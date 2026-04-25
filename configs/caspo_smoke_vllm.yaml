@@ -1,0 +1,60 @@
+# Smoke config: SmolLM2 135M with vLLM rollout backend + wandb logging.
+# 2 RL steps just to verify the full pipeline (rollout via vLLM →
+# step seg → V_φ → step TD → PPO update → vLLM weight sync) works.
+model_name_or_path: HuggingFaceTB/SmolLM2-135M-Instruct
+torch_dtype: bfloat16
+attn_implementation: eager
+trust_remote_code: false
+
+dataset_name: agentica-org/DeepScaleR-Preview-Dataset
+eval_dataset_name: HuggingFaceH4/MATH-500
+max_prompt_len: 256
+max_response_len: 96
+
+method: caspo
+group_size: 4
+rollout_temperature: 1.0
+rollout_top_p: 1.0
+value_data_temperature: 1.0
+rollout_backend: vllm
+vllm_gpu_memory_utilization: 0.4
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true
+
+segmentation_mode: latex_aware
+step_delimiter: "\n"
+min_step_tokens: 4
+max_steps_per_response: 16
+
+prefix_value_path: /mnt/nvme_tmp/jason_caspo/value_smoke/final
+update_value_during_policy: true
+online_value_lr: 1.0e-4
+use_adb: true
+use_dlw: true
+
+gamma: 1.0
+standardize_step_advantage: true
+standardize_advantage_scope: batch
+
+clip_eps_low: 0.20
+clip_eps_high: 0.20
+kl_coef: 0.0
+kl_estimator: k3
+
+output_dir: /mnt/nvme_tmp/jason_caspo/caspo_smoke_vllm
+lr: 1.0e-5
+prompts_per_step: 2
+micro_batch_size: 1
+grad_accum_steps: 8
+max_steps: 2
+seed: 0
+log_every: 1
+save_every: 200
+eval_every: 0
+
+wandb_enabled: true
+wandb_project: caspo-smoke
+wandb_run_name: smoke_vllm_caspo
+wandb_mode: online
+
+device: cuda

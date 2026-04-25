@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caspo"
+version = "0.1.0"
+description = "Credit Assignment Step Policy Optimization — VinePPO with a learned prefix value model"
+requires-python = ">=3.10"
+# Core runtime deps. Heavy GPU stack (vllm, flash-attn) is intentionally
+# not declared here: those must be installed against a matched torch+CUDA
+# build by the user / image. See requirements.txt for the same lower bounds.
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.44",
+    "datasets>=2.18",
+    "pyyaml>=6.0",
+    "sympy>=1.12",
+]
+
+[project.optional-dependencies]
+# math_verify ships an Antlr-pinned closure; the reward module falls back
+# to a SymPy-only path when it's absent, so keep it optional.
+verify = ["math_verify"]
+# wandb import is wrapped in try/except in the trainer; only required if
+# you actually want experiment tracking.
+tracking = ["wandb"]
+dev = ["pytest", "pytest-xdist"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["caspo*"]
+
+[tool.pytest.ini_options]
+# pytest-xdist is available via the [dev] extra. Parallelism helps modestly
+# (~1.35x speedup at -n 4 on this suite, measured 2026-04-25) because most
+# tests are dominated by torch/transformers import time rather than CPU work.
+# `-n auto` (≈208 workers on this box) is *slower* than serial due to import
+# storms; do not enable it. If you want parallel runs, pass `-n 2` or `-n 4`
+# manually:  pytest tests/ -n 4 --ignore=tests/test_vllm_engine.py
+testpaths = ["tests"]

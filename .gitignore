@@ -1,0 +1,41 @@
+# Local environment and secrets
+.env
+.env.*
+.env_*
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Experiment outputs and trackers
+wandb/
+out/
+logs/
+*.log
+
+# Large/local model artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# LaTeX intermediates; keep paper/main.pdf tracked.
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.synctex.gz

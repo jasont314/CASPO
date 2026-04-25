@@ -1,0 +1,81 @@
+# CASPO on DeepSeekMath-7B-MATH — matches VinePPO setup for direct
+# comparison against their published numbers on the 7B scale.
+# Inherits everything from caspo_rho1b_math.yaml; only the SFT init changes.
+model_name_or_path: realtreetune/deepseekmath-7b-sft-MATH-v2
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+trust_remote_code: false
+
+dataset_name: DigitalLearningGmbH/MATH-lighteval
+dataset_split: train
+eval_dataset_name: HuggingFaceH4/MATH-500
+eval_split: test
+prompt_template: "[MATH_TASK] Problem:\n{query}\n\nSolution:"
+
+max_prompt_len: 1024
+max_response_len: 1024
+
+group_size: 8
+rollout_temperature: 0.6
+rollout_top_p: 0.9
+rollout_top_k: -1
+value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
+rollout_backend: vllm
+prompts_per_step: 8
+
+segmentation_mode: latex_aware
+step_delimiter: "\n"
+min_step_tokens: 4
+max_steps_per_response: 64
+
+value_beta: 10.0
+value_margin: 5.0
+value_lr: 5.0e-7
+value_weight_decay: 0.0
+value_warmup_steps: 0
+value_micro_batch_size: 1
+value_grad_accum_steps: 64
+value_max_epochs: 3                # paper-faithful 3 epochs over (filtered) data
+value_max_steps: 0                 # 0 = use value_max_epochs
+value_save_every: 500
+value_log_every: 10
+value_grad_clip: 1.0
+value_data_path: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_math/value_data.pt
+
+prefix_value_path: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_math/value_final
+update_value_during_policy: true
+online_value_lr: 1.0e-4
+use_adb: true
+use_dlw: true
+adb_dlw_eps: 0.05
+
+gamma: 1.0
+standardize_step_advantage: true
+standardize_advantage_scope: batch
+
+clip_eps_low: 0.20
+clip_eps_high: 0.20
+kl_coef: 1.0e-4
+kl_estimator: k3
+
+output_dir: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_math
+lr: 2.0e-6                        # was 1e-6. Conservative 2x bump (vs 3x for rho-1B): 7B model
+                                  # is more lr-sensitive and DeepSeekMath has stronger SFT prior,
+                                  # so we don't want to risk drift. Targets the same not-learning
+                                  # symptom (|ratio|≈1, |A|≈0.3) seen on rho-1B.
+weight_decay: 0.0
+warmup_steps: 60
+grad_clip: 1.0
+micro_batch_size: 1
+grad_accum_steps: 64              # 8 prompts × G=8 = 64 episodes / mb=1 → accum=64 → effective batch 64
+epochs_per_rollout: 2
+max_steps: 1500                   # was 1000. Modest extension; 7B trains slowly per wall-clock,
+                                  # so 1.5x is the cap before each run becomes prohibitive.
+seed: 0
+log_every: 1
+save_every: 40
+eval_every: 40
+
+device: cuda
+compile: false
+use_gradient_checkpointing: true

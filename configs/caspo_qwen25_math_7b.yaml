@@ -1,0 +1,108 @@
+# Full-scale CASPO config for Qwen2.5-Math-7B on DeepScaleR / MATH-500.
+# Phase 1 hyperparameters mirror IPVRM (arXiv:2604.13197): β=10, m=5, lr=5e-7,
+# effective batch 64. Phase 2 hyperparameters mirror VinePPO (arXiv:2410.01679):
+# lr=1e-6, ε=0.2, γ=1.0, KL=1e-4, no critic loss, PPO clipped surrogate.
+#
+# DeepScaleR is harder than MATH-train (AIME/AMC/Olympiad-tier), so we keep
+# longer responses (4096) and use the latex-aware step splitter that handles
+# the heavy LaTeX environments these problems use.
+model_name_or_path: Qwen/Qwen2.5-Math-7B
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+trust_remote_code: true
+
+dataset_name: agentica-org/DeepScaleR-Preview-Dataset
+dataset_split: train
+eval_dataset_name: HuggingFaceH4/MATH-500
+eval_split: test
+# Qwen2.5-Math base has no chat template configured, so we must specify one
+# explicitly. Match the DeepScaleR / Qwen2.5-Math convention: ask for boxed
+# final answer so the math_verifier reward fires.
+prompt_template: "Problem:\n{query}\n\nPlease reason step by step, and put your final answer within \\boxed{}.\n\nSolution:"
+max_prompt_len: 1024
+max_response_len: 4096
+
+# rollout — vLLM is mandatory at 7B + 4096 max-response length; HF backend
+# is several orders of magnitude too slow here.
+group_size: 8
+rollout_temperature: 0.6
+rollout_top_p: 0.95
+rollout_top_k: -1
+rollout_backend: vllm
+value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
+
+# vLLM runtime knobs (7B fp16 weights ≈ 14GB; KV at 5120 tokens fits with 0.85
+# util on a single 80GB GPU — leaves room for trainer + optimizer state).
+vllm_gpu_memory_utilization: 0.55     # trainer + V_φ + ref + optimizer share GPU
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true              # avoid CUDA-graph compile cost on weight-sync churn
+
+# step segmentation — latex-aware splitter (port of VinePPO's
+# math_extract_steps_inplace.py). Required for DeepScaleR-style problems
+# whose responses contain align/equation/cases/tabular environments.
+segmentation_mode: latex_aware
+step_delimiter: "\n"                  # unused under latex_aware; kept for fallback
+min_step_tokens: 4
+max_steps_per_response: 64
+
+# Phase 1 — IPVRM (paper §4.1: β=10, m=5, lr=5e-7, batch 64, 3 epochs)
+value_beta: 10.0
+value_margin: 5.0
+value_lr: 5.0e-7
+value_weight_decay: 0.0
+value_warmup_steps: 0
+value_micro_batch_size: 1
+value_grad_accum_steps: 64           # effective batch 64 (paper-faithful)
+value_max_epochs: 3                  # paper-faithful 3 epochs over (filtered) data
+value_max_steps: 0                   # 0 = use value_max_epochs
+value_save_every: 500
+value_log_every: 10
+value_grad_clip: 1.0
+value_data_path: /mnt/nvme_tmp/jason_caspo/qwen25_math_7b_deepscaler/value_data.pt
+
+# Phase 2 — value usage. Online IPVRM (Eq. 15 with ADB+DLW) ON — this is the
+# actual CASPO contribution and is what should run in the paper-faithful 7B
+# headline. Set update_value_during_policy=false to fall back to a frozen V_φ
+# if memory-bound.
+prefix_value_path: /mnt/nvme_tmp/jason_caspo/qwen25_math_7b_deepscaler/value_final
+update_value_during_policy: true
+online_value_lr: 1.0e-4
+use_adb: true
+use_dlw: true
+adb_dlw_eps: 0.05
+
+# step TD
+gamma: 1.0
+standardize_step_advantage: true
+standardize_advantage_scope: batch
+
+# PPO (matches VinePPO/PPO MATH config)
+clip_eps_low: 0.20
+clip_eps_high: 0.20
+kl_coef: 1.0e-4                       # init_kl_coef from refKl0.0001.jsonnet
+kl_estimator: k3                      # control_variate ≈ k3 unbiased
+
+# training
+output_dir: /mnt/nvme_tmp/jason_caspo/qwen25_math_7b_deepscaler
+lr: 2.0e-6                            # was 1e-6. Conservative 2x bump for 7B (matches deepseekmath
+                                      # configs); evidence on rho-1B shows policy not moving at 1e-6.
+                                      # Qwen2.5-Math-7B base has no SFT-RL prior → modest bump only.
+weight_decay: 0.0
+warmup_steps: 60                      # ≈ warmup_ratio 0.03 × ~2000 step-equivalents
+grad_clip: 1.0
+prompts_per_step: 8                   # 8 prompts × G=8 = 64 episodes/step
+micro_batch_size: 1
+grad_accum_steps: 64                  # 8 prompts × G=8 = 64 episodes / mb=1 → accum=64 → effective batch 64
+epochs_per_rollout: 2                 # VinePPO: num_epochs_per_iteration=2
+max_steps: 1500                       # was 1000. DeepScaleR is harder than MATH; longer responses
+                                      # mean per-step credit assignment is noisier → benefits from
+                                      # extra optimizer steps. Capped at 1.5x to keep wall-clock
+                                      # tractable (4096-tok responses on 7B are slow).
+seed: 0
+log_every: 1
+save_every: 100
+eval_every: 100
+
+device: cuda
+compile: false
+use_gradient_checkpointing: true

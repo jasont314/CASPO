@@ -1,0 +1,48 @@
+# Phase-2 smoke: CASPO policy optimization with a tiny model + tiny V_phi.
+# Run after configs/value_smoke.yaml has produced out/value_smoke/final.
+model_name_or_path: HuggingFaceTB/SmolLM2-135M-Instruct
+torch_dtype: float32
+attn_implementation: eager
+trust_remote_code: false
+
+dataset_name: agentica-org/DeepScaleR-Preview-Dataset
+eval_dataset_name: HuggingFaceH4/MATH-500
+max_prompt_len: 256
+max_response_len: 128
+
+# rollout
+group_size: 4
+rollout_temperature: 1.0
+rollout_top_p: 1.0
+
+# step segmentation
+step_delimiter: "\n\n"
+min_step_tokens: 4
+max_steps_per_response: 16
+
+# value model — point this at the phase-1 output.
+prefix_value_path: out/value_smoke/final
+value_beta: 10.0
+value_margin: 5.0
+update_value_during_policy: false
+
+# step TD
+gamma: 1.0
+standardize_step_advantage: true
+standardize_advantage_scope: batch
+
+# PPO
+clip_eps_low: 0.20
+clip_eps_high: 0.20
+kl_coef: 0.0
+kl_estimator: k3
+
+# training
+output_dir: out/caspo_smoke
+lr: 1.0e-5
+prompts_per_step: 2
+micro_batch_size: 1
+grad_accum_steps: 8
+max_steps: 2
+seed: 0
+device: cuda

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Phase 4b — launch PPO + CASPO + GRPO + VinePPO baselines in parallel on Rho-1B-MATH.
+# Each method gets one GPU (trainer + vLLM share); 4 methods on GPUs 0-3.
+#
+# Usage:
+#   ./scripts/launch_rho1b_parallel.sh
+#
+# Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/logs/phase2_<method>.log.
+# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>/final.
+#
+set -eo pipefail
+# Don't use 'set -u' — conda activate scripts have unbound vars.
+source /opt/conda/etc/profile.d/conda.sh
+conda activate scalable
+
+export HF_HOME=/mnt/nvme_tmp/jason_caspo/hf_cache
+export HF_HUB_CACHE=/mnt/nvme_tmp/jason_caspo/hf_cache
+export TRANSFORMERS_CACHE=/mnt/nvme_tmp/jason_caspo/hf_cache
+
+cd "$(dirname "$0")/.."
+source ./scripts/perf_env.sh
+
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
+ROOT=/mnt/nvme_tmp/jason_caspo
+BASE_CONFIG=configs/caspo_rho1b_math.yaml
+LOGDIR="$ROOT/caspo_rho1b_math/logs"
+mkdir -p "$LOGDIR"
+PIDS=()
+
+cleanup() {
+    local rc=$?
+    if (( rc != 0 )); then
+        echo "[launch] exiting with rc=$rc; launched pids: ${PIDS[*]:-none}"
+    fi
+    exit $rc
+}
+trap cleanup EXIT
+trap 'echo "[launch] ERR at line $LINENO (rc=$?)"' ERR
+
+# Use 0.5 GPU memory for vLLM; trainer + V_φ + ref + optimizer takes the other half.
+COMMON_OVERRIDES=(
+    --override vllm_gpu_memory_utilization=0.45
+    --override vllm_enforce_eager=true
+    --override wandb_mode=online
+    --override wandb_project=caspo-rho1b-math
+)
+
+launch_method() {
+    local method=$1
+    local gpu=$2
+    local extra=$3   # extra overrides as a single string (or empty)
+    local outdir="$ROOT/caspo_rho1b_math_${method}"
+    local log="$LOGDIR/phase2_${method}.log"
+    echo "[launch] ${method} → GPU ${gpu} → ${outdir}"
+    # shellcheck disable=SC2086  # $extra is intentionally word-split into multiple --override flags
+    CUDA_VISIBLE_DEVICES="$gpu" nohup "$PYTHON_BIN" -u -m scripts.train_caspo \
+        --config "$BASE_CONFIG" \
+        --override "method=${method}" \
+        --override "output_dir=${outdir}" \
+        --override "wandb_run_name=rho1b_math_${method}_seed0" \
+        "${COMMON_OVERRIDES[@]}" \
+        ${extra} \
+        > "$log" 2>&1 &
+    local pid=$!
+    PIDS+=("$pid")
+    echo "  pid=$pid log=$log"
+}
+
+# PPO — sequence-level terminal reward advantage baseline.
+launch_method ppo 3 "--override update_value_during_policy=false"
+
+# CASPO with online IPVRM + ADB+DLW (default)
+launch_method caspo 0 ""
+
+# GRPO — no V_φ; the trainer only requires prefix_value_path for method=caspo.
+launch_method grpo 1 "--override update_value_during_policy=false"
+
+# VinePPO — no V_φ; uses sample_with_prefix MC values at each prefix.
+launch_method vineppo 2 "--override update_value_during_policy=false --override vineppo_mc_rollouts=9"
+
+echo "[launch] all ${#PIDS[@]} methods started; logs in $LOGDIR/"
+
+fail=0
+for pid in "${PIDS[@]}"; do
+    if wait "$pid"; then
+        :
+    else
+        rc=$?
+        echo "[launch] pid=$pid exited with rc=$rc"
+        fail=$((fail + 1))
+    fi
+done
+if (( fail > 0 )); then
+    echo "[launch] DONE — $fail/${#PIDS[@]} training job(s) failed; check logs"
+    exit 1
+fi
+echo "[launch] DONE — all ${#PIDS[@]} training jobs completed cleanly"

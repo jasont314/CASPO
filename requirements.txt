@@ -1,0 +1,13 @@
+# Core runtime dependencies for CASPO.
+#
+# Heavy GPU deps (vllm, flash-attn) are NOT pinned here — install separately
+# in your env (vllm pulls a matched torch; flash-attn must match torch CUDA).
+# wandb is optional (trainer try/excepts the import); install it if you want
+# experiment tracking. math_verify is also optional with a SymPy fallback.
+
+torch>=2.4
+transformers>=4.44
+datasets>=2.18
+pyyaml>=6.0
+math_verify
+sympy>=1.12

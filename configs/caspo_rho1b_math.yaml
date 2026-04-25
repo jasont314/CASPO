@@ -1,0 +1,90 @@
+# CASPO on Rho-1B-MATH — matches VinePPO setup for direct comparison against
+# their Figs 4/5/6 (Rho-1B on MATH). Hyperparameters lifted verbatim from
+# VinePPO/configs/polIter_rho1bSft2_vineppo_MATH.jsonnet + ppo_MATH.jsonnet.
+#
+# Phase 1 first (collect rollouts on Rho-1B SFT, train V_phi),
+# Phase 2 then runs CASPO with this config.
+model_name_or_path: realtreetune/rho-1b-sft-MATH
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+trust_remote_code: false
+
+# VinePPO/PPO MATH dataset: standard MATH train split.
+dataset_name: DigitalLearningGmbH/MATH-lighteval
+dataset_split: train
+eval_dataset_name: HuggingFaceH4/MATH-500
+eval_split: test
+prompt_template: "[MATH_TASK] Problem:\n{query}\n\nSolution:"
+
+max_prompt_len: 1024
+max_response_len: 1024            # VinePPO: max_tokens=1024
+
+# rollout (matches VinePPO)
+group_size: 8
+rollout_temperature: 0.6
+rollout_top_p: 0.9
+rollout_top_k: -1
+value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
+rollout_backend: vllm
+prompts_per_step: 8               # 8 prompts × G=8 = 64 episodes per step
+                                  # VinePPO: 512/iter @ 8 epochs/iter ≈ 64 episodes/grad-step
+
+# step segmentation — VinePPO-faithful LaTeX-aware splitter (ported from
+# their math_extract_steps_inplace.py).
+segmentation_mode: latex_aware
+step_delimiter: "\n"               # unused under latex_aware; kept for fallback
+min_step_tokens: 4
+max_steps_per_response: 64
+
+# Phase 1 — IPVRM training (paper §4.1: β=10, m=5, lr=5e-7, batch 64)
+value_beta: 10.0
+value_margin: 5.0
+value_lr: 5.0e-7
+value_weight_decay: 0.0
+value_warmup_steps: 0
+value_micro_batch_size: 1
+value_grad_accum_steps: 64        # effective batch 64 (paper)
+value_max_epochs: 3                # paper-faithful 3 epochs over (filtered) data
+value_max_steps: 0                 # 0 = use value_max_epochs
+value_save_every: 500
+value_log_every: 10
+value_grad_clip: 1.0
+value_data_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_data.pt
+
+# Phase 2 — value usage. Online updates ON (Eq. 15 with ADB+DLW per §3.3).
+prefix_value_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
+update_value_during_policy: true
+online_value_lr: 1.0e-4
+use_adb: true
+use_dlw: true
+adb_dlw_eps: 0.05
+
+# step TD
+gamma: 1.0
+standardize_step_advantage: true
+standardize_advantage_scope: batch
+
+# PPO (matches VinePPO MATH config exactly)
+clip_eps_low: 0.20
+clip_eps_high: 0.20
+kl_coef: 1.0e-4                   # init_kl_coef from refKl0.0001.jsonnet
+kl_estimator: k3                  # control_variate ≈ k3 unbiased
+
+# training (matches VinePPO ppo_MATH.jsonnet general_training_args)
+output_dir: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math
+lr: 1.0e-6
+weight_decay: 0.0
+warmup_steps: 60                  # ≈ warmup_ratio 0.03 × 2000 step-equivalents
+grad_clip: 1.0
+micro_batch_size: 1
+grad_accum_steps: 64              # 8 prompts × G=8 = 64 episodes / mb=1 → accum=64 → effective batch 64
+epochs_per_rollout: 2             # VinePPO: num_epochs_per_iteration=2
+max_steps: 1000                   # VinePPO: total_num_iterations=1000
+seed: 0
+log_every: 1
+save_every: 40                    # VinePPO: save_steps=40
+eval_every: 40
+
+device: cuda
+compile: false
+use_gradient_checkpointing: true

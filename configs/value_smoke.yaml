@@ -1,0 +1,35 @@
+# Phase-1 smoke: collect data + train V_phi end-to-end on a tiny model.
+model_name_or_path: HuggingFaceTB/SmolLM2-135M-Instruct
+torch_dtype: float32
+attn_implementation: eager
+trust_remote_code: false
+
+dataset_name: agentica-org/DeepScaleR-Preview-Dataset
+max_prompt_len: 256
+max_response_len: 128
+
+# rollout for data collection
+group_size: 4
+rollout_temperature: 1.0
+rollout_top_p: 1.0
+prompts_per_step: 2
+
+# IPVRM training
+value_beta: 10.0
+value_margin: 5.0
+value_lr: 5.0e-7
+value_micro_batch_size: 1
+value_grad_accum_steps: 4
+# value_max_epochs defaults to 3, which would override value_max_steps via
+# epochs * train_size / batch. Set epochs to 0 so the smoke run honors the
+# raw 4-step budget below.
+value_max_epochs: 0
+value_max_steps: 4
+value_save_every: 4
+value_log_every: 1
+value_grad_clip: 1.0
+value_data_path: out/value_smoke/value_data.pt
+
+output_dir: out/value_smoke
+seed: 0
+device: cuda
