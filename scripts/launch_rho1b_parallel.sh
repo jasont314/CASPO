@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/launch_rho1b_parallel.sh
 #   RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" ./scripts/launch_rho1b_parallel.sh
+#   RUN_TAG=paper512_seed0 SAVE_EVERY=100 WANDB_MODE=offline ./scripts/launch_rho1b_parallel.sh
 #
 # Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math${RUN_SUFFIX}/logs.
 # Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/final.
@@ -57,6 +58,12 @@ COMMON_OVERRIDES=(
     --override "wandb_mode=${WANDB_MODE:-online}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )
+if [[ -n "${SAVE_EVERY:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "save_every=${SAVE_EVERY}")
+fi
+if [[ -n "${MAX_STEPS:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "max_steps=${MAX_STEPS}")
+fi
 
 launch_method() {
     local method=$1

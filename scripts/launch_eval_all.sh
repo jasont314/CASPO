@@ -7,6 +7,7 @@
 #   ./scripts/launch_eval_all.sh
 #   EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 #   RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+#   RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_200 EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 ./scripts/launch_eval_all.sh
 #
 # Each method gets one GPU; runs sequentially per method but parallel across methods.
 
@@ -53,8 +54,19 @@ trap cleanup EXIT
 trap 'echo "[eval] ERR at line $LINENO (rc=$?)"' ERR
 
 # Headline benchmarks. Skip aime24 / aime25 / amc23 here (too small to be
-# headline numbers); add them for the OOD section in the paper.
-BENCHMARKS="math500,math,collegemath,olympiadbench"
+# headline numbers); add them for the OOD section in the paper. Override with
+# EVAL_BENCHMARKS=math500 and EVAL_LIMIT=100 for cheap periodic sample eval.
+BENCHMARKS="${EVAL_BENCHMARKS:-math500,math,collegemath,olympiadbench}"
+EVAL_K="${EVAL_K:-16}"
+CKPT_SUBDIR="${CKPT_SUBDIR:-final}"
+EVAL_LIMIT_ARGS=()
+LIMIT_TAG="full"
+if [[ -n "${EVAL_LIMIT:-}" ]]; then
+    EVAL_LIMIT_ARGS=(--limit "$EVAL_LIMIT")
+    LIMIT_TAG="limit${EVAL_LIMIT}"
+fi
+BENCH_TAG="${BENCHMARKS//,/+}"
+CKPT_TAG="${CKPT_SUBDIR//\//_}"
 METHODS=(caspo grpo vineppo ppo)
 IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-4 5 6 7}"
 if (( ${#EVAL_GPUS[@]} < ${#METHODS[@]} )); then
@@ -65,9 +77,10 @@ fi
 eval_method() {
     local method=$1
     local gpu=$2
-    local ckpt="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}/final"
+    local ckpt="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}/${CKPT_SUBDIR}"
     local out_dir="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}"
-    local log="$LOGDIR/phase5_eval_${method}.log"
+    local log="$LOGDIR/phase5_eval_${method}_${CKPT_TAG}_${BENCH_TAG}_k${EVAL_K}_${LIMIT_TAG}.log"
+    local output_json="$out_dir/eval_results_${CKPT_TAG}_${BENCH_TAG}_k${EVAL_K}_${LIMIT_TAG}.json"
     if [[ ! -d "$ckpt" ]]; then
         echo "[eval] SKIP ${method} — no checkpoint at ${ckpt}"
         return
@@ -81,10 +94,12 @@ eval_method() {
         --override wandb_enabled=false \
         --override rollout_backend=vllm \
         --benchmarks "$BENCHMARKS" \
-        --k 16 \
+        --k "$EVAL_K" \
         --temperature 0.35 \
         --top-p 0.9 \
         --max-new-tokens 1024 \
+        "${EVAL_LIMIT_ARGS[@]}" \
+        --output "$output_json" \
         > "$log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")

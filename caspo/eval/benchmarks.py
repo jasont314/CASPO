@@ -95,6 +95,22 @@ BENCHMARKS: Dict[str, Dict[str, Any]] = {
 }
 
 
+async def prime_vllm_async_engine(engine) -> None:
+    """Start vLLM AsyncLLM frontend tasks on the caller's event loop.
+
+    vLLM V1 starts its output handler lazily. When AsyncLLM is embedded in a
+    synchronous trainer/eval process, the first metadata request can otherwise
+    wait for EngineCore output before the output handler has started draining
+    it. Calling this once after creating the loop avoids that frontend stall.
+    """
+    runner = getattr(engine, "_run_output_handler", None)
+    if runner is not None:
+        runner()
+    get_tasks = getattr(engine, "get_supported_tasks", None)
+    if get_tasks is not None:
+        await get_tasks()
+
+
 def _load_problems(spec: Dict[str, Any]) -> List[Dict[str, str]]:
     """Load (question, answer) pairs from HuggingFace. Returns [] on failure."""
     try:
@@ -434,6 +450,7 @@ def evaluate_vllm(
         loop = asyncio.new_event_loop()
     try:
         try:
+            loop.run_until_complete(prime_vllm_async_engine(engine))
             outputs_per_problem = loop.run_until_complete(_drain_all(token_prompts))
         finally:
             # AsyncLLM owns background tasks bound to the event loop used for

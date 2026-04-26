@@ -161,7 +161,8 @@ class VLLMRolloutEngine:
             # vLLM's IPC update API serializes CUDA IPC handles through the
             # EngineCore control channel. This is local-process-only for our
             # trainer/vLLM topology; the env flag must be visible before the
-            # EngineCore subprocess starts.
+            # EngineCore subprocess starts and remain visible in the frontend
+            # process while it decodes EngineCore utility responses.
             os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # Sentinels so __del__ / shutdown don't trip on partially-constructed
@@ -204,7 +205,7 @@ class VLLMRolloutEngine:
                     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                 else:
                     os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
-            if self._weight_sync_backend == "ipc":
+            if self._weight_sync_backend != "ipc":
                 if prev_allow_insecure is None:
                     os.environ.pop("VLLM_ALLOW_INSECURE_SERIALIZATION", None)
                 else:
@@ -214,6 +215,7 @@ class VLLMRolloutEngine:
         # down so its EngineCore subprocess + NCCL sockets don't leak.
         try:
             self._loop = asyncio.new_event_loop()
+            self._loop.run_until_complete(self._prime_async_frontend())
         except Exception:
             try:
                 self.engine.shutdown()
@@ -225,6 +227,24 @@ class VLLMRolloutEngine:
     # ------------------------------------------------------------------
     # Async helpers
     # ------------------------------------------------------------------
+
+    async def _prime_async_frontend(self) -> None:
+        """Start AsyncLLM frontend tasks on our persistent event loop.
+
+        Recent vLLM V1 builds lazily request EngineCore metadata before
+        starting the output handler when ``AsyncLLM`` was constructed outside a
+        running asyncio loop. In this embedded trainer, that can deadlock: the
+        metadata request waits for an EngineCore response while no output task
+        is draining EngineCore. Starting the output handler here keeps later
+        ``generate()`` calls on the same loop and avoids the first-request
+        stall.
+        """
+        runner = getattr(self.engine, "_run_output_handler", None)
+        if runner is not None:
+            runner()
+        get_tasks = getattr(self.engine, "get_supported_tasks", None)
+        if get_tasks is not None:
+            await get_tasks()
 
     async def _drain_one(self, prompt: Any, sampling_params: Any, request_id: str):
         """Consume the AsyncLLM streaming generator and return the final RequestOutput.

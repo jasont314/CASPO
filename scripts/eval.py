@@ -25,6 +25,7 @@ if _REPO_ROOT not in sys.path:
 
 from caspo.config import CASPOConfig
 from caspo.eval import evaluate, evaluate_vllm, BENCHMARKS
+from caspo.eval.benchmarks import prime_vllm_async_engine
 from scripts.collect_value_data import apply_overrides
 
 
@@ -162,6 +163,7 @@ def main() -> None:
             engine_args = AsyncEngineArgs(**engine_kwargs)
             shared_engine = AsyncLLM.from_engine_args(engine_args)
             shared_loop = asyncio.new_event_loop()
+            shared_loop.run_until_complete(prime_vllm_async_engine(shared_engine))
 
         try:
             for name in benchmark_names:
