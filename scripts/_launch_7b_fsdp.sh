@@ -70,6 +70,12 @@ CASPO_FSDP_CPU_OFFLOAD="${CASPO_FSDP_CPU_OFFLOAD:-${FSDP_CPU_OFFLOAD:-false}}"
 # full_shard. Override via CASPO_FSDP_SHARDING_STRATEGY=full_shard if you
 # need the legacy fully-sharded layout (e.g. tight-VRAM single-node runs).
 CASPO_FSDP_SHARDING_STRATEGY="${CASPO_FSDP_SHARDING_STRATEGY:-${FSDP_SHARDING_STRATEGY:-hybrid_shard}}"
+# Activation checkpointing mode: "off" / "full" / "selective". When non-"off"
+# overrides cfg.use_gradient_checkpointing. "selective" recomputes only the
+# attention block (cheap with FA3, ~10% layer FLOPs) and keeps MLP
+# activations live — saves recompute cost vs "full" while still freeing
+# enough activation memory at 7B mb=2.
+CASPO_ACTIVATION_CHECKPOINTING_MODE="${CASPO_ACTIVATION_CHECKPOINTING_MODE:-${ACTIVATION_CHECKPOINTING_MODE:-off}}"
 CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
 # Logprob micro-batch for the no-grad rescore + ref-logprob passes.
 # Default 8: bigger than mb=2 (the trainable forward) because there's no
@@ -82,6 +88,7 @@ unset VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_NUM_SEQS
 unset MICRO_BATCH_SIZE GRAD_ACCUM_STEPS USE_GRADIENT_CHECKPOINTING
 unset FSDP_CPU_OFFLOAD REWARD_WORKERS PROMPTS_PER_STEP LOGPROB_MICRO_BATCH_SIZE
 unset FSDP_SHARDING_STRATEGY
+unset ACTIVATION_CHECKPOINTING_MODE
 
 OVERRIDES=(
     --override "method=${METHOD}"
@@ -98,6 +105,7 @@ OVERRIDES=(
     --override "micro_batch_size=${CASPO_MICRO_BATCH_SIZE}"
     --override "grad_accum_steps=${CASPO_GRAD_ACCUM_STEPS}"
     --override "use_gradient_checkpointing=${CASPO_USE_GRADIENT_CHECKPOINTING}"
+    --override "activation_checkpointing_mode=${CASPO_ACTIVATION_CHECKPOINTING_MODE}"
     --override "logprob_micro_batch_size=${CASPO_LOGPROB_MICRO_BATCH_SIZE}"
     --override "prompts_per_step=${PROMPTS_PER_STEP_VAL}"
     --override "reward_workers=${CASPO_REWARD_WORKERS}"
