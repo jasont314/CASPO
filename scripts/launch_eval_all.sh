@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/launch_eval_all.sh
 #   EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+#   RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 #
 # Each method gets one GPU; runs sequentially per method but parallel across methods.
 
@@ -29,7 +30,12 @@ source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
 ROOT=/mnt/nvme_tmp/jason_caspo
-LOGDIR="$ROOT/caspo_rho1b_math/logs"
+RUN_TAG="${RUN_TAG:-}"
+RUN_SUFFIX=""
+if [[ -n "$RUN_TAG" ]]; then
+    RUN_SUFFIX="_${RUN_TAG}"
+fi
+LOGDIR="$ROOT/caspo_rho1b_math${RUN_SUFFIX}/logs"
 mkdir -p "$LOGDIR"
 
 # Track child PIDs so the parent waits for them — without `wait`, the shell
@@ -59,8 +65,8 @@ fi
 eval_method() {
     local method=$1
     local gpu=$2
-    local ckpt="$ROOT/caspo_rho1b_math_${method}/final"
-    local out_dir="$ROOT/caspo_rho1b_math_${method}"
+    local ckpt="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}/final"
+    local out_dir="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}"
     local log="$LOGDIR/phase5_eval_${method}.log"
     if [[ ! -d "$ckpt" ]]; then
         echo "[eval] SKIP ${method} — no checkpoint at ${ckpt}"

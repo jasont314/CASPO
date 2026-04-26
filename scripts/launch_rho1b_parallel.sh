@@ -5,9 +5,10 @@
 #
 # Usage:
 #   ./scripts/launch_rho1b_parallel.sh
+#   RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" ./scripts/launch_rho1b_parallel.sh
 #
-# Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/logs/phase2_<method>.log.
-# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>/final.
+# Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math${RUN_SUFFIX}/logs.
+# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/final.
 #
 set -eo pipefail
 # Don't use 'set -u' — conda activate scripts have unbound vars.
@@ -24,7 +25,12 @@ source ./scripts/perf_env.sh
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
 ROOT=/mnt/nvme_tmp/jason_caspo
 BASE_CONFIG=configs/caspo_rho1b_math.yaml
-LOGDIR="$ROOT/caspo_rho1b_math/logs"
+RUN_TAG="${RUN_TAG:-}"
+RUN_SUFFIX=""
+if [[ -n "$RUN_TAG" ]]; then
+    RUN_SUFFIX="_${RUN_TAG}"
+fi
+LOGDIR="$ROOT/caspo_rho1b_math${RUN_SUFFIX}/logs"
 mkdir -p "$LOGDIR"
 PIDS=()
 read -r -a GPUS <<< "${GPU_LIST:-4 5 6 7}"
@@ -48,15 +54,15 @@ trap 'echo "[launch] ERR at line $LINENO (rc=$?)"' ERR
 COMMON_OVERRIDES=(
     --override vllm_gpu_memory_utilization=0.45
     --override vllm_enforce_eager=false
-    --override wandb_mode=online
-    --override wandb_project=caspo-rho1b-math
+    --override "wandb_mode=${WANDB_MODE:-online}"
+    --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )
 
 launch_method() {
     local method=$1
     local gpu=$2
     local extra=$3   # extra overrides as a single string (or empty)
-    local outdir="$ROOT/caspo_rho1b_math_${method}"
+    local outdir="$ROOT/caspo_rho1b_math_${method}${RUN_SUFFIX}"
     local log="$LOGDIR/phase2_${method}.log"
     echo "[launch] ${method} → GPU ${gpu} → ${outdir}"
     # shellcheck disable=SC2086  # $extra is intentionally word-split into multiple --override flags
@@ -64,7 +70,7 @@ launch_method() {
         --config "$BASE_CONFIG" \
         --override "method=${method}" \
         --override "output_dir=${outdir}" \
-        --override "wandb_run_name=rho1b_math_${method}_seed0" \
+        --override "wandb_run_name=rho1b_math_${method}_seed0${RUN_SUFFIX}" \
         "${COMMON_OVERRIDES[@]}" \
         ${extra} \
         > "$log" 2>&1 &
