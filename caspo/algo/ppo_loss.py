@@ -156,7 +156,9 @@ def ppo_clipped_loss(
     fmask = mask_bool.to(logprobs.dtype)
     zeros = torch.zeros((), device=logprobs.device, dtype=logprobs.dtype)
     # Important: ``nan * 0 == nan``. Use where-based masking before any
-    # arithmetic that touches padded positions.
+    # arithmetic that touches padded positions — see
+    # test_masked_nan_padding_does_not_poison_loss_or_kl which asserts a
+    # NaN at a masked slot is fully scrubbed from both loss and grad.
     log_ratio_raw = torch.where(mask_bool, logprobs - old_logprobs, zeros)
     advantage_safe = torch.where(mask_bool, advantage, zeros)
 

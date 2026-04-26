@@ -55,10 +55,14 @@ def compute_log_ratio(
     Returns:
         ``[B, R]`` tensor; tokens outside the response are exactly ``0`` so
         that ``cumsum`` over the time axis is well-defined.
+
+        Note: the subtraction stays in the input dtype (bf16/fp16/fp32).
+        Only ``cumsum`` over long prefixes accumulates rounding error
+        catastrophically in bf16, so callers should upcast ``out`` to fp32
+        immediately before ``cumsum`` rather than paying the upcast on
+        every forward.
     """
-    pi = pi_logprobs.float()
-    ref = ref_logprobs.float()
-    out = beta * (pi - ref)
+    out = beta * (pi_logprobs - ref_logprobs)
     out = out * response_mask.to(out.dtype)
     return out
 
@@ -264,11 +268,13 @@ class PrefixValueModel(nn.Module):
         )
         # Fused log_softmax + gather via cross_entropy(reduction='none').
         # cross_entropy returns -log p(y); negate to recover log p(y).
-        # Upcast to float32 for numerical stability of the softmax (matches
-        # the prior log_softmax(.float()) behaviour).
+        # PyTorch's fused softmax_xent kernel already accumulates the
+        # log-softmax in fp32 internally when fed bf16/fp16 logits, so we
+        # skip the explicit .float() upcast (which would materialize a
+        # [B*R, V] fp32 copy of the logits, ~2 GB at vocab=32k, B*R=64k).
         B, R_, V = sliced.shape
         nll = F.cross_entropy(
-            sliced.reshape(B * R_, V).float(),
+            sliced.reshape(B * R_, V),
             response_ids.reshape(B * R_),
             reduction="none",
         )
@@ -280,8 +286,23 @@ class PrefixValueModel(nn.Module):
         prompt_mask: torch.Tensor,
         response_ids: torch.Tensor,
         response_mask: torch.Tensor,
+        *,
+        ref_logprobs: Optional[torch.Tensor] = None,
     ) -> dict:
         """Run both LMs and assemble per-prefix ``V``.
+
+        Args:
+            prompt_ids/mask, response_ids/mask: usual.
+            ref_logprobs: optional precomputed ``[B, R]`` ``log π_ref``
+                tensor on the response tokens. When provided, the internal
+                ``self.ref`` forward is skipped and these values are used
+                instead. Callers MUST guarantee the tensor was produced by
+                a forward of an equivalent reference LM on the same
+                ``(prompt, response)`` shapes — otherwise the value-model
+                cumulative log-ratio is meaningless. The tensor's shape
+                must equal ``response_ids.shape``; we raise on mismatch
+                rather than silently fall through, since silent fallthrough
+                would mask a wiring bug at the call site.
 
         Returns a dict with
             ``log_ratio``     ``[B, R]`` beta * (log pi_phi - log pi_ref), masked
@@ -293,15 +314,31 @@ class PrefixValueModel(nn.Module):
             self.phi, prompt_ids, prompt_mask, response_ids, response_mask
         )
 
-        # Force ref to eval() inside forward — defends against an outer
-        # `model.train()` call (Module.train() recurses into all submodules,
-        # including frozen ref) re-enabling dropout on the reference network.
-        self.ref.eval()
-        with torch.no_grad():
-            ref_logprobs = self._gather_response_logprobs(
-                self.ref, prompt_ids, prompt_mask, response_ids, response_mask
-            )
+        if ref_logprobs is not None:
+            if ref_logprobs.shape != response_ids.shape:
+                raise ValueError(
+                    f"ref_logprobs shape {tuple(ref_logprobs.shape)} != "
+                    f"response_ids shape {tuple(response_ids.shape)}; cannot "
+                    "share trainer-side ref logprobs into value model"
+                )
+            if ref_logprobs.device != response_ids.device:
+                raise ValueError(
+                    f"ref_logprobs on {ref_logprobs.device} but "
+                    f"response_ids on {response_ids.device}"
+                )
             ref_logprobs = ref_logprobs.detach()
+            if ref_logprobs.dtype != phi_logprobs.dtype:
+                ref_logprobs = ref_logprobs.to(phi_logprobs.dtype)
+        else:
+            # Force ref to eval() inside forward — defends against an outer
+            # `model.train()` call (Module.train() recurses into all submodules,
+            # including frozen ref) re-enabling dropout on the reference network.
+            self.ref.eval()
+            with torch.no_grad():
+                ref_logprobs = self._gather_response_logprobs(
+                    self.ref, prompt_ids, prompt_mask, response_ids, response_mask
+                )
+                ref_logprobs = ref_logprobs.detach()
 
         # mask logprobs *before* the subtraction in compute_log_ratio so that
         # padded positions contribute exactly zero.
@@ -314,9 +351,16 @@ class PrefixValueModel(nn.Module):
         )  # [B, R]
 
         # V[:, t] = sum_{i < t} log_ratio[:, i] with V[:, 0] = 0.
+        # Promote to fp32 *only* for the cumsum: bf16 cumsum accumulates
+        # round-off catastrophically beyond ~T=512. The subtraction in
+        # compute_log_ratio stays in the input dtype to keep activations
+        # small.
         B, R = log_ratio.shape
-        zero = log_ratio.new_zeros(B, 1)
-        V = torch.cat([zero, torch.cumsum(log_ratio, dim=1)], dim=1)  # [B, R+1]
+        log_ratio_f32 = (
+            log_ratio.float() if log_ratio.dtype != torch.float32 else log_ratio
+        )
+        zero = log_ratio_f32.new_zeros(B, 1)
+        V = torch.cat([zero, torch.cumsum(log_ratio_f32, dim=1)], dim=1)  # [B, R+1]
 
         return {
             "log_ratio": log_ratio,

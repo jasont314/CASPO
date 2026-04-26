@@ -18,6 +18,6 @@ export CKPT_SUBDIR="${CKPT_SUBDIR:-final}"
 export EVAL_BENCHMARKS="${EVAL_BENCHMARKS:-math500,math,collegemath,olympiadbench}"
 export EVAL_K="${EVAL_K:-16}"
 export EVAL_GPU_LIST="${EVAL_GPU_LIST:-0 1 2 3 4 5 6}"
-export EVAL_VLLM_GPU_MEMORY_UTILIZATION="${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+export EVAL_VLLM_GPU_MEMORY_UTILIZATION="${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-0.92}"
 
 exec ./scripts/launch_eval_all.sh

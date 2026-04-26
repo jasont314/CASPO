@@ -10,8 +10,12 @@ response contains any ``\\boxed{}`` at all (regardless of correctness).
 
 from __future__ import annotations
 
+import atexit
+import os
 import re
-from typing import List, Optional
+from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
+from typing import List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +307,66 @@ def grade_math(prediction: str, ground_truth: str) -> float:
 # Callable wrapper
 # ---------------------------------------------------------------------------
 
+
+def _grade_chunk(
+    chunk: List[Tuple[str, str, Optional[Tuple[str, str]]]],
+    bonus: float,
+) -> List[float]:
+    """Worker entry-point. Top-level (picklable) by design.
+
+    ``chunk`` is a list of ``(pred, gt, normalized_gt_or_None)`` triples. When
+    the third element is ``(gt_bare, gt_norm)`` the worker can skip the LaTeX
+    peel + canonicalize on the GT and go straight to comparison. When ``None``
+    the worker falls back to deriving them locally — used when the GT is rare
+    enough that the main process didn't bother to cache it.
+    """
+    out: List[float] = []
+    for pred, gt, pre_norm in chunk:
+        pred_inner = extract_boxed_answer(pred)
+        if pred_inner is None:
+            out.append(0.0)
+            continue
+        if pre_norm is not None:
+            gt_bare, gt_norm = pre_norm
+        else:
+            gt_bare = _strip_to_bare(gt) if gt is not None else ""
+            gt_norm = _normalize(gt_bare)
+        if _normalize(pred_inner) == gt_norm:
+            out.append(1.0)
+            continue
+        mv = _try_math_verify(pred_inner, gt_bare)
+        if mv is True:
+            out.append(1.0)
+            continue
+        if mv is False:
+            out.append(bonus)
+            continue
+        sp = _try_sympy(pred_inner, gt_bare)
+        if sp is True:
+            out.append(1.0)
+        else:
+            out.append(bonus)
+    return out
+
+
+# Module-level registry of pools so atexit can shut them down even if a
+# MathRewardFn instance gets GC'd in a non-deterministic order during
+# interpreter teardown.
+_LIVE_POOLS: "list[ProcessPoolExecutor]" = []
+
+
+def _shutdown_all_pools() -> None:  # pragma: no cover - exit path
+    while _LIVE_POOLS:
+        pool = _LIVE_POOLS.pop()
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_all_pools)
+
+
 class MathRewardFn:
     """Callable batch reward.
 
@@ -313,9 +377,25 @@ class MathRewardFn:
     ``1.0`` (the bonus is not stacked on top of a correct grade). The bonus
     is clamped to ``[0.0, 1.0)`` so a wrong-but-formatted answer cannot
     out-score a correct one.
+
+    When ``num_workers > 1`` and the batch is large enough to amortize the
+    IPC cost, grading is dispatched across a persistent
+    ``ProcessPoolExecutor``. SIGALRM-based timeouts in :func:`_try_sympy`
+    require *processes* (signals only fire on the main thread of each
+    process), so a thread pool would silently drop the timeout guard.
     """
 
-    def __init__(self, format_bonus: float = 0.0):
+    # Below this threshold the IPC + chunk-pickle cost dominates the symbolic
+    # work, so we stay on the serial path. ``len(predictions) > workers * 2``
+    # is the documented gate.
+    _MIN_PARALLEL_RATIO: int = 2
+
+    def __init__(
+        self,
+        format_bonus: float = 0.0,
+        num_workers: int = 1,
+        gt_cache_max_size: int = 8192,
+    ):
         b = float(format_bonus)
         if b < 0.0:
             b = 0.0
@@ -323,6 +403,66 @@ class MathRewardFn:
             # Cap strictly below 1.0 — equal would tie wrong with right.
             b = 1.0 - 1e-6
         self.format_bonus = b
+        self.num_workers = max(1, int(num_workers))
+        self.gt_cache_max_size = max(1, int(gt_cache_max_size))
+        # Persistent across PPO outer steps. The DeepScaleR train cycle is
+        # ~7.5K prompts so the same GT recurs many times during one epoch.
+        # OrderedDict gives us FIFO eviction without an explicit deque.
+        self._gt_cache: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
+        # Pool is created lazily on the first parallel-eligible call. Re-used
+        # across calls so we pay the fork cost only once per trainer instance.
+        self._pool: Optional[ProcessPoolExecutor] = None
+
+    # -- pool lifecycle ------------------------------------------------------
+
+    def _ensure_pool(self) -> ProcessPoolExecutor:
+        if self._pool is None:
+            # ``max_workers`` capped at the configured value; spawn-vs-fork is
+            # left to the platform default (fork on Linux, spawn on macOS/Win).
+            self._pool = ProcessPoolExecutor(max_workers=self.num_workers)
+            _LIVE_POOLS.append(self._pool)
+        return self._pool
+
+    def close(self) -> None:
+        """Tear down the worker pool. Idempotent."""
+        if self._pool is not None:
+            try:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            try:
+                _LIVE_POOLS.remove(self._pool)
+            except ValueError:
+                pass
+            self._pool = None
+
+    def __del__(self) -> None:  # pragma: no cover - GC path
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # -- gt cache helpers ----------------------------------------------------
+
+    def _cache_gt(self, gt: str) -> Tuple[str, str]:
+        cached = self._gt_cache.get(gt)
+        if cached is not None:
+            # OrderedDict.move_to_end keeps recently-used entries away from
+            # the FIFO eviction tail.
+            self._gt_cache.move_to_end(gt)
+            return cached
+        gt_bare = _strip_to_bare(gt) if gt is not None else ""
+        cached = (gt_bare, _normalize(gt_bare))
+        self._gt_cache[gt] = cached
+        # Bounded-size: evict the oldest 1024 (or all but the newest 1, if
+        # max_size is tiny) to amortize the rebalance cost.
+        if len(self._gt_cache) > self.gt_cache_max_size:
+            evict = min(1024, max(1, len(self._gt_cache) - self.gt_cache_max_size + 1))
+            for _ in range(evict):
+                self._gt_cache.popitem(last=False)
+        return cached
+
+    # -- main entry ----------------------------------------------------------
 
     def __call__(
         self,
@@ -334,46 +474,67 @@ class MathRewardFn:
                 f"predictions ({len(predictions)}) and ground_truths "
                 f"({len(ground_truths)}) must have the same length"
             )
-        out: List[float] = []
-        # In RL rollouts the same ground truth recurs across many predictions
-        # (group-relative sampling: K rollouts per prompt). Cache the
-        # ``_strip_to_bare`` + ``_normalize`` work per unique GT to avoid
-        # redoing the LaTeX peel + replace-chain every time.
-        gt_cache: dict = {}
         bonus = self.format_bonus
-        for pred, gt in zip(predictions, ground_truths):
-            # Extract once; reuse for both grading and the format bonus.
-            pred_inner = extract_boxed_answer(pred)
-            if pred_inner is None:
-                out.append(0.0)
-                continue
+        n = len(predictions)
+        # Pre-warm the GT cache in the parent so workers don't each redo the
+        # same LaTeX peel + canonicalization. Tuples are cheap to pickle.
+        for gt in ground_truths:
+            self._cache_gt(gt)
 
-            cached = gt_cache.get(gt)
-            if cached is None:
-                gt_bare = _strip_to_bare(gt) if gt is not None else ""
-                cached = (gt_bare, _normalize(gt_bare))
-                gt_cache[gt] = cached
-            gt_bare, gt_norm = cached
+        # Decide whether to fan out. Threshold matches the documented gate:
+        # >1 worker AND batch large enough to amortize the IPC overhead.
+        use_parallel = (
+            self.num_workers > 1
+            and n > self.num_workers * self._MIN_PARALLEL_RATIO
+        )
 
-            # 1) Cheap normalized string equality first (skip math_verify when
-            # the strings already agree after canonicalization).
-            if _normalize(pred_inner) == gt_norm:
-                out.append(1.0)
-                continue
-            # 2) math_verify (symbolic).
-            mv = _try_math_verify(pred_inner, gt_bare)
-            if mv is True:
-                out.append(1.0)
-                continue
-            if mv is False:
-                # math_verify did its symbolic check and disagreed; skip SymPy
-                # to avoid duplicate work / potential hangs.
-                out.append(bonus)
-                continue
-            # 3) SymPy equivalence (only when math_verify unavailable).
-            sp = _try_sympy(pred_inner, gt_bare)
-            if sp is True:
-                out.append(1.0)
-            else:
-                out.append(bonus)
-        return out
+        if not use_parallel:
+            # Serial path — preserves test determinism and avoids fork cost
+            # for the small batches typical in unit tests.
+            out: List[float] = []
+            for pred, gt in zip(predictions, ground_truths):
+                pred_inner = extract_boxed_answer(pred)
+                if pred_inner is None:
+                    out.append(0.0)
+                    continue
+                gt_bare, gt_norm = self._cache_gt(gt)
+                if _normalize(pred_inner) == gt_norm:
+                    out.append(1.0)
+                    continue
+                mv = _try_math_verify(pred_inner, gt_bare)
+                if mv is True:
+                    out.append(1.0)
+                    continue
+                if mv is False:
+                    out.append(bonus)
+                    continue
+                sp = _try_sympy(pred_inner, gt_bare)
+                if sp is True:
+                    out.append(1.0)
+                else:
+                    out.append(bonus)
+            return out
+
+        # Parallel path. Build chunks of (pred, gt, pre_norm) so workers can
+        # skip the GT canonicalization. Chunk size is chosen so each worker
+        # gets roughly two batches' worth of work — keeps stragglers short
+        # without flooding the executor with single-item futures.
+        chunk_count = self.num_workers * 4
+        chunk_size = max(1, (n + chunk_count - 1) // chunk_count)
+        chunks: List[List[Tuple[str, str, Optional[Tuple[str, str]]]]] = []
+        for start in range(0, n, chunk_size):
+            end = min(n, start + chunk_size)
+            triples: List[Tuple[str, str, Optional[Tuple[str, str]]]] = []
+            for i in range(start, end):
+                gt_i = ground_truths[i]
+                triples.append((predictions[i], gt_i, self._gt_cache.get(gt_i)))
+            chunks.append(triples)
+
+        pool = self._ensure_pool()
+        # Submit all chunks, then collect in submission order so the output
+        # list aligns with ``predictions``.
+        futures = [pool.submit(_grade_chunk, chunk, bonus) for chunk in chunks]
+        out_parallel: List[float] = []
+        for fut in futures:
+            out_parallel.extend(fut.result())
+        return out_parallel

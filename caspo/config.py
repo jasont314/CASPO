@@ -60,6 +60,9 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
     "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
     "vllm_weight_sync_backend": ("checkpoint", "ipc"),
+    # vllm_kv_cache_dtype is Optional — None means "auto" (vLLM default).
+    # Validated below in __post_init__ rather than via the curated table so
+    # we keep None passthrough.
 }
 
 # Bool fields that may arrive as the strings "true"/"false" from YAML when
@@ -71,7 +74,7 @@ _BOOL_FIELDS: tuple[str, ...] = (
     "update_value_during_policy", "use_adb", "use_dlw",
     "standardize_step_advantage",
     "vllm_enforce_eager", "vllm_skip_initial_sync",
-    "vllm_return_logprobs",
+    "vllm_return_logprobs", "vllm_enable_chunked_prefill",
     "wandb_enabled",
     "compile", "use_gradient_checkpointing",
     "fsdp_auto_wrap", "fsdp_use_orig_params", "fsdp_cpu_offload",
@@ -245,6 +248,16 @@ class CASPOConfig:
     # for high-throughput rollout jobs after confirming KV cache headroom.
     vllm_max_num_seqs: Optional[int] = None
     vllm_max_num_batched_tokens: Optional[int] = None
+    # Chunked prefill: interleaves prefill chunks with decode steps so a
+    # newly-arriving long prompt does not stall in-flight decode. The vLLM
+    # engine constructor enforces this at True today; the field is kept for
+    # YAML parity with eval-time pipelines that may opt out.
+    vllm_enable_chunked_prefill: bool = True
+    # KV-cache dtype. ``None`` (auto) picks vLLM's default (fp16/bf16 to match
+    # the model dtype); ``"fp8"`` halves KV memory and is used by the eval
+    # pipeline (inference-only, accuracy hit is below seed noise on avg@k).
+    # Rollout side defaults to None so RL training keeps full-precision KV.
+    vllm_kv_cache_dtype: Optional[Literal["auto", "fp8"]] = None
     # "expanded": one vLLM request per sample (safe on all observed vLLM V1
     # builds, but Python-heavy for GRPO/VinePPO).
     # "batched": one request with SamplingParams(n=K); fail fast if the vLLM
@@ -312,6 +325,19 @@ class CASPOConfig:
     # {output_dir}/profile/. Default 0 = profiler off (zero overhead, just an
     # if-check before the loop).
     profile_steps: int = 0
+
+    # ---- reward grading ----
+    # Number of worker processes for parallel SymPy/math_verify grading. The
+    # SymPy fallback uses SIGALRM for adversarial-expression timeouts, which
+    # only works in a process (not a thread). A persistent ProcessPoolExecutor
+    # is created lazily on the first grading call and reused across PPO outer
+    # steps. ``1`` keeps the legacy serial path (deterministic, no fork cost).
+    reward_workers: int = 4
+    # Max size of the per-MathRewardFn ground-truth normalization cache. The
+    # same prompts cycle every ~7.5K examples, so persisting normalized GT
+    # across PPO outer steps avoids redoing the LaTeX peel + replace-chain.
+    # When the cache exceeds this many entries, the oldest 1024 are evicted.
+    gt_cache_max_size: int = 8192
 
     def __post_init__(self) -> None:
         # ---- str → bool coercion ----
@@ -486,6 +512,14 @@ class CASPOConfig:
             raise ValueError(
                 f"profile_steps must be >= 0 (0 disables profiling), got {self.profile_steps}"
             )
+        if self.reward_workers < 1:
+            raise ValueError(
+                f"reward_workers must be >= 1 (1 disables pool), got {self.reward_workers}"
+            )
+        if self.gt_cache_max_size < 1:
+            raise ValueError(
+                f"gt_cache_max_size must be >= 1, got {self.gt_cache_max_size}"
+            )
         if self.vllm_max_num_seqs is not None and self.vllm_max_num_seqs < 1:
             raise ValueError(
                 f"vllm_max_num_seqs must be >= 1 when set, got {self.vllm_max_num_seqs}"
@@ -502,6 +536,15 @@ class CASPOConfig:
             raise ValueError(
                 "vllm_max_num_batched_tokens must be >= 1 when set, "
                 f"got {self.vllm_max_num_batched_tokens}"
+            )
+        # Optional Literal["auto", "fp8"] — validated here so None remains
+        # a legal passthrough (= vLLM default). Any other string is rejected.
+        if self.vllm_kv_cache_dtype is not None and self.vllm_kv_cache_dtype not in (
+            "auto", "fp8",
+        ):
+            raise ValueError(
+                "vllm_kv_cache_dtype must be one of None, 'auto', 'fp8'; "
+                f"got {self.vllm_kv_cache_dtype!r}"
             )
         if (
             self.vllm_max_inflight_requests is not None

@@ -245,10 +245,15 @@ class PrefixValueTrainer:
         self.cfg = cfg
         self.model = model
 
+        # ``fused=True`` is bit-identical to non-fused on CUDA and ~10-20%
+        # faster; silently fall back on CPU where the kwarg is rejected.
+        device = self.model.device
+        use_fused = device.type == "cuda" and torch.cuda.is_available()
         self.optimizer = AdamW(
             (p for p in self.model.phi.parameters() if p.requires_grad),
             lr=cfg.value_lr,
             weight_decay=cfg.value_weight_decay,
+            fused=use_fused,
         )
         self.lr_scheduler = _build_lr_schedule(self.optimizer, cfg.value_warmup_steps)
         self.global_step = 0

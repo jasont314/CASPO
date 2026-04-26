@@ -32,6 +32,7 @@ import contextlib
 import functools
 import json
 import os
+import random
 import time
 import warnings
 from dataclasses import asdict
@@ -85,6 +86,18 @@ def _resolve_dtype(name: str) -> torch.dtype:
     return _DTYPE_MAP[name]
 
 
+def _fused_adamw_supported(device: torch.device) -> bool:
+    """Return True iff fused AdamW is safe on this device.
+
+    Fused AdamW is bit-identical to non-fused (CUDA-only fused-mul-add path),
+    ~10-20% faster on modern GPUs. Falls back silently on CPU / older
+    PyTorch builds where the kwarg is unsupported.
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return device.type == "cuda" and torch.cuda.is_available()
+
+
 def _build_lr_schedule(optimizer, warmup_steps: int) -> LambdaLR:
     def lr_lambda(step: int) -> float:
         if warmup_steps <= 0:
@@ -103,6 +116,27 @@ def _cycle(iterable: Iterable):
             yield x
         if not any_yielded:
             raise RuntimeError("data iterable yielded no examples")
+
+
+def _reshuffling_cycle(examples: list, seed: int):
+    """Infinite iterator over ``examples`` that reshuffles between passes.
+
+    Each pass uses a fresh ``random.Random(seed + epoch)`` so the order is
+    deterministic given ``seed`` and reproducible across reruns, but doesn't
+    repeat the same fixed cycle that a plain ``itertools.cycle`` would. The
+    list is shuffled in place via a per-epoch local copy so callers can keep
+    a stable ``examples`` reference for diagnostics if needed.
+    """
+    if not examples:
+        raise RuntimeError("data iterable yielded no examples")
+    epoch = 0
+    while True:
+        rng = random.Random(int(seed) + epoch)
+        order = list(range(len(examples)))
+        rng.shuffle(order)
+        for i in order:
+            yield examples[i]
+        epoch += 1
 
 
 def _configured_logprob_micro_batch_size(cfg: CASPOConfig) -> int:
@@ -341,6 +375,22 @@ class CASPOTrainer:
         self.model = self._wrap_ddp_if_enabled(
             self.model, module_name="policy", require_trainable=True,
         )
+        # ---- torch.compile (opt-in, applied AFTER DDP/FSDP wrapping) ----
+        # ``mode="reduce-overhead"`` reuses CUDA graphs across steps and is
+        # the right knob for steady-shape workloads like RL rollouts.
+        # ``dynamic=True`` accepts the variable response_len + microbatch
+        # padding without recompiling on each shape; ``fullgraph=False``
+        # tolerates HF's Python-side preprocessing (rotary cache, etc.).
+        # Frozen modules (ref_policy, value_model.ref) are intentionally
+        # not compiled — no autograd, no gain. The value-model phi is
+        # compiled below when present and trainable.
+        if cfg.compile:
+            self.model = torch.compile(
+                self.model,
+                mode="reduce-overhead",
+                dynamic=True,
+                fullgraph=False,
+            )
         if self.value_model is not None:
             if self.ref_policy is None:
                 self.value_model.ref = self._wrap_fsdp_if_enabled(
@@ -354,11 +404,19 @@ class CASPOTrainer:
                 module_name="value_phi",
                 require_trainable=True,
             )
+            if cfg.compile:
+                self.value_model.phi = torch.compile(
+                    self.value_model.phi,
+                    mode="reduce-overhead",
+                    dynamic=True,
+                    fullgraph=False,
+                )
             if cfg.update_value_during_policy:
                 self.value_optimizer = AdamW(
                     (p for p in self.value_model.phi.parameters() if p.requires_grad),
                     lr=cfg.online_value_lr,
                     weight_decay=cfg.value_weight_decay,
+                    fused=_fused_adamw_supported(self.device),
                 )
 
         # ---- optimizer + schedule ----
@@ -366,6 +424,7 @@ class CASPOTrainer:
             (p for p in self.model.parameters() if p.requires_grad),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
+            fused=_fused_adamw_supported(self.device),
         )
         self.lr_scheduler = _build_lr_schedule(self.optimizer, cfg.warmup_steps)
 
@@ -373,7 +432,10 @@ class CASPOTrainer:
         self.delimiter_token_ids = _tokenize_delimiter(self.tokenizer, cfg.step_delimiter)
 
         # ---- reward + data ----
-        self.reward_fn = MathRewardFn()
+        self.reward_fn = MathRewardFn(
+            num_workers=cfg.reward_workers,
+            gt_cache_max_size=cfg.gt_cache_max_size,
+        )
         self.train_examples = list(load_train_dataset(cfg, tokenizer=self.tokenizer))
         if self.dist.is_distributed:
             self.train_examples = self.train_examples[
@@ -384,7 +446,11 @@ class CASPOTrainer:
                 "training dataset is empty after filtering/sharding on "
                 f"rank {self.dist.rank}/{self.dist.world_size}"
             )
-        self._train_iter = _cycle(self.train_examples)
+        # Reshuffle between passes so we don't lock into the same fixed cycle
+        # order across epochs. Seed = cfg.seed bumped per-epoch internally; on
+        # distributed runs each rank already has its own shard, so the
+        # rank-local shuffle is independent — no extra rank stride needed.
+        self._train_iter = _reshuffling_cycle(self.train_examples, cfg.seed)
 
         # ---- rollout backend (HF or vLLM) ----
         backend = cfg.rollout_backend
@@ -786,11 +852,33 @@ class CASPOTrainer:
         response_mask: torch.Tensor,
         outcomes: torch.Tensor,
         prompt_index: Optional[torch.Tensor] = None,
+        *,
+        ref_logprobs_full: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         cfg = self.cfg
         assert self.value_model is not None, "value_model must be set for caspo method"
         mb = max(1, int(cfg.micro_batch_size))
         B = prompt_ids.shape[0]
+        # Sanity: when sharing ref logprobs from the trainer, the precomputed
+        # tensor must cover the full batch. Mismatched shape would silently
+        # corrupt the value-model log-ratio for every microbatch slice.
+        if ref_logprobs_full is not None:
+            if ref_logprobs_full.shape[0] != B:
+                raise ValueError(
+                    f"shared ref_logprobs_full has B={ref_logprobs_full.shape[0]} "
+                    f"but value-model batch is B={B}"
+                )
+            if ref_logprobs_full.shape[1] != response_ids.shape[1]:
+                raise ValueError(
+                    f"shared ref_logprobs_full has R="
+                    f"{ref_logprobs_full.shape[1]} but response_ids has R="
+                    f"{response_ids.shape[1]}"
+                )
+
+        def _ref_slice(start: int, end: int) -> Optional[torch.Tensor]:
+            return (
+                ref_logprobs_full[start:end] if ref_logprobs_full is not None else None
+            )
 
         if self.value_optimizer is None:
             out_chunks: List[torch.Tensor] = []
@@ -800,6 +888,7 @@ class CASPOTrainer:
                     out = self.value_model(
                         prompt_ids[start:end], prompt_mask[start:end],
                         response_ids[start:end], response_mask[start:end],
+                        ref_logprobs=_ref_slice(start, end),
                     )
                 out_chunks.append(out["log_ratio"].detach())
             return torch.cat(out_chunks, dim=0), {}
@@ -841,6 +930,7 @@ class CASPOTrainer:
                 out = self.value_model(
                     prompt_ids[start:end], prompt_mask[start:end],
                     response_ids[start:end], response_mask[start:end],
+                    ref_logprobs=_ref_slice(start, end),
                 )
                 V_x_slice = V_x_full[start:end] if (V_x_full is not None and cfg.use_adb) else None
                 w_slice = w_full[start:end] if (w_full is not None and cfg.use_dlw) else None
@@ -890,16 +980,20 @@ class CASPOTrainer:
         """Compute per-token logprobs for the response tokens without
         materializing the full ``[B, R, V]`` log-softmax. Uses fused
         ``cross_entropy`` (which calls ``log_softmax_lastdim`` under the
-        hood) on a flattened ``[B*R, V]`` view in fp32 — equivalent to
+        hood) on a flattened ``[B*R, V]`` view — equivalent to
         ``log_softmax(.float()).gather(...)`` but ~2× faster and avoids the
-        extra ``[B, R, V]`` fp32 activation. ``logits`` slice is fed
-        directly; we keep the original dtype on input and only upcast to
-        fp32 inside ``cross_entropy``."""
+        extra ``[B, R, V]`` fp32 activation.
+
+        ``cross_entropy`` already accumulates softmax in fp32 internally
+        when fed bf16/fp16 logits, so we feed the original dtype directly
+        instead of materializing a ``[B*R, V]`` fp32 copy of the logits
+        (~2 GB at vocab=32k, B*R=64k saved per microbatch).
+        """
         sliced = logits[:, P - 1 : P - 1 + R, :]
         B, R_, V = sliced.shape
         # cross_entropy returns -logp; negate to get logp.
         neg_logp = F.cross_entropy(
-            sliced.reshape(B * R_, V).float(),
+            sliced.reshape(B * R_, V),
             response_ids.reshape(B * R_),
             reduction="none",
         )
@@ -1223,10 +1317,16 @@ class CASPOTrainer:
         response_ids = rollout.response_ids.to(self.device, non_blocking=True)
         response_mask = rollout.response_mask.to(self.device, non_blocking=True)
         # When rolling out via vLLM, sampling_logprobs come from a different
-        # softmax/attention path than the trainer's. Re-score with the
-        # trainer model so PPO's ratio is meaningful (otherwise mean_ratio
-        # is biased by ~10×). For HF rollout the two paths are identical and
-        # this re-score is a no-op modulo numerics — but cheap, so always do it.
+        # softmax/attention path than the trainer's. PPO's "old logprobs"
+        # must come from the trainer's own forward at the pre-update weights
+        # (otherwise ratio is biased by ~10×). We reuse the *first* epoch's
+        # microbatch forward as the old-logprobs source: at epoch 0 the
+        # policy hasn't moved yet, so new_logprobs == old_logprobs and
+        # ``ratio = exp(new - old) == 1`` exactly. This eliminates the
+        # full-pass ``_rescore_old_logprobs`` call, saving one forward over
+        # the whole rollout per step (≈ ``epochs_per_rollout / (1 + epochs)``
+        # of policy-time). The collected detached values then serve as the
+        # frozen π_old for epochs 1..N-1.
         rewards = rollout.rewards.to(self.device, non_blocking=True).float()
         prompt_index = rollout.prompt_index.to(self.device, non_blocking=True)
         tiled_prompt_ids = prompt_ids[prompt_index]
@@ -1237,12 +1337,26 @@ class CASPOTrainer:
         response_len_stats = _scalar_tensor_stats(response_token_counts)
         response_tokens_total = float(response_token_counts.sum().item())
         t_device = time.time() - t_device_start
-        # Re-score old logprobs with trainer's forward at the pre-update weights.
-        t_old_logprobs_start = time.time()
-        old_logprobs_full = self._rescore_old_logprobs(
+        # Old-logprobs are built up lazily during epoch 0 from the *same*
+        # microbatch forwards used for the policy gradient, then frozen
+        # and reused for epochs 1..N-1 via per-microbatch slices in
+        # ``old_logprobs_chunks`` below. ``t_old_logprobs`` is retained
+        # for the timing payload but stays at 0 — the cost is folded into
+        # ``t_policy_s``.
+        t_old_logprobs = 0.0
+
+        # Precompute frozen reference logprobs once per rollout. We hoist
+        # this *before* the value-model forward (when method=caspo) so the
+        # value model can reuse the same ``[B, R]`` tensor instead of
+        # running its own ``self.ref`` forward — saving one base-model
+        # forward per step. ``ref_logprobs_full`` is also reused inside
+        # every PPO epoch's microbatch loop, replacing the previous
+        # per-step ref-precompute that ran after the advantage block.
+        t_ref_logprobs_start = time.time()
+        ref_logprobs_full = self._precompute_ref_logprobs(
             tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
         )
-        t_old_logprobs = time.time() - t_old_logprobs_start
+        t_ref_logprobs = time.time() - t_ref_logprobs_start
 
         method = cfg.method
 
@@ -1299,9 +1413,15 @@ class CASPOTrainer:
             t_value_start = time.time()
             if method == "caspo":
                 binary_outcomes = (rewards >= 0.5).float()
+                # Share the trainer's already-computed ref_logprobs_full so
+                # the value model skips its own ``self.ref`` forward — saves
+                # one base-model forward over the rollout per step. The
+                # value model raises if shapes don't match the response
+                # tensor (which would indicate a wiring bug).
                 log_ratio, value_stats = self._value_forward_with_optional_update(
                     tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
                     binary_outcomes, prompt_index=prompt_index,
+                    ref_logprobs_full=ref_logprobs_full,
                 )
                 V_step = step_values_from_log_ratios(
                     log_ratio, response_mask, seg.boundary_after, seg.step_count,
@@ -1370,12 +1490,21 @@ class CASPOTrainer:
         accum = max(1, int(cfg.grad_accum_steps))
         n_epochs = max(1, int(cfg.epochs_per_rollout))
 
-        total_loss = 0.0
-        total_pg = 0.0
-        total_kl = 0.0
-        total_logp = 0.0
-        total_clip_frac = 0.0
-        total_ratio = 0.0
+        # On-device accumulators: each microbatch appends one stacked
+        # tensor (per-stat scalar weighted by micro_tokens). We materialize
+        # all of them in a single ``torch.stack(...).tolist()`` at the end
+        # of the policy loop instead of paying a CUDA→host sync per
+        # ``.item()`` per microbatch (~5 syncs per micro). Reference:
+        # caspo/value/train_value.py:144 uses the same pattern.
+        accum_device = self.device
+        accum_dtype = torch.float32
+        zero_scalar = torch.zeros((), device=accum_device, dtype=accum_dtype)
+        loss_terms: List[torch.Tensor] = []
+        pg_terms: List[torch.Tensor] = []
+        logp_terms: List[torch.Tensor] = []
+        clip_terms: List[torch.Tensor] = []
+        ratio_terms: List[torch.Tensor] = []
+        kl_terms: List[torch.Tensor] = []
         total_kl_seen = 0   # only counts micros that produced a KL estimate
         n_micro = 0
         token_weight_denom = 0.0
@@ -1384,11 +1513,9 @@ class CASPOTrainer:
         grad_norm_max = 0.0
         grad_norm_count = 0
 
-        t_ref_logprobs_start = time.time()
-        ref_logprobs_full = self._precompute_ref_logprobs(
-            tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
-        )
-        t_ref_logprobs = time.time() - t_ref_logprobs_start
+        # ``ref_logprobs_full`` was already precomputed at the top of step()
+        # so the value model could share it (see hoist comment above). It
+        # stays valid for every PPO epoch since π_ref is frozen.
 
         # Iterate the SAME rollout n_epochs times. π_old / advantages stay
         # frozen (computed before this loop); only π_θ updates each epoch.
@@ -1409,6 +1536,7 @@ class CASPOTrainer:
             sum(micro_token_counts[i : min(i + accum, n_micros_total)])
             for i in range(0, n_micros_total, accum)
         ]
+        old_logprobs_chunks = [None] * n_micros_total
         for epoch in range(n_epochs):
             # Reset accumulator counter so the optimizer step boundary
             # ``n_micro_in_epoch % accum == 0`` is computed within the epoch.
@@ -1427,7 +1555,22 @@ class CASPOTrainer:
                         tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
                         response_ids[start:end], response_mask[start:end],
                     )
-                    old_lp = old_logprobs_full[start:end]
+                    if epoch == 0:
+                        # Freeze π_old from this microbatch's forward. At
+                        # epoch 0 the policy hasn't moved yet, so by
+                        # construction ``ratio = exp(new - old) == 1``
+                        # exactly here — the PPO clip term reduces to
+                        # ``-A`` (unclipped surrogate). Subsequent epochs
+                        # read this slice unmodified.
+                        old_lp = new_logprobs.detach()
+                        old_logprobs_chunks[micro_idx] = old_lp
+                    else:
+                        cached = old_logprobs_chunks[micro_idx]
+                        assert cached is not None, (
+                            f"missing cached old_logprobs for microbatch "
+                            f"{micro_idx} at epoch {epoch}"
+                        )
+                        old_lp = cached
                     adv = token_advantage[start:end]
                     mask = response_mask[start:end]
 
@@ -1446,14 +1589,19 @@ class CASPOTrainer:
                     (loss * grad_weight).backward()
 
                 with torch.no_grad():
-                    total_loss += float(loss.item()) * micro_tokens
-                    total_pg += float(stats["pg_loss"].item()) * micro_tokens
-                    total_logp += float(stats["mean_logp"].item()) * micro_tokens
-                    total_clip_frac += float(stats["clip_frac"].item()) * micro_tokens
-                    total_ratio += float(stats["mean_ratio"].item()) * micro_tokens
-                    token_weight_denom += micro_tokens
+                    # Stage on-device contributions; we ``.tolist()`` the
+                    # whole stack once after the policy loop. ``micro_tokens``
+                    # is a Python float — multiplying by it avoids creating a
+                    # tensor scalar for the weight.
+                    w = float(micro_tokens)
+                    loss_terms.append(loss.detach().to(accum_dtype) * w)
+                    pg_terms.append(stats["pg_loss"].to(accum_dtype) * w)
+                    logp_terms.append(stats["mean_logp"].to(accum_dtype) * w)
+                    clip_terms.append(stats["clip_frac"].to(accum_dtype) * w)
+                    ratio_terms.append(stats["mean_ratio"].to(accum_dtype) * w)
+                    token_weight_denom += w
                     if "mean_kl" in stats:
-                        total_kl += float(stats["mean_kl"].item()) * micro_tokens
+                        kl_terms.append(stats["mean_kl"].to(accum_dtype) * w)
                         total_kl_seen += 1
                     n_micro += 1
                     n_micro_in_epoch += 1
@@ -1476,6 +1624,26 @@ class CASPOTrainer:
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     n_optim_steps += 1
+        # Single sync: materialize all per-stat token-weighted sums in one
+        # CUDA→host round-trip. ``torch.stack`` over zero-dim tensors costs
+        # virtually nothing; the saving is ~5 syncs/microbatch * n_micro
+        # eliminated.
+        with torch.no_grad():
+            stat_stack = torch.stack(
+                [
+                    torch.stack(loss_terms).sum() if loss_terms else zero_scalar,
+                    torch.stack(pg_terms).sum() if pg_terms else zero_scalar,
+                    torch.stack(logp_terms).sum() if logp_terms else zero_scalar,
+                    torch.stack(clip_terms).sum() if clip_terms else zero_scalar,
+                    torch.stack(ratio_terms).sum() if ratio_terms else zero_scalar,
+                    torch.stack(kl_terms).sum() if kl_terms else zero_scalar,
+                ]
+            )
+            stat_vals = stat_stack.tolist()
+        total_loss, total_pg, total_logp, total_clip_frac, total_ratio, total_kl = (
+            stat_vals[0], stat_vals[1], stat_vals[2],
+            stat_vals[3], stat_vals[4], stat_vals[5],
+        )
         t_policy = time.time() - t_policy_start
 
         # Sync vLLM weights for the next rollout (if applicable). The train

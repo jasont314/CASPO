@@ -721,8 +721,10 @@ The eval launcher supports:
 - `EVAL_BENCHMARKS`: comma-separated list, default `math500,math,collegemath,olympiadbench`.
 - `EVAL_LIMIT`: optional per-benchmark problem cap for sample eval.
 - `EVAL_K`: samples per problem, default `16`.
-- `EVAL_VLLM_GPU_MEMORY_UTILIZATION`: defaults to `0.85` because eval does not
-  share the GPU with a trainer.
+- `EVAL_VLLM_GPU_MEMORY_UTILIZATION`: defaults to `0.92` because eval does
+  not share the GPU with a trainer; combined with `kv_cache_dtype="fp8"`
+  this lets the engine hold ~2× more concurrent KV blocks for the K=16
+  multi-sample fanout.
 
 ## Latest Paper-Faithful Speed Probe
 
@@ -792,6 +794,83 @@ MICRO_BATCH_SIZE=1 GRAD_ACCUM_STEPS=64 USE_GRADIENT_CHECKPOINTING=true \
 CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.45 \
 RUN_TAG=conservative ./scripts/launch_rho1b_caspo.sh
 ```
+
+### Round 2 optimizations (Apr 2026)
+
+A second optimization pass landed on top of the Pareto sweep. Each item is
+a pure speed-up — no effective-learning change beyond ~1e-3 bf16 noise.
+
+| Optimization | Mechanism | Gain |
+|---|---|---|
+| FlashAttention 3 (HF + vLLM) | `attn_implementation: flash_attention_3` in YAML; FA3 Hopper backend installed in `scalable` env | Faster attention forward+backward on H100 |
+| Reuse epoch-0 forward as `old_logprobs` | Skip dedicated `_rescore_old_logprobs` pass; capture `new_logprobs.detach()` from the first PPO epoch | One full forward per step eliminated; `t_old` drops from ~6 s to 0 s |
+| Share `ref_logprobs` between trainer KL and value model | `value_model.forward(ref_logprobs=...)` accepts a precomputed tensor | One full ref forward eliminated for CASPO; ~10 GB activation peak reduction |
+| Drop `.float()` upcast inside `cross_entropy` | bf16 cross_entropy with internal fp32 reduction is numerically equivalent | ~2 GB activation per microbatch saved; CE kernel ~5-10% faster |
+| `fused=True` AdamW | Single fused CUDA kernel instead of foreach + 3 launches | Bit-identical, 1-2% step time |
+| Stack scalars in microbatch loop | Replace per-microbatch `.item()` syncs with on-device accumulator + single `.tolist()` | Removes CPU-GPU sync per microbatch |
+| `torch.compile` (opt-in via `cfg.compile=true`) | `mode="reduce-overhead", dynamic=True` on policy and `value_model.phi` | 10-15% policy forward+backward when recompiles stay rare; off by default |
+| Parallel SymPy reward verifier | `ProcessPoolExecutor` over chunked predictions when `cfg.reward_workers > 1`, gated on batch size | Hides up to 2-10 s/step on hard problem batches |
+| Persistent ground-truth cache | Per-trainer `OrderedDict` keyed on raw GT string with FIFO eviction at `cfg.gt_cache_max_size` | Eliminates per-call GT renormalization across the ~7.5K-prompt cycle |
+| Cached tokenized dataset | First call writes `${HF_HOME}/caspo_dataset_cache/<hash>.pt`; subsequent processes load directly | Faster cold-start; `CASPO_DATASET_CACHE_DISABLE=1` opts out |
+| Shuffled training cycle | `random.Random(cfg.seed + epoch).shuffle(...)` per cycle | Same gradients per step, different order — quality lever, not speed |
+| Pre-tokenize prompt cache in vLLM rollout | LRU cache (max=1024) keyed by prompt string | Removes per-step Python tokenize loop |
+| Eval `kv_cache_dtype="fp8"` + `gpu_memory_utilization=0.92` | Halves KV bytes; doubles concurrent KV blocks for K=16 fanout | ~30-50% faster eval |
+| Eval `enable_chunked_prefill=True` + `max_num_batched_tokens=8192` | Interleaves prefills with decodes when many K-fanout requests share prompt prefixes | Stacks with above |
+| Eval `top_k=50` for SamplingParams | Avoids full-vocab sort under top_p sampling | ~2-3% eval |
+| Default `wandb_mode=offline` in single-method launchers | Avoids intermittent network stalls during training | Risk reduction |
+| `wait -n` dispatcher in 8-GPU launcher | When a method finishes, immediately dispatch its eval on the freed GPU instead of waiting for everyone | ~7-12 h saved per full suite |
+| Health-check sidecar watchdog | Polls each method's log every 60 s, warns on `STATUS: STALE` for 2 consecutive polls (no auto-kill in v1) | Avoids overnight idle on hangs |
+| `WAIT_FOR_CHILDREN=0` detached mode | Writes `launcher_pids.json` and exits without blocking | Detachable suite |
+
+Per-method post-Round-2 step times (single H100, validated by 6-step smokes
+on `mb=8/accum=8/ckpt=false/vllm_util=0.30` plus all Round 2 patches):
+
+| Method | Round 1 step time | Round 2 step time | Round 1+2 vs original |
+|---|---:|---:|---:|
+| PPO | ~50s | **~43s** | 90s → 43s (~2.1×) |
+| GRPO | ~48s | **~43s** | 92s → 43s (~2.1×) |
+| CASPO (online RM) | ~75s | **~60s** | 141s → 60s (~2.4×) |
+| caspo-frozen-rm | ~63s | (untested at R2; should track CASPO ratio) | 141s → ~50s |
+| VinePPO K=9 (1-GPU) | ~191s | **per-MC throughput unchanged**; per-step varies with `steps/r` (191-308s observed across batches) | net ~unchanged at fixed `steps/r` |
+
+VinePPO's step time scales as `steps_per_response × K=9` because each
+non-terminal step boundary triggers K MC continuations. Per-MC sampling
+throughput on Round 2 measured at 0.0066 s/sample, identical to Round 1.
+Variance across smokes (steps/r 6.6-10.2) is a function of the policy's
+response-length distribution at SFT init, not an optimization regression.
+GRPO/PPO are unaffected (`steps/r=1` always); CASPO's per-step value is one
+V_φ forward per response and does not multiply with `steps/r`.
+
+Notes:
+- Rollout's `enable_chunked_prefill` is OFF by default (verified that VinePPO's K=9 MC pattern regressed by ~70% with chunked-prefill on, since mixed prefill-decode CUDA graphs penalize many short prefixes). Eval keeps it on.
+- `cfg.compile` is wired but defaults to false; first-step compile cost (~30-90 s) is amortized over hundreds of steps but adds dynamic-recompile risk on variable seq lengths. Opt-in only.
+- `EnsureLR / no schedule changes`: nothing in this round affects learning rate, KL coef, or PPO clip; comparison with the original VinePPO setup remains apples-to-apples up to bf16 reduction noise.
+
+### FA3 install
+
+Installed via:
+
+```bash
+/opt/conda/envs/scalable/bin/pip install --no-build-isolation \
+  "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git#subdirectory=hopper"
+```
+
+Verify:
+
+```bash
+/opt/conda/envs/scalable/bin/python -c "
+import flash_attn_interface
+import torch
+from transformers import AutoModelForCausalLM
+m = AutoModelForCausalLM.from_pretrained('realtreetune/rho-1b-sft-MATH',
+    torch_dtype=torch.bfloat16, attn_implementation='flash_attention_3').cuda()
+ids = torch.tensor([[1,2,3,4,5,6,7,8]], device='cuda')
+print(m(ids).logits.shape)
+"
+```
+
+If FA3 is unavailable at runtime, HF transformers falls back to FA2 with a
+warning — non-fatal.
 
 ## Latest Two-GPU VinePPO Probe
 

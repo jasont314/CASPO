@@ -85,7 +85,14 @@ def step_values_from_log_ratios(
     # the final result back to the input dtype.
     use_float32 = dtype in (torch.bfloat16, torch.float16)
     compute_dtype = torch.float32 if use_float32 else dtype
-    masked_lr = log_ratio.to(compute_dtype) * response_mask.to(compute_dtype)
+    # One mask cast (in log_ratio's dtype), then a single upcast on the
+    # already-masked product. Avoids materializing a fp32 copy of
+    # ``log_ratio`` *and* a fp32 copy of ``response_mask`` simultaneously
+    # — multiplying first in the input dtype and casting the small product
+    # (``[B, R]``) once is cheaper than casting both [B, R] inputs.
+    masked_lr = log_ratio * response_mask.to(log_ratio.dtype)
+    if masked_lr.dtype != compute_dtype:
+        masked_lr = masked_lr.to(compute_dtype)
 
     # cumsum[b, k] is the running sum INCLUDING token k. If k is the last
     # token of step t-1, cumsum[b, k] is V at the START of step t.

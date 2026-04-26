@@ -6,7 +6,7 @@
 # Phase 2 then runs CASPO with this config.
 model_name_or_path: realtreetune/rho-1b-sft-MATH
 torch_dtype: bfloat16
-attn_implementation: flash_attention_2
+attn_implementation: flash_attention_3
 trust_remote_code: false
 
 # VinePPO/PPO MATH dataset: standard MATH train split.
