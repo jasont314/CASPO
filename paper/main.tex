@@ -260,6 +260,9 @@ CASPO advantage ablations can be launched with
 \texttt{scripts/launch\_rho1b\_caspo\_ablations.sh}; by default this schedules
 only the two extra \texttt{prob} and \texttt{logprob} variants because
 \texttt{value} is the main CASPO run.
+The frozen-RM ablation uses
+\texttt{scripts/launch\_rho1b\_caspo\_frozen\_rm.sh}, keeping IPVRM scoring
+while setting \texttt{update\_value\_during\_policy=false}.
 
 \section{Limitations and Open Engineering Questions}
 \caspo{} depends on the quality and calibration of the learned prefix value

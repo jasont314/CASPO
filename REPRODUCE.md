@@ -154,6 +154,20 @@ ADV_VARIANTS="value prob logprob" GPU_LIST="4 5 6" \
   ./scripts/launch_rho1b_caspo_ablations.sh
 ```
 
+Frozen-RM CASPO disables online value updates while keeping prefix-value
+scoring:
+
+```bash
+RUN_TAG=paper512_seed0 GPU_LIST="4" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_caspo_frozen_rm.sh
+```
+
+Output:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_frozen_rm_paper512_seed0
+```
+
 ## Evaluation
 
 Use cheap sample evals at intermediate checkpoints:
@@ -173,7 +187,7 @@ RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 Eval defaults:
 
 - Methods: CASPO, GRPO, VinePPO, PPO
-- Override with `METHODS="caspo_prob caspo_logprob"` for CASPO ablation evals
+- Override with `METHODS="caspo_prob caspo_logprob caspo_frozen_rm"` for CASPO ablation evals
 - Benchmarks: `math500,math,collegemath,olympiadbench`
 - `EVAL_K=16`
 - temperature `0.35`
