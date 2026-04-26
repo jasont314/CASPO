@@ -1,17 +1,16 @@
 """Config validation / comparison tool for CASPO YAML configs.
 
 Loads every config in ``configs/*.yaml`` via ``CASPOConfig.from_yaml`` and
-reports key training hyperparameters, plus sanity checks on effective
-batch math:
+reports key training hyperparameters, plus sanity checks on rollout/minibatch
+math:
 
-  * effective batch size E = grad_accum_steps * micro_batch_size *
-    prompts_per_step / group_size  -- this is the number of *prompts* whose
-    rollouts contribute one optimizer step.
-  * Target effective batch T = group_size * prompts_per_step  (the natural
-    "1 macro-step worth" reference).
-  * GRPO standardize requires effective_batch_in_responses
-    (= prompts_per_step * group_size) to be a multiple of group_size, which
-    it is by construction; we still re-verify in case of weird edits.
+  * rollout_responses = prompts_per_step * group_size -- responses generated
+    before PPO epochs are run.
+  * optimizer_batch_responses = micro_batch_size * grad_accum_steps --
+    responses consumed by one optimizer update.
+  * optimizer_batch_responses must evenly tile rollout_responses. This allows
+    paper-faithful VinePPO settings such as 512 rollout responses trained in
+    64-response minibatches for multiple PPO epochs.
 
 Usage
 -----
@@ -79,9 +78,9 @@ class ConfigReport:
     def actual_effective_responses(self) -> int:
         """How many responses one optimizer step actually consumes.
 
-        ``micro_batch_size`` is in *responses*, ``grad_accum_steps`` chains
-        them, and we run one rollout per optimizer step (rollout produces
-        ``prompts_per_step * group_size`` responses).
+        ``micro_batch_size`` is in responses and ``grad_accum_steps`` chains
+        them into a PPO minibatch. One rollout can contain multiple optimizer
+        minibatches per epoch.
         """
         assert self.cfg is not None
         return (
@@ -133,21 +132,26 @@ def _validate(report: ConfigReport) -> list[str]:
         return issues
     value_only = report.name.startswith("value_")
 
-    # 1. effective batch in responses must be a multiple of group_size, so
-    # GRPO/CASPO group standardize sees whole groups per accumulation window.
+    # 1. optimizer minibatches must evenly tile the rollout response pool.
     # The rollout produces ``prompts_per_step * group_size`` responses; the
     # trainer iterates over them in micro-batches of size ``micro_batch_size``
-    # for ``grad_accum_steps`` steps. The product
-    # micro_batch_size * grad_accum_steps should evenly tile that pool.
+    # for ``grad_accum_steps`` steps per optimizer update. The product
+    # micro_batch_size * grad_accum_steps is the PPO minibatch size in
+    # responses. Paper-faithful VinePPO uses 512 rollout responses and a
+    # 64-response PPO minibatch, so equality here would be too strict.
     if not value_only:
         rollout_responses = cfg.prompts_per_step * cfg.group_size
         consumed = cfg.micro_batch_size * cfg.grad_accum_steps
-        if consumed != rollout_responses:
+        if consumed <= 0:
             issues.append(
-                f"micro_batch_size*grad_accum_steps={consumed} does not equal "
-                f"prompts_per_step*group_size={rollout_responses} "
+                f"micro_batch_size*grad_accum_steps={consumed} must be positive"
+            )
+        elif rollout_responses % consumed != 0:
+            issues.append(
+                f"micro_batch_size*grad_accum_steps={consumed} does not evenly "
+                f"tile prompts_per_step*group_size={rollout_responses} "
                 f"(rollout produces {rollout_responses} responses, optimizer "
-                f"consumes {consumed} per step)"
+                f"minibatch consumes {consumed})"
             )
 
     # 2. group_size divisibility: the trainer's group standardize assumes
@@ -224,18 +228,19 @@ def _print_single(report: ConfigReport) -> None:
     for key in REPORT_KEYS:
         print(f"  {key:>22s}: {_fmt_value(getattr(cfg, key))}")
     print(
-        f"  {'target_eff_batch':>22s}: "
+        f"  {'rollout_responses':>22s}: "
         f"{report.target_effective_batch}  (=group_size*prompts_per_step)"
     )
     print(
-        f"  {'rollout_responses':>22s}: "
-        f"{cfg.prompts_per_step * cfg.group_size}"
-    )
-    print(
-        f"  {'optimizer_consumes':>22s}: "
+        f"  {'optimizer_batch':>22s}: "
         f"{cfg.micro_batch_size * cfg.grad_accum_steps}  "
         f"(=micro_batch_size*grad_accum_steps)"
     )
+    if cfg.micro_batch_size * cfg.grad_accum_steps > 0:
+        print(
+            f"  {'batches_per_epoch':>22s}: "
+            f"{(cfg.prompts_per_step * cfg.group_size) // (cfg.micro_batch_size * cfg.grad_accum_steps)}"
+        )
     issues = _validate(report)
     if issues:
         print("  WARNINGS:")
@@ -308,16 +313,20 @@ def _print_diff(reports: list[ConfigReport]) -> None:
     )
     rows.append(
         (
-            "batch_match",
+            "batches_per_epoch",
             [
                 (
                     "n/a"
                     if r.name.startswith("value_")
-                    else
-                    "yes"
+                    else str(
+                        (r.cfg.prompts_per_step * r.cfg.group_size)
+                        // (r.cfg.micro_batch_size * r.cfg.grad_accum_steps)
+                    )
                     if r.cfg is not None
-                    and r.cfg.micro_batch_size * r.cfg.grad_accum_steps
-                    == r.cfg.prompts_per_step * r.cfg.group_size
+                    and r.cfg.micro_batch_size * r.cfg.grad_accum_steps > 0
+                    and (r.cfg.prompts_per_step * r.cfg.group_size)
+                    % (r.cfg.micro_batch_size * r.cfg.grad_accum_steps)
+                    == 0
                     else "NO"
                 )
                 if r.cfg is not None

@@ -1,5 +1,5 @@
 # CASPO on Rho-1B-MATH — matches VinePPO setup for direct comparison against
-# their Figs 4/5/6 (Rho-1B on MATH). Hyperparameters lifted verbatim from
+# their Figs 4/5/6 (Rho-1B on MATH). Core hyperparameters are lifted from
 # VinePPO/configs/polIter_rho1bSft2_vineppo_MATH.jsonnet + ppo_MATH.jsonnet.
 #
 # Phase 1 first (collect rollouts on Rho-1B SFT, train V_phi),
@@ -19,15 +19,15 @@ prompt_template: "[MATH_TASK] Problem:\n{query}\n\nSolution:"
 max_prompt_len: 1024
 max_response_len: 1024            # VinePPO: max_tokens=1024
 
-# rollout (matches VinePPO)
+# rollout (matches VinePPO Rho-1B MATH: 512 episodes/iteration from
+# 64 prompts x 8 rollouts per prompt)
 group_size: 8
 rollout_temperature: 0.6
 rollout_top_p: 0.9
 rollout_top_k: -1
 value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
 rollout_backend: vllm
-prompts_per_step: 8               # 8 prompts × G=8 = 64 episodes per step
-                                  # VinePPO: 512/iter @ 8 epochs/iter ≈ 64 episodes/grad-step
+prompts_per_step: 64              # 64 prompts x G=8 = 512 episodes per PPO step
 
 # vLLM runtime. Trainer/ref/value/optimizer share the same 80GB H100 as vLLM
 # for 1B single-GPU runs, so keep the engine below half-memory and use CUDA
@@ -86,15 +86,15 @@ kl_estimator: k3                  # control_variate ≈ k3 unbiased
 output_dir: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math
 lr: 1.0e-6
 weight_decay: 0.0
-warmup_steps: 60                  # ≈ warmup_ratio 0.03 × 2000 step-equivalents
+warmup_steps: 480                 # warmup_ratio 0.03 x (1000 steps x 16 optimizer updates/step)
 grad_clip: 1.0
 micro_batch_size: 1
-grad_accum_steps: 64              # 8 prompts × G=8 = 64 episodes / mb=1 → accum=64 → effective batch 64
+grad_accum_steps: 64              # 64-response PPO minibatches; 512-response rollout tiles into 8 minibatches/epoch
 epochs_per_rollout: 2             # VinePPO: num_epochs_per_iteration=2
 max_steps: 1000                   # VinePPO: total_num_iterations=1000
 seed: 0
 log_every: 1
-save_every: 40                    # VinePPO: save_steps=40
+save_every: 40                    # PPO repo config save_steps=40; VinePPO's repo overrides this to 10
 eval_every: 40
 
 device: cuda

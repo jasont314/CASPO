@@ -97,8 +97,9 @@ deepspeed --no_local_rank --num_gpus=8 src/treetune/main.py \
 - SFT init checkpoints
 - Dataset + prompt format
 - group_size = 8, temperature = 0.6, top_p = 0.9, max_tokens = 1024 (MATH) / 512 (GSM8K)
+- Rho-1B MATH rollout shape = 512 episodes/iteration = 64 prompts × 8 rollouts
 - LR = 1e-6, weight_decay = 0, warmup ~ 0.03, max_grad_norm = 1.0
-- target_train_batch_size = 64
+- target_train_batch_size = 64 (mapped to 64-response PPO minibatches)
 - num_epochs_per_iteration = 2, total_num_iterations = 1000
 - KL: init_kl_coef = 1e-4 (control_variate KL ≈ k3 estimator)
 - γ = 1.0, λ = 1.0 (VinePPO match), PPO clip ε = 0.2
