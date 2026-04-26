@@ -371,9 +371,62 @@ class PrefixValueModel(nn.Module):
 
     # ------------------------------------------------------------------ io
     def save_pretrained(self, path: str) -> None:
-        """Save only ``phi`` plus a small metadata file pointing to the ref."""
+        """Save only ``phi`` plus a small metadata file pointing to the ref.
+
+        FSDP-aware: when ``self.phi`` is an FSDP-wrapped module, every rank
+        must enter ``state_dict_type(FULL_STATE_DICT)`` together so the
+        ``offload_to_cpu=True, rank0_only=True`` gather can run. Only rank 0
+        writes the actual files. Mirrors the pattern in
+        ``caspo/trainer/caspo_trainer.py:_save_policy_pretrained``.
+        """
+        phi = self.phi
+        is_fsdp = phi.__class__.__name__ == "FullyShardedDataParallel"
+
+        # Resolve rank — fall back to 0 if torch.distributed is not init
+        # (single-process call path).
+        try:
+            import torch.distributed as _dist
+            _dist_init = _dist.is_available() and _dist.is_initialized()
+            rank = _dist.get_rank() if _dist_init else 0
+        except Exception:
+            _dist_init = False
+            rank = 0
+
+        if is_fsdp:
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                FullyShardedDataParallel as FSDP,
+                StateDictType,
+            )
+
+            full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(phi, StateDictType.FULL_STATE_DICT, full_cfg):
+                state_dict = phi.state_dict()
+
+            if rank == 0:
+                os.makedirs(path, exist_ok=True)
+                inner = getattr(phi, "module", phi)
+                inner.save_pretrained(path, state_dict=state_dict)
+                try:
+                    self.tokenizer.save_pretrained(path)
+                except Exception as e:  # pragma: no cover
+                    warnings.warn(f"tokenizer save_pretrained failed: {e}")
+                meta = {
+                    "ref_model_path": self._ref_model_path,
+                    "model_name_or_path": self._phi_model_path,
+                    "beta": self._beta,
+                    "margin": self._margin,
+                }
+                with open(os.path.join(path, "caspo_value_meta.json"), "w") as f:
+                    json.dump(meta, f, indent=2)
+            return
+
+        # Non-FSDP path: rank-0-only write when distributed (e.g. DDP), else
+        # plain single-process save.
+        if rank != 0:
+            return
         os.makedirs(path, exist_ok=True)
-        self.phi.save_pretrained(path)
+        phi.save_pretrained(path)
         try:
             self.tokenizer.save_pretrained(path)
         except Exception as e:  # pragma: no cover

@@ -15,6 +15,8 @@ training script drives the data iterator and the checkpointing.
 
 from __future__ import annotations
 
+import functools
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -23,6 +25,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from caspo.config import CASPOConfig
+from caspo.utils.distributed import distributed_env, is_dist_initialized
 from caspo.value.prefix_value import PrefixValueModel
 
 
@@ -221,6 +224,83 @@ def compute_adb_dlw_factors(
 # Trainer
 # ---------------------------------------------------------------------------
 
+def _infer_fsdp_layer_classes(module: torch.nn.Module) -> set:
+    """Mirror of CASPOTrainer._infer_fsdp_layer_classes for the value phi."""
+    names = set(getattr(module, "_no_split_modules", None) or [])
+    config = getattr(module, "config", None)
+    names.update(getattr(config, "_no_split_modules", None) or [])
+    if not names:
+        return set()
+    return {
+        m.__class__
+        for m in module.modules()
+        if m.__class__.__name__ in names
+    }
+
+
+def _wrap_phi_fsdp(
+    phi: torch.nn.Module,
+    cfg: CASPOConfig,
+    *,
+    local_rank: int,
+    world_size: int,
+) -> torch.nn.Module:
+    """FSDP-wrap the trainable ``phi`` LM.
+
+    Mirrors ``caspo/trainer/caspo_trainer.py:_wrap_fsdp_if_enabled``. The
+    frozen ``ref`` LM is left un-sharded (no opt state, just 14 GB resident
+    per rank for a 7B bf16 model) so all-gathers during forward are not
+    needed for the ref pass.
+    """
+    from torch.distributed.fsdp import (
+        BackwardPrefetch,
+        CPUOffload,
+        FullyShardedDataParallel as FSDP,
+        ShardingStrategy,
+    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    strategy_map = {
+        "full_shard": ShardingStrategy.FULL_SHARD,
+        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+        "no_shard": ShardingStrategy.NO_SHARD,
+    }
+    backward_prefetch_map = {
+        "backward_pre": BackwardPrefetch.BACKWARD_PRE,
+        "backward_post": BackwardPrefetch.BACKWARD_POST,
+        "none": None,
+    }
+
+    kwargs = {
+        "sharding_strategy": strategy_map[cfg.fsdp_sharding_strategy],
+        "cpu_offload": CPUOffload(offload_params=cfg.fsdp_cpu_offload),
+        "use_orig_params": cfg.fsdp_use_orig_params,
+        "forward_prefetch": cfg.fsdp_forward_prefetch,
+        "limit_all_gathers": cfg.fsdp_limit_all_gathers,
+    }
+    if torch.cuda.is_available():
+        kwargs["device_id"] = torch.device("cuda", local_rank)
+    backward_prefetch = backward_prefetch_map[cfg.fsdp_backward_prefetch]
+    if backward_prefetch is not None:
+        kwargs["backward_prefetch"] = backward_prefetch
+
+    if cfg.fsdp_auto_wrap:
+        layer_classes = _infer_fsdp_layer_classes(phi)
+        if layer_classes:
+            kwargs["auto_wrap_policy"] = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=layer_classes,
+            )
+        else:
+            warnings.warn(
+                "FSDP auto-wrap found no transformer block classes for value phi; "
+                "wrapping the top-level module only."
+            )
+
+    wrapped = FSDP(phi, **kwargs)
+    return wrapped
+
+
 def _build_lr_schedule(optimizer, warmup_steps: int) -> LambdaLR:
     """Linear warmup → constant LR (matches LatEntRL's helper)."""
     def lr_lambda(step: int) -> float:
@@ -244,6 +324,30 @@ class PrefixValueTrainer:
     def __init__(self, cfg: CASPOConfig, model: PrefixValueModel) -> None:
         self.cfg = cfg
         self.model = model
+
+        # FSDP-wrap phi BEFORE constructing the optimizer so AdamW sees the
+        # sharded FlatParameters (cuts opt-state from 56 GB → 56/world_size GB
+        # per rank for a 7B bf16 model). The frozen ref is intentionally NOT
+        # wrapped: it has no opt state and frequent all-gathers during forward
+        # would dominate runtime.
+        env = distributed_env()
+        wrap_fsdp = (
+            cfg.distributed_backend == "fsdp"
+            and env.is_distributed
+            and is_dist_initialized()
+        )
+        if wrap_fsdp:
+            self.model.phi = _wrap_phi_fsdp(
+                self.model.phi, cfg,
+                local_rank=env.local_rank, world_size=env.world_size,
+            )
+            if env.rank == 0:
+                print(
+                    f"[value] FSDP wrapped phi "
+                    f"(strategy={cfg.fsdp_sharding_strategy}, "
+                    f"world_size={env.world_size})",
+                    flush=True,
+                )
 
         # ``fused=True`` is bit-identical to non-fused on CUDA and ~10-20%
         # faster; silently fall back on CPU where the kwarg is rejected.
@@ -332,9 +436,16 @@ class PrefixValueTrainer:
             n_micro_in_block += 1
             if n_micro_in_block >= accum or end == B:
                 if cfg.value_grad_clip and cfg.value_grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.phi.parameters(), max_norm=cfg.value_grad_clip,
-                    )
+                    phi = self.model.phi
+                    is_fsdp = phi.__class__.__name__ == "FullyShardedDataParallel"
+                    if is_fsdp and hasattr(phi, "clip_grad_norm_"):
+                        # FSDP's own clip_grad_norm_ does the right cross-rank
+                        # gather of squared norms before clipping.
+                        phi.clip_grad_norm_(cfg.value_grad_clip)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            phi.parameters(), max_norm=cfg.value_grad_clip,
+                        )
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)

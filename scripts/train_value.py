@@ -31,6 +31,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from caspo.config import CASPOConfig
+from caspo.utils.distributed import (
+    distributed_env,
+    init_distributed_if_needed,
+    is_dist_initialized,
+    resolve_device,
+)
 from caspo.value import PrefixValueModel, PrefixValueTrainer, ipvrm_loss
 from scripts.collect_value_data import apply_overrides  # reuse coercion
 
@@ -205,6 +211,32 @@ def main() -> None:
     cfg = CASPOConfig.from_yaml(args.config)
     cfg = apply_overrides(cfg, args.override)
 
+    # ---- distributed init ----
+    # Single-process invocations (no torchrun-style env, WORLD_SIZE<=1) leave
+    # init_process_group as a no-op and dist_info.is_distributed == False.
+    # Under our per-rank bash launcher, RANK/WORLD_SIZE/MASTER_* are set and
+    # init_process_group runs once.
+    env = distributed_env()
+    if env.is_distributed and cfg.distributed_backend != "fsdp":
+        raise ValueError(
+            f"WORLD_SIZE={env.world_size} but distributed_backend="
+            f"{cfg.distributed_backend!r}; value training requires "
+            f"distributed_backend='fsdp' for multi-rank runs."
+        )
+    dist_info = init_distributed_if_needed()
+    is_main = dist_info.is_main
+    world_size = dist_info.world_size
+    rank = dist_info.rank
+    # Resolve a rank-local device so CUDA_VISIBLE_DEVICES + LOCAL_RANK=0 in
+    # the per-rank launcher (each rank sees one GPU as cuda:0) still maps
+    # correctly here.
+    rank_device = resolve_device(cfg.device, dist_info)
+    cfg.device = str(rank_device)
+
+    def _rprint(*a, **kw):
+        if is_main:
+            print(*a, **kw)
+
     data_path = args.data or cfg.value_data_path
     if not data_path or not os.path.exists(data_path):
         raise FileNotFoundError(
@@ -214,8 +246,10 @@ def main() -> None:
     blob = torch.load(data_path, map_location="cpu", weights_only=False)
     N = blob["prompt_ids"].shape[0]
     pos_frac = float(blob["outcomes"].mean().item())
-    print(f"[value] loaded {N} (prompt,response,outcome) rows from {data_path}", flush=True)
-    print(f"[value] positive fraction = {pos_frac:.3f}", flush=True)
+    _rprint(f"[value] loaded {N} (prompt,response,outcome) rows from {data_path}", flush=True)
+    _rprint(f"[value] positive fraction = {pos_frac:.3f}", flush=True)
+    if world_size > 1:
+        _rprint(f"[value] distributed: rank {rank}/{world_size} on {rank_device}", flush=True)
     # Move/pin once to avoid per-step PCIe traffic. Off by env var if a user
     # explicitly wants to keep VRAM headroom: CASPO_VALUE_NO_DEVICE_BLOB=1.
     _prefer_dev = os.environ.get("CASPO_VALUE_NO_DEVICE_BLOB", "0") not in ("1", "true", "True")
@@ -240,19 +274,31 @@ def main() -> None:
             G = max(1, snap_G)
     val_fraction = float(cfg.value_val_fraction)
     train_rows, val_rows = _split_train_val(N, G, val_fraction, seed=int(cfg.seed))
-    print(
-        f"[value] train: {len(train_rows)} rollouts ({len(train_rows)//G} prompts), "
+    full_train_count = len(train_rows)
+    _rprint(
+        f"[value] train: {full_train_count} rollouts ({full_train_count//G} prompts), "
         f"val: {len(val_rows)} rollouts ({len(val_rows)//G} prompts) "
         f"(val_fraction={val_fraction:.2f})",
         flush=True,
     )
+
+    # ---- per-rank dataset sharding ----
+    # Rank N takes train rows N::world_size. Validation stays on rank 0 only
+    # (the eval pass + best-checkpoint logic runs only there).
+    if world_size > 1:
+        train_rows = train_rows[rank::world_size]
+        _rprint(
+            f"[value] sharded train: rank 0 sees {len(train_rows)} of "
+            f"{full_train_count} rollouts (stride={world_size})",
+            flush=True,
+        )
 
     # ---- step budget ----
     bs = max(1, int(cfg.value_micro_batch_size) * int(cfg.value_grad_accum_steps))
     steps_per_epoch = max(1, math.ceil(len(train_rows) / bs))
     if int(cfg.value_max_epochs) > 0:
         max_steps = int(cfg.value_max_epochs) * steps_per_epoch
-        print(
+        _rprint(
             f"[value] step budget: {cfg.value_max_epochs} epochs × "
             f"{steps_per_epoch} steps/epoch = {max_steps} steps "
             f"(batch={bs})",
@@ -260,7 +306,7 @@ def main() -> None:
         )
     else:
         max_steps = int(cfg.value_max_steps)
-        print(f"[value] step budget: {max_steps} (raw)", flush=True)
+        _rprint(f"[value] step budget: {max_steps} (raw)", flush=True)
     if max_steps <= 0:
         raise ValueError(
             f"max_steps={max_steps} ≤ 0; set value_max_epochs > 0 or "
@@ -268,13 +314,20 @@ def main() -> None:
         )
 
     # ---- model + trainer ----
+    # Construct phi+ref on each rank and move to the rank-local device BEFORE
+    # the trainer wraps phi with FSDP. After FSDP wrap, phi's flat-params are
+    # sharded across world_size; ref stays full-resident (frozen, no opt).
     model = PrefixValueModel(cfg)
     model.to(cfg.device)
     trainer = PrefixValueTrainer(cfg, model)
 
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(cfg.output_dir, exist_ok=True)
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        _dist.barrier()
     log_path = os.path.join(cfg.output_dir, "value_train_log.jsonl")
-    log_file = open(log_path, "a", buffering=1)
+    log_file = open(log_path, "a", buffering=1) if is_main else None
 
     # ---- training loop with early stopping on val loss ----
     best_val_loss = float("inf")
@@ -284,9 +337,12 @@ def main() -> None:
     final_path = os.path.join(cfg.output_dir, "final")
     # Clear any stale best/ from a prior run so the final-copy step below
     # cannot accidentally promote a checkpoint that was never validated by
-    # this run's eval loop.
-    if os.path.isdir(best_path):
+    # this run's eval loop. Rank 0 only — other ranks must not race to delete.
+    if is_main and os.path.isdir(best_path):
         shutil.rmtree(best_path)
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        _dist.barrier()
 
     # Pre-build a deterministic per-epoch row permutation iterator. This
     # replaces ``rng.sample(train_rows, k=bs)`` per step (Python-list copy +
@@ -326,7 +382,7 @@ def main() -> None:
         stats = trainer.step(batch)
         last_step_done = step
 
-        if cfg.value_log_every and (step % cfg.value_log_every == 0):
+        if cfg.value_log_every and (step % cfg.value_log_every == 0) and is_main:
             elapsed = time.time() - t0
             msg = (
                 f"[value step {step}/{max_steps}] "
@@ -340,76 +396,148 @@ def main() -> None:
         # ---- val eval + early stopping ----
         # value_eval_every <= 0 disables eval (and therefore early stopping
         # and best-checkpoint tracking — falls through to final-save branch).
+        # Validation runs on rank 0 only; the early-stop decision is then
+        # broadcast so all ranks exit the loop in lockstep (otherwise FSDP
+        # all-gathers in save_pretrained would hang waiting for stragglers).
         if int(cfg.value_eval_every) > 0 and (step % int(cfg.value_eval_every) == 0):
-            val_stats = _eval_val_loss(model, blob, val_rows_t, batch_size=bs)
-            print(
-                f"[value step {step}] val_loss={val_stats['val_loss']:.4f} "
-                f"val_acc={val_stats['val_acc_at_last']:.3f} "
-                f"(best={best_val_loss:.4f} @ step {best_step})",
-                flush=True,
-            )
-            log_file.write(json.dumps({"step": step, **val_stats}) + "\n")
-            if val_stats["val_loss"] < best_val_loss - 1e-6:
-                best_val_loss = val_stats["val_loss"]
-                best_step = step
-                no_improve_evals = 0
-                # Save best snapshot.
-                model.save_pretrained(best_path)
-                with open(os.path.join(best_path, "step.json"), "w") as f:
-                    json.dump(
-                        {
-                            "step": step,
-                            "val_loss": val_stats["val_loss"],
-                            "val_acc_at_last": val_stats["val_acc_at_last"],
-                        },
-                        f,
-                    )
+            do_break = False
+            if is_main:
+                val_stats = _eval_val_loss(model, blob, val_rows_t, batch_size=bs)
+                print(
+                    f"[value step {step}] val_loss={val_stats['val_loss']:.4f} "
+                    f"val_acc={val_stats['val_acc_at_last']:.3f} "
+                    f"(best={best_val_loss:.4f} @ step {best_step})",
+                    flush=True,
+                )
+                log_file.write(json.dumps({"step": step, **val_stats}) + "\n")
+                if val_stats["val_loss"] < best_val_loss - 1e-6:
+                    best_val_loss = val_stats["val_loss"]
+                    best_step = step
+                    no_improve_evals = 0
+                else:
+                    no_improve_evals += 1
+                    if (
+                        no_improve_evals >= int(cfg.value_early_stop_patience)
+                        and step >= int(cfg.value_early_stop_min_steps)
+                    ):
+                        print(
+                            f"[value] early stop at step {step} "
+                            f"(no val improvement for {no_improve_evals} evals; "
+                            f"best={best_val_loss:.4f} @ step {best_step})",
+                            flush=True,
+                        )
+                        early_stopped = True
+                        do_break = True
+
+            # Broadcast {save_best, do_break} so every rank participates in the
+            # FSDP full-state-dict gather (which all ranks must enter together)
+            # and exits the loop together.
+            if is_dist_initialized():
+                import torch.distributed as _dist
+                flags = torch.tensor(
+                    [
+                        1 if (is_main and best_step == step) else 0,
+                        1 if do_break else 0,
+                    ],
+                    dtype=torch.long, device=rank_device,
+                )
+                _dist.broadcast(flags, src=0)
+                save_best_now = bool(flags[0].item())
+                do_break = bool(flags[1].item())
             else:
-                no_improve_evals += 1
-                if (
-                    no_improve_evals >= int(cfg.value_early_stop_patience)
-                    and step >= int(cfg.value_early_stop_min_steps)
-                ):
-                    print(
-                        f"[value] early stop at step {step} "
-                        f"(no val improvement for {no_improve_evals} evals; "
-                        f"best={best_val_loss:.4f} @ step {best_step})",
-                        flush=True,
-                    )
-                    early_stopped = True
-                    break
+                save_best_now = is_main and (best_step == step)
+
+            if save_best_now:
+                # All ranks must enter save_pretrained together because FSDP's
+                # FULL_STATE_DICT context is collective. Only rank 0 writes.
+                model.save_pretrained(best_path)
+                if is_main:
+                    with open(os.path.join(best_path, "step.json"), "w") as f:
+                        json.dump(
+                            {
+                                "step": step,
+                                "val_loss": best_val_loss,
+                                "val_acc_at_last": (
+                                    val_stats["val_acc_at_last"]
+                                    if is_main else None
+                                ),
+                            },
+                            f,
+                        )
+
+            if do_break:
+                break
 
     # ---- finalize: copy best → final, or save current if no eval happened ----
-    # Always remove any stale final/ first so we don't mix files from prior runs.
-    if os.path.isdir(final_path):
+    # save_pretrained on FSDP-wrapped phi is collective: every rank MUST enter
+    # the FULL_STATE_DICT context together, even though only rank 0 writes
+    # files. So we determine "do we need to save current?" on every rank by
+    # broadcasting from rank 0, then call save_pretrained collectively.
+    have_best = is_main and os.path.isdir(best_path)
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        flag = torch.tensor([1 if have_best else 0], dtype=torch.long, device=rank_device)
+        _dist.broadcast(flag, src=0)
+        have_best = bool(flag[0].item())
+
+    if is_main and os.path.isdir(final_path):
         shutil.rmtree(final_path)
-    if os.path.isdir(best_path):
-        shutil.copytree(best_path, final_path)
-        print(
-            f"[value] done. best (val_loss={best_val_loss:.4f} @ step {best_step}) "
-            f"copied to {final_path}",
-            flush=True,
-        )
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        _dist.barrier()
+
+    if have_best:
+        if is_main:
+            shutil.copytree(best_path, final_path)
+            print(
+                f"[value] done. best (val_loss={best_val_loss:.4f} @ step {best_step}) "
+                f"copied to {final_path}",
+                flush=True,
+            )
     else:
         # Either val_eval_every <= 0 or training never reached an eval step.
+        # Collective on every rank; rank 0 writes step.json.
         model.save_pretrained(final_path)
-        with open(os.path.join(final_path, "step.json"), "w") as f:
-            json.dump({"step": last_step_done}, f)
-        print(
-            f"[value] done. final (no val eval ran) saved to {final_path}",
-            flush=True,
-        )
-    if not os.path.isdir(final_path):
+        if is_main:
+            with open(os.path.join(final_path, "step.json"), "w") as f:
+                json.dump({"step": last_step_done}, f)
+            print(
+                f"[value] done. final (no val eval ran) saved to {final_path}",
+                flush=True,
+            )
+
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        _dist.barrier()
+    final_exists = is_main and os.path.isdir(final_path)
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        flag = torch.tensor([1 if final_exists else 0], dtype=torch.long, device=rank_device)
+        _dist.broadcast(flag, src=0)
+        final_exists = bool(flag[0].item())
+    if not final_exists:
         # Defensive: if both branches somehow skipped (e.g. max_steps=0), at
         # least save the current model so downstream phases don't crash.
         model.save_pretrained(final_path)
-        with open(os.path.join(final_path, "step.json"), "w") as f:
-            json.dump({"step": last_step_done}, f)
-        print(
-            f"[value] WARN: no checkpoint produced by main path; "
-            f"saved current model to {final_path}",
-            flush=True,
-        )
+        if is_main:
+            with open(os.path.join(final_path, "step.json"), "w") as f:
+                json.dump({"step": last_step_done}, f)
+            print(
+                f"[value] WARN: no checkpoint produced by main path; "
+                f"saved current model to {final_path}",
+                flush=True,
+            )
+
+    # All remaining metadata writes (run config snapshot, value_final symlink,
+    # training_summary.json) are rank-0 only — non-rank-0 processes exit here.
+    if not is_main:
+        if log_file is not None:
+            log_file.close()
+        if is_dist_initialized():
+            import torch.distributed as _dist
+            _dist.barrier()
+            _dist.destroy_process_group()
+        return
 
     # Always snapshot the run config alongside (separate name from HF config.json).
     with open(os.path.join(final_path, "caspo_run_config.json"), "w") as f:
@@ -465,7 +593,13 @@ def main() -> None:
             f,
             indent=2,
         )
-    log_file.close()
+    if log_file is not None:
+        log_file.close()
+    # Tear down the process group cleanly so the launcher doesn't see hangs.
+    if is_dist_initialized():
+        import torch.distributed as _dist
+        _dist.barrier()
+        _dist.destroy_process_group()
 
 
 if __name__ == "__main__":
