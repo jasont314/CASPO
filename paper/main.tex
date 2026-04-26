@@ -263,6 +263,13 @@ only the two extra \texttt{prob} and \texttt{logprob} variants because
 The frozen-RM ablation uses
 \texttt{scripts/launch\_rho1b\_caspo\_frozen\_rm.sh}, keeping IPVRM scoring
 while setting \texttt{update\_value\_during\_policy=false}.
+For faster \vineppo{} on Rho-1B, the repository also includes
+\texttt{scripts/launch\_rho1b\_vineppo\_ddp2.sh}, a two-GPU replicated DDP
+launcher with one rank-local vLLM engine and IPC weight sync per rank. It
+launches one Python process per physical GPU so each trainer rank and vLLM
+engine share the same single visible CUDA device. Its default shape is 32
+prompts per rank with group size 8, preserving the 512-response global outer
+step.
 
 \section{Limitations and Open Engineering Questions}
 \caspo{} depends on the quality and calibration of the learned prefix value

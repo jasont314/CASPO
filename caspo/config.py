@@ -55,7 +55,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "standardize_advantage_scope": ("batch", "group", "off"),
     "kl_estimator": ("k1", "k3"),
     "wandb_mode": ("online", "offline", "disabled"),
-    "distributed_backend": ("none", "fsdp"),
+    "distributed_backend": ("none", "fsdp", "ddp"),
     "fsdp_sharding_strategy": ("full_shard", "shard_grad_op", "no_shard"),
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
     "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
@@ -285,10 +285,10 @@ class CASPOConfig:
     compile: bool = False
     use_gradient_checkpointing: bool = False
     # ---- distributed full-model training ----
-    # ``fsdp`` is the optimized full-finetune path for torchrun-launched jobs.
-    # It shards policy/ref/value-model parameters and optimizer state across
-    # ranks while keeping the single-process path unchanged.
-    distributed_backend: Literal["none", "fsdp"] = "none"
+    # ``fsdp`` is the sharded full-finetune path for memory-bound jobs.
+    # ``ddp`` is the replicated full-finetune path for Rho-scale jobs where
+    # rank-local vLLM + IPC sync is faster than checkpoint-based sync.
+    distributed_backend: Literal["none", "fsdp", "ddp"] = "none"
     dist_backend: str = "nccl"
     dist_timeout_s: int = 1800
     fsdp_sharding_strategy: Literal[
@@ -447,12 +447,23 @@ class CASPOConfig:
                     "(vllm_tensor_parallel_size=1). Use a separate rollout "
                     "topology for tensor-parallel vLLM."
                 )
+        if self.distributed_backend == "ddp" and self.rollout_backend != "vllm":
+            raise ValueError(
+                "distributed_backend='ddp' currently requires "
+                "rollout_backend='vllm' so each rank can use a rank-local "
+                "rollout engine. Use distributed_backend='none' for HF rollout."
+            )
+        if self.distributed_backend == "ddp" and self.vllm_tensor_parallel_size != 1:
+            raise ValueError(
+                "distributed_backend='ddp' expects one rank-local vLLM engine "
+                "per process (vllm_tensor_parallel_size=1)."
+            )
         if self.vllm_weight_sync_backend == "ipc":
-            if self.distributed_backend != "none":
+            if self.distributed_backend == "fsdp":
                 raise ValueError(
                     "vllm_weight_sync_backend='ipc' is only supported for the "
-                    "single-process trainer. Use checkpoint sync for FSDP until "
-                    "NCCL weight sync is implemented."
+                    "single-process or DDP replicated trainer. Use checkpoint "
+                    "sync for FSDP until NCCL weight sync is implemented."
                 )
             if self.vllm_tensor_parallel_size != 1:
                 raise ValueError(

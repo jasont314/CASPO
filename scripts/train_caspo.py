@@ -68,7 +68,7 @@ def _validate_cfg(cfg) -> None:
     if world_size > 1 and cfg.distributed_backend == "none":
         raise ValueError(
             "WORLD_SIZE>1 but distributed_backend='none'. Pass "
-            "--override distributed_backend=fsdp or launch a single process."
+            "--override distributed_backend=fsdp/ddp or launch a single process."
         )
     # Make sure the output dir is writable now, not 5 min into training.
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -134,6 +134,16 @@ def main() -> None:
     try:
         trainer.train()
     finally:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception as e:
+            print(
+                f"[train_caspo] distributed shutdown warning: {e}",
+                flush=True,
+            )
         sampler = getattr(trainer, "sampler", None)
         if sampler is not None and hasattr(sampler, "shutdown"):
             try:

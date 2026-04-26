@@ -49,8 +49,8 @@ def test_fsdp_vllm_rank_local_config_is_valid():
     assert cfg.rollout_backend == "vllm"
 
 
-def test_ipc_weight_sync_requires_single_process_rank_local_vllm():
-    with pytest.raises(ValueError, match="single-process trainer"):
+def test_ipc_weight_sync_rejects_fsdp_rank_local_vllm():
+    with pytest.raises(ValueError, match="DDP replicated trainer"):
         CASPOConfig(
             distributed_backend="fsdp",
             rollout_backend="vllm",
@@ -61,6 +61,30 @@ def test_ipc_weight_sync_requires_single_process_rank_local_vllm():
         CASPOConfig(
             rollout_backend="vllm",
             vllm_weight_sync_backend="ipc",
+            vllm_tensor_parallel_size=2,
+        )
+
+
+def test_ddp_vllm_ipc_rank_local_config_is_valid():
+    cfg = CASPOConfig(
+        distributed_backend="ddp",
+        rollout_backend="vllm",
+        vllm_weight_sync_backend="ipc",
+        vllm_tensor_parallel_size=1,
+    )
+
+    assert cfg.distributed_backend == "ddp"
+    assert cfg.vllm_weight_sync_backend == "ipc"
+
+
+def test_ddp_requires_rank_local_vllm_rollout():
+    with pytest.raises(ValueError, match="rollout_backend='vllm'"):
+        CASPOConfig(distributed_backend="ddp", rollout_backend="hf")
+
+    with pytest.raises(ValueError, match="vllm_tensor_parallel_size=1"):
+        CASPOConfig(
+            distributed_backend="ddp",
+            rollout_backend="vllm",
             vllm_tensor_parallel_size=2,
         )
 

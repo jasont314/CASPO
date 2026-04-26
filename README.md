@@ -245,6 +245,39 @@ Output:
 /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_frozen_rm_paper512_seed0
 ```
 
+## Two-GPU VinePPO
+
+For Rho-1B VinePPO, the fastest multi-GPU path is replicated DDP with one
+rank-local vLLM engine per GPU. The dedicated launcher uses GPUs 6 and 7 by
+default, starts one trainer process per physical GPU, and preserves the
+current 512-response global outer step:
+
+```bash
+RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_vineppo_ddp2.sh
+```
+
+Default DDP shape:
+
+```text
+2 ranks x 32 prompts/rank x 8 rollouts = 512 responses/global step
+2 ranks x 32 grad-accum micros x 1 response = 64-response global PPO minibatch
+```
+
+Output:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_vineppo_ddp2_paper512_seed0
+```
+
+For an infrastructure smoke:
+
+```bash
+MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
+GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
+GPU_LIST="6 7" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
+```
+
 ## Evaluation
 
 Do cheap sample evals at saved checkpoints and full eval only at the end.
@@ -265,7 +298,7 @@ RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 
 The eval launcher supports:
 
-- `METHODS`: space-separated checkpoint directory tags, default `caspo grpo vineppo ppo`; use `METHODS="caspo_prob caspo_logprob caspo_frozen_rm"` for ablations.
+- `METHODS`: space-separated checkpoint directory tags, default `caspo grpo vineppo ppo`; use `METHODS="caspo_prob caspo_logprob caspo_frozen_rm vineppo_ddp2"` for ablations/DDP runs.
 - `CKPT_SUBDIR`: checkpoint under each method output dir, e.g. `step_250` or `final`.
 - `EVAL_BENCHMARKS`: comma-separated list, default `math500,math,collegemath,olympiadbench`.
 - `EVAL_LIMIT`: optional per-benchmark problem cap for sample eval.

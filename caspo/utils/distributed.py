@@ -117,7 +117,10 @@ def barrier() -> None:
         return
     import torch.distributed as dist
 
-    dist.barrier()
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
 
 
 def rank0_print(info: DistributedInfo, *args, **kwargs) -> None:

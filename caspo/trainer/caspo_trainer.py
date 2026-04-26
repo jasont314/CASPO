@@ -16,11 +16,11 @@ All methods share the rollout (HF or vLLM), reward grading, and PPO clipped
 surrogate. The forward pass for the policy loss is separate from the rollout's
 sampling-time logprobs (importance ratio = π_θ / π_old).
 
-vLLM weight sync: after each optimizer step, the trainer saves its policy
-state_dict to ``cfg.vllm_sync_dir`` and calls
-``engine.sync_weights_from_path(...)`` so subsequent rollouts use updated
-weights. Disk-based for now (~5s/iter at 1B). NCCL upgrade is a follow-up
-for 7B-scale runs.
+vLLM weight sync: after each optimizer step, the trainer either pushes weights
+directly with vLLM's CUDA-IPC update API (Rho-scale single-process/DDP
+replicated runs) or saves a checkpoint to ``cfg.vllm_sync_dir`` and calls
+``engine.sync_weights_from_path(...)`` (FSDP / larger-model fallback). NCCL
+upgrade is a follow-up for sharded 7B-scale runs.
 
 Wandb: enabled by default. Logs policy/reward/segmentation/value/timing/eval
 metrics per step. Set ``cfg.wandb_enabled=False`` to disable.
@@ -28,6 +28,7 @@ metrics per step. Set ``cfg.wandb_enabled=False`` to disable.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -169,8 +170,14 @@ def _is_fsdp_module(module: torch.nn.Module) -> bool:
     return module.__class__.__name__ == "FullyShardedDataParallel"
 
 
-def _unwrap_fsdp(module: torch.nn.Module) -> torch.nn.Module:
-    return getattr(module, "module", module) if _is_fsdp_module(module) else module
+def _is_ddp_module(module: torch.nn.Module) -> bool:
+    return module.__class__.__name__ == "DistributedDataParallel"
+
+
+def _unwrap_parallel(module: torch.nn.Module) -> torch.nn.Module:
+    if _is_fsdp_module(module) or _is_ddp_module(module):
+        return getattr(module, "module", module)
+    return module
 
 
 class CASPOTrainer:
@@ -184,7 +191,7 @@ class CASPOTrainer:
                 raise ValueError(
                     "torchrun launched WORLD_SIZE>1 but "
                     "distributed_backend='none'. Use "
-                    "distributed_backend='fsdp' for full-model distributed "
+                    "distributed_backend='fsdp' or 'ddp' for full-model distributed "
                     "training, or launch a single process."
                 )
             self.dist = DistributedInfo()
@@ -196,11 +203,20 @@ class CASPOTrainer:
         self._fsdp_enabled = (
             cfg.distributed_backend == "fsdp" and self.dist.is_distributed
         )
+        self._ddp_enabled = (
+            cfg.distributed_backend == "ddp" and self.dist.is_distributed
+        )
         if cfg.distributed_backend == "fsdp" and not self.dist.is_distributed:
             warnings.warn(
                 "distributed_backend='fsdp' requested but WORLD_SIZE=1; "
                 "continuing in single-process mode. Launch with torchrun for "
                 "sharded full-model training."
+            )
+        if cfg.distributed_backend == "ddp" and not self.dist.is_distributed:
+            warnings.warn(
+                "distributed_backend='ddp' requested but WORLD_SIZE=1; "
+                "continuing in single-process mode. Launch multiple ranks for "
+                "replicated data-parallel training."
             )
         self.device = resolve_device(cfg.device, self.dist)
         set_seed(int(cfg.seed) + int(self.dist.rank))
@@ -305,6 +321,9 @@ class CASPOTrainer:
                     )
 
         self.model = self._wrap_fsdp_if_enabled(self.model, module_name="policy")
+        self.model = self._wrap_ddp_if_enabled(
+            self.model, module_name="policy", require_trainable=True,
+        )
         if self.value_model is not None:
             if self.ref_policy is None:
                 self.value_model.ref = self._wrap_fsdp_if_enabled(
@@ -312,6 +331,11 @@ class CASPOTrainer:
                 )
             self.value_model.phi = self._wrap_fsdp_if_enabled(
                 self.value_model.phi, module_name="value_phi",
+            )
+            self.value_model.phi = self._wrap_ddp_if_enabled(
+                self.value_model.phi,
+                module_name="value_phi",
+                require_trainable=True,
             )
             if cfg.update_value_during_policy:
                 self.value_optimizer = AdamW(
@@ -348,6 +372,21 @@ class CASPOTrainer:
         # ---- rollout backend (HF or vLLM) ----
         backend = cfg.rollout_backend
         if backend == "vllm":
+            if (
+                self._ddp_enabled
+                and cfg.vllm_weight_sync_backend == "ipc"
+                and torch.cuda.is_available()
+            ):
+                visible_cuda_devices = torch.cuda.device_count()
+                if visible_cuda_devices != 1:
+                    raise RuntimeError(
+                        "distributed_backend='ddp' with "
+                        "vllm_weight_sync_backend='ipc' expects each rank "
+                        "process to see exactly one CUDA device. Launch with "
+                        "one physical GPU in CUDA_VISIBLE_DEVICES per rank "
+                        "(for example scripts/launch_rho1b_vineppo_ddp2.sh); "
+                        f"torch.cuda.device_count()={visible_cuda_devices}."
+                    )
             engine_kwargs = dict(
                 gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
                 tensor_parallel_size=cfg.vllm_tensor_parallel_size,
@@ -492,6 +531,42 @@ class CASPOTrainer:
             )
         return wrapped
 
+    def _wrap_ddp_if_enabled(
+        self,
+        module: torch.nn.Module,
+        *,
+        module_name: str,
+        require_trainable: bool = True,
+    ) -> torch.nn.Module:
+        if not self._ddp_enabled:
+            return module
+        if _is_ddp_module(module):
+            return module
+        if require_trainable and not any(p.requires_grad for p in module.parameters()):
+            rank0_print(
+                self.dist,
+                f"[trainer] DDP skip {module_name} (no trainable parameters)",
+                flush=True,
+            )
+            return module
+
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        kwargs: dict[str, Any] = {
+            "broadcast_buffers": False,
+            "gradient_as_bucket_view": True,
+        }
+        if self.device.type == "cuda":
+            kwargs["device_ids"] = [self.dist.local_rank]
+            kwargs["output_device"] = self.dist.local_rank
+        wrapped = DDP(module, **kwargs)
+        rank0_print(
+            self.dist,
+            f"[trainer] DDP wrapped {module_name} (world_size={self.dist.world_size})",
+            flush=True,
+        )
+        return wrapped
+
     def _clip_grad_norm(
         self,
         module: torch.nn.Module,
@@ -501,6 +576,12 @@ class CASPOTrainer:
         if _is_fsdp_module(module) and hasattr(module, "clip_grad_norm_"):
             return module.clip_grad_norm_(max_norm)
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
+
+    @staticmethod
+    def _maybe_no_sync(module: torch.nn.Module, enabled: bool):
+        if enabled and _is_ddp_module(module):
+            return module.no_sync()
+        return contextlib.nullcontext()
 
     def _sequence_reward_advantage(
         self,
@@ -608,7 +689,7 @@ class CASPOTrainer:
                 error_msg = None
                 try:
                     os.makedirs(path, exist_ok=True)
-                    _unwrap_fsdp(self.model).save_pretrained(
+                    _unwrap_parallel(self.model).save_pretrained(
                         path,
                         state_dict=state_dict,
                         safe_serialization=safe_serialization,
@@ -626,7 +707,9 @@ class CASPOTrainer:
             error_msg = None
             try:
                 os.makedirs(path, exist_ok=True)
-                self.model.save_pretrained(path, safe_serialization=safe_serialization)
+                _unwrap_parallel(self.model).save_pretrained(
+                    path, safe_serialization=safe_serialization,
+                )
                 if save_tokenizer:
                     self.tokenizer.save_pretrained(path)
             except Exception as e:  # noqa: BLE001
@@ -664,7 +747,7 @@ class CASPOTrainer:
                     "single-process, unsharded trainers. Use checkpoint sync "
                     "or implement NCCL sync for FSDP."
                 )
-            return self.sampler.sync_weights_from_model(_unwrap_fsdp(self.model))
+            return self.sampler.sync_weights_from_model(_unwrap_parallel(self.model))
         t0 = time.time()
         save_tokenizer = not self._sync_tokenizer_saved
         self._save_policy_pretrained(
@@ -735,23 +818,26 @@ class CASPOTrainer:
         agg = {"value_loss": 0.0, "value_acc": 0.0,
                "v_bar_pos": 0.0, "v_bar_neg": 0.0}
         for micro_idx, (start, end) in enumerate(micro_ranges):
-            out = self.value_model(
-                prompt_ids[start:end], prompt_mask[start:end],
-                response_ids[start:end], response_mask[start:end],
-            )
-            V_x_slice = V_x_full[start:end] if (V_x_full is not None and cfg.use_adb) else None
-            w_slice = w_full[start:end] if (w_full is not None and cfg.use_dlw) else None
-            v_loss, v_stats = ipvrm_loss(
-                log_ratio=out["log_ratio"],
-                response_mask=response_mask[start:end],
-                outcomes=outcomes[start:end],
-                margin=self.value_model.margin,
-                prompt_value_baseline=V_x_slice,
-                loss_weights=w_slice,
-            )
-            micro_rows = micro_row_counts[micro_idx]
-            weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
-            (v_loss * weight).backward()
+            # DDP all-reduces once for the accumulated online value update.
+            sync_value = micro_idx == len(micro_ranges) - 1
+            with self._maybe_no_sync(self.value_model.phi, enabled=not sync_value):
+                out = self.value_model(
+                    prompt_ids[start:end], prompt_mask[start:end],
+                    response_ids[start:end], response_mask[start:end],
+                )
+                V_x_slice = V_x_full[start:end] if (V_x_full is not None and cfg.use_adb) else None
+                w_slice = w_full[start:end] if (w_full is not None and cfg.use_dlw) else None
+                v_loss, v_stats = ipvrm_loss(
+                    log_ratio=out["log_ratio"],
+                    response_mask=response_mask[start:end],
+                    outcomes=outcomes[start:end],
+                    margin=self.value_model.margin,
+                    prompt_value_baseline=V_x_slice,
+                    loss_weights=w_slice,
+                )
+                micro_rows = micro_row_counts[micro_idx]
+                weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
+                (v_loss * weight).backward()
             agg["value_loss"] += v_stats["loss"] * weight
             agg["value_acc"] += v_stats["acc_at_last"] * weight
             agg["v_bar_pos"] += (
@@ -1284,26 +1370,6 @@ class CASPOTrainer:
             # ``n_micro_in_epoch % accum == 0`` is computed within the epoch.
             n_micro_in_epoch = 0
             for micro_idx, (start, end) in enumerate(micro_ranges):
-                new_logprobs = self._forward_policy_logprobs(
-                    tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
-                    response_ids[start:end], response_mask[start:end],
-                )
-                old_lp = old_logprobs_full[start:end]
-                adv = token_advantage[start:end]
-                mask = response_mask[start:end]
-
-                ref_lp = (
-                    ref_logprobs_full[start:end]
-                    if ref_logprobs_full is not None else None
-                )
-
-                loss, stats = ppo_clipped_loss(
-                    logprobs=new_logprobs, old_logprobs=old_lp, advantage=adv,
-                    response_mask=mask,
-                    clip_eps_low=cfg.clip_eps_low, clip_eps_high=cfg.clip_eps_high,
-                    ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
-                    kl_estimator=cfg.kl_estimator,
-                )
                 group_idx = micro_idx // accum
                 group_tokens = group_token_counts[group_idx] if group_token_counts else 0.0
                 micro_tokens = micro_token_counts[micro_idx]
@@ -1311,7 +1377,29 @@ class CASPOTrainer:
                     micro_tokens / group_tokens
                     if group_tokens > 0.0 else 0.0
                 )
-                (loss * grad_weight).backward()
+                will_step = ((n_micro_in_epoch + 1) % accum == 0) or (end == B)
+                with self._maybe_no_sync(self.model, enabled=not will_step):
+                    new_logprobs = self._forward_policy_logprobs(
+                        tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
+                        response_ids[start:end], response_mask[start:end],
+                    )
+                    old_lp = old_logprobs_full[start:end]
+                    adv = token_advantage[start:end]
+                    mask = response_mask[start:end]
+
+                    ref_lp = (
+                        ref_logprobs_full[start:end]
+                        if ref_logprobs_full is not None else None
+                    )
+
+                    loss, stats = ppo_clipped_loss(
+                        logprobs=new_logprobs, old_logprobs=old_lp, advantage=adv,
+                        response_mask=mask,
+                        clip_eps_low=cfg.clip_eps_low, clip_eps_high=cfg.clip_eps_high,
+                        ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
+                        kl_estimator=cfg.kl_estimator,
+                    )
+                    (loss * grad_weight).backward()
 
                 with torch.no_grad():
                     total_loss += float(loss.item()) * micro_tokens
@@ -1325,7 +1413,7 @@ class CASPOTrainer:
                     n_micro += 1
                     n_micro_in_epoch += 1
 
-                if n_micro_in_epoch % accum == 0 or end == B:
+                if will_step:
                     grad_norm = None
                     if cfg.grad_clip and cfg.grad_clip > 0:
                         grad_norm = float(

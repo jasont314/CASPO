@@ -146,6 +146,15 @@ class VLLMRolloutEngine:
         # has already inherited the modified env at fork time).
         prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         prev_allow_insecure = os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION")
+        # torchrun exports rank/world env vars. A rank-local vLLM engine should
+        # not inherit those, otherwise its EngineCore can mistake a
+        # single-GPU local engine for part of the trainer's process group.
+        dist_env_keys = (
+            "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+            "GROUP_RANK", "ROLE_RANK", "ROLE_WORLD_SIZE",
+            "MASTER_ADDR", "MASTER_PORT",
+        )
+        prev_dist_env = {k: os.environ.get(k) for k in dist_env_keys}
         if gpu_id is not None:
             gpu_idx = int(gpu_id)
             if prev_cvd:
@@ -157,6 +166,8 @@ class VLLMRolloutEngine:
                 os.environ["CUDA_VISIBLE_DEVICES"] = visible[gpu_idx]
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            for key in dist_env_keys:
+                os.environ.pop(key, None)
         if self._weight_sync_backend == "ipc":
             # vLLM's IPC update API serializes CUDA IPC handles through the
             # EngineCore control channel. This is local-process-only for our
@@ -197,6 +208,21 @@ class VLLMRolloutEngine:
                 engine_kwargs["weight_transfer_config"] = {"backend": "ipc"}
             engine_args = AsyncEngineArgs(**engine_kwargs)
             self.engine = AsyncLLM.from_engine_args(engine_args)
+
+            # Persistent event loop so we don't create+destroy one per call.
+            # Keep the rank-local vLLM env active while priming; some vLLM V1
+            # builds lazily start frontend/EngineCore work from this metadata
+            # request, not only from ``from_engine_args`` above.
+            try:
+                self._loop = asyncio.new_event_loop()
+                self._loop.run_until_complete(self._prime_async_frontend())
+            except Exception:
+                try:
+                    self.engine.shutdown()
+                except Exception:
+                    pass
+                self.engine = None
+                raise
         finally:
             # Restore parent process env. (The engine subprocess already forked
             # with the override, so its CUDA_VISIBLE_DEVICES sticks.)
@@ -205,24 +231,16 @@ class VLLMRolloutEngine:
                     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                 else:
                     os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+                for key, value in prev_dist_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
             if self._weight_sync_backend != "ipc":
                 if prev_allow_insecure is None:
                     os.environ.pop("VLLM_ALLOW_INSECURE_SERIALIZATION", None)
                 else:
                     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = prev_allow_insecure
-        # Persistent event loop so we don't create+destroy one per call.
-        # If new_event_loop fails (extremely unlikely) we tear the engine
-        # down so its EngineCore subprocess + NCCL sockets don't leak.
-        try:
-            self._loop = asyncio.new_event_loop()
-            self._loop.run_until_complete(self._prime_async_frontend())
-        except Exception:
-            try:
-                self.engine.shutdown()
-            except Exception:
-                pass
-            self.engine = None
-            raise
 
     # ------------------------------------------------------------------
     # Async helpers
