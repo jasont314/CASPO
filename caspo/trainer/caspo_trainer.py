@@ -387,7 +387,7 @@ class CASPOTrainer:
         if cfg.compile:
             self.model = torch.compile(
                 self.model,
-                mode="reduce-overhead",
+                mode="default",
                 dynamic=True,
                 fullgraph=False,
             )

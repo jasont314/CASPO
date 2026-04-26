@@ -67,6 +67,16 @@ CASPO_MICRO_BATCH_SIZE="${CASPO_MICRO_BATCH_SIZE:-${MICRO_BATCH_SIZE:-8}}"
 CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-8}}"
 CASPO_USE_GRADIENT_CHECKPOINTING="${CASPO_USE_GRADIENT_CHECKPOINTING:-${USE_GRADIENT_CHECKPOINTING:-false}}"
 
+# Round 2 knobs (Apr 2026):
+#   reward_workers — ProcessPoolExecutor for SymPy verifier; default 4 mirrors
+#     the cfg dataclass default. Lower to 1 for deterministic/serial scoring.
+#   compile — torch.compile on policy + value_model.phi. Currently OFF by
+#     default: with mode="default" it runs (no CUDA-graph crash) but variable
+#     seq lengths trigger ~8 recompiles before dynamo gives up; net win
+#     unclear at our shape distribution. Try `CASPO_COMPILE=true` to opt in.
+CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
+CASPO_COMPILE="${CASPO_COMPILE:-${COMPILE:-false}}"
+
 # These names are launcher aliases, not native vLLM environment variables.
 unset VLLM_GPU_MEMORY_UTILIZATION
 unset VLLM_MULTI_SAMPLE_MODE
@@ -75,6 +85,8 @@ unset VLLM_MAX_NUM_BATCHED_TOKENS
 unset MICRO_BATCH_SIZE
 unset GRAD_ACCUM_STEPS
 unset USE_GRADIENT_CHECKPOINTING
+unset REWARD_WORKERS
+unset COMPILE
 
 COMMON_OVERRIDES=(
     --override "method=${METHOD}"
@@ -87,6 +99,8 @@ COMMON_OVERRIDES=(
     --override "micro_batch_size=${CASPO_MICRO_BATCH_SIZE}"
     --override "grad_accum_steps=${CASPO_GRAD_ACCUM_STEPS}"
     --override "use_gradient_checkpointing=${CASPO_USE_GRADIENT_CHECKPOINTING}"
+    --override "reward_workers=${CASPO_REWARD_WORKERS}"
+    --override "compile=${CASPO_COMPILE}"
     --override "save_every=${SAVE_EVERY:-250}"
     --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
@@ -102,7 +116,7 @@ fi
 
 echo "[rho1b-onegpu] ${RUN_METHOD_TAG} method=${METHOD} gpu=${SELECTED_GPU} out=${OUTDIR}"
 echo "[rho1b-onegpu] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
-echo "[rho1b-onegpu] mb=${CASPO_MICRO_BATCH_SIZE} accum=${CASPO_GRAD_ACCUM_STEPS} grad_ckpt=${CASPO_USE_GRADIENT_CHECKPOINTING}"
+echo "[rho1b-onegpu] mb=${CASPO_MICRO_BATCH_SIZE} accum=${CASPO_GRAD_ACCUM_STEPS} grad_ckpt=${CASPO_USE_GRADIENT_CHECKPOINTING} reward_workers=${CASPO_REWARD_WORKERS} compile=${CASPO_COMPILE}"
 echo "[rho1b-onegpu] log=${LOG}"
 
 CUDA_VISIBLE_DEVICES="$SELECTED_GPU" "$PYTHON_BIN" -u -m scripts.train_caspo \

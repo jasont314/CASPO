@@ -808,7 +808,7 @@ a pure speed-up — no effective-learning change beyond ~1e-3 bf16 noise.
 | Drop `.float()` upcast inside `cross_entropy` | bf16 cross_entropy with internal fp32 reduction is numerically equivalent | ~2 GB activation per microbatch saved; CE kernel ~5-10% faster |
 | `fused=True` AdamW | Single fused CUDA kernel instead of foreach + 3 launches | Bit-identical, 1-2% step time |
 | Stack scalars in microbatch loop | Replace per-microbatch `.item()` syncs with on-device accumulator + single `.tolist()` | Removes CPU-GPU sync per microbatch |
-| `torch.compile` (opt-in via `cfg.compile=true`) | `mode="reduce-overhead", dynamic=True` on policy and `value_model.phi` | 10-15% policy forward+backward when recompiles stay rare; off by default |
+| `torch.compile` (opt-in via `cfg.compile=true`) | `mode="default", dynamic=True` on policy and `value_model.phi` | **CURRENTLY UNUSABLE** — see compile incompatibility note below |
 | Parallel SymPy reward verifier | `ProcessPoolExecutor` over chunked predictions when `cfg.reward_workers > 1`, gated on batch size | Hides up to 2-10 s/step on hard problem batches |
 | Persistent ground-truth cache | Per-trainer `OrderedDict` keyed on raw GT string with FIFO eviction at `cfg.gt_cache_max_size` | Eliminates per-call GT renormalization across the ~7.5K-prompt cycle |
 | Cached tokenized dataset | First call writes `${HF_HOME}/caspo_dataset_cache/<hash>.pt`; subsequent processes load directly | Faster cold-start; `CASPO_DATASET_CACHE_DISABLE=1` opts out |
@@ -843,7 +843,7 @@ V_φ forward per response and does not multiply with `steps/r`.
 
 Notes:
 - Rollout's `enable_chunked_prefill` is OFF by default (verified that VinePPO's K=9 MC pattern regressed by ~70% with chunked-prefill on, since mixed prefill-decode CUDA graphs penalize many short prefixes). Eval keeps it on.
-- `cfg.compile` is wired but defaults to false; first-step compile cost (~30-90 s) is amortized over hundreds of steps but adds dynamic-recompile risk on variable seq lengths. Opt-in only.
+- `cfg.compile=True` is wired but currently unusable on this stack. Validated empirically (Apr 2026): with `mode="reduce-overhead"` the trainer crashes with `Error: accessing tensor output of CUDAGraphs that has been overwritten` because the trainer reuses output tensors across optimizer micro-steps. With `mode="default"` (no CUDA graphs) the policy forward hits two HF/transformers limitations at once: (1) graph break inside `_get_unpad_data` from `seqlens_in_batch.max().item()` on every call, and (2) per-layer recompiles because `module.layer_idx` is a static integer that differs across the 22 transformer layers — dynamo exhausts the recompile budget at layer 8 and falls back to eager. Until HF wires a compile-friendly attention path or we patch around `_get_unpad_data`, leave `cfg.compile=false`.
 - `EnsureLR / no schedule changes`: nothing in this round affects learning rate, KL coef, or PPO clip; comparison with the original VinePPO setup remains apples-to-apples up to bf16 reduction noise.
 
 ### FA3 install
