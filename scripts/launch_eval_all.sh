@@ -10,7 +10,8 @@
 #   RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 ./scripts/launch_eval_all.sh
 #   METHODS="caspo_prob caspo_logprob" RUN_TAG=paper512_seed0 ./scripts/launch_eval_all.sh
 #
-# Each method gets one GPU; runs sequentially per method but parallel across methods.
+# Each method gets one GPU; benchmarks run sequentially inside each method job
+# while methods run in parallel across GPUs.
 
 set -eo pipefail
 # Don't use 'set -u' — conda activate scripts have unbound vars.
@@ -31,7 +32,7 @@ export TRANSFORMERS_CACHE=/mnt/nvme_tmp/jason_caspo/hf_cache
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-ROOT=/mnt/nvme_tmp/jason_caspo
+ROOT="${ROOT:-/mnt/nvme_tmp/jason_caspo}"
 RUN_TAG="${RUN_TAG:-}"
 RUN_SUFFIX=""
 if [[ -n "$RUN_TAG" ]]; then
@@ -60,6 +61,7 @@ trap 'echo "[eval] ERR at line $LINENO (rc=$?)"' ERR
 BENCHMARKS="${EVAL_BENCHMARKS:-math500,math,collegemath,olympiadbench}"
 EVAL_K="${EVAL_K:-16}"
 CKPT_SUBDIR="${CKPT_SUBDIR:-final}"
+EVAL_VLLM_GPU_MEMORY_UTILIZATION="${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 EVAL_LIMIT_ARGS=()
 LIMIT_TAG="full"
 if [[ -n "${EVAL_LIMIT:-}" ]]; then
@@ -68,10 +70,10 @@ if [[ -n "${EVAL_LIMIT:-}" ]]; then
 fi
 BENCH_TAG="${BENCHMARKS//,/+}"
 CKPT_TAG="${CKPT_SUBDIR//\//_}"
-read -r -a METHODS <<< "${METHODS:-caspo grpo vineppo ppo}"
-IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-4 5 6 7}"
+read -r -a METHODS <<< "${METHODS:-grpo ppo vineppo_ddp2 caspo caspo_prob caspo_logprob caspo_frozen_rm}"
+IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-0 1 2 3 4 5 6}"
 if (( ${#EVAL_GPUS[@]} < ${#METHODS[@]} )); then
-    echo "[eval] EVAL_GPU_LIST must provide at least ${#METHODS[@]} GPUs; got: ${EVAL_GPU_LIST:-4 5 6 7}" >&2
+    echo "[eval] EVAL_GPU_LIST must provide at least ${#METHODS[@]} GPUs; got: ${EVAL_GPU_LIST:-0 1 2 3 4 5 6}" >&2
     exit 1
 fi
 
@@ -99,6 +101,7 @@ eval_method() {
         --temperature 0.35 \
         --top-p 0.9 \
         --max-new-tokens 1024 \
+        --gpu-memory-utilization "$EVAL_VLLM_GPU_MEMORY_UTILIZATION" \
         "${EVAL_LIMIT_ARGS[@]}" \
         --output "$output_json" \
         > "$log" 2>&1 &

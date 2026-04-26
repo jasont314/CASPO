@@ -109,6 +109,19 @@ def _configured_logprob_micro_batch_size(cfg: CASPOConfig) -> int:
     return max(1, int(cfg.logprob_micro_batch_size or cfg.micro_batch_size))
 
 
+def _scalar_tensor_stats(values: torch.Tensor) -> dict[str, float]:
+    """Return cheap scalar diagnostics for a 1D-ish tensor."""
+    if values.numel() == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    x = values.detach().float().reshape(-1)
+    return {
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()) if x.numel() > 1 else 0.0,
+        "min": float(x.min().item()),
+        "max": float(x.max().item()),
+    }
+
+
 def _tokenize_delimiter(tokenizer, delimiter: str) -> List[int]:
     if not delimiter:
         raise ValueError("step_delimiter must be a non-empty string")
@@ -1218,6 +1231,11 @@ class CASPOTrainer:
         prompt_index = rollout.prompt_index.to(self.device, non_blocking=True)
         tiled_prompt_ids = prompt_ids[prompt_index]
         tiled_prompt_mask = prompt_mask[prompt_index]
+        prompt_token_counts = prompt_mask.sum(dim=1).float()
+        response_token_counts = response_mask.sum(dim=1).float()
+        prompt_len_stats = _scalar_tensor_stats(prompt_token_counts)
+        response_len_stats = _scalar_tensor_stats(response_token_counts)
+        response_tokens_total = float(response_token_counts.sum().item())
         t_device = time.time() - t_device_start
         # Re-score old logprobs with trainer's forward at the pre-update weights.
         t_old_logprobs_start = time.time()
@@ -1236,6 +1254,7 @@ class CASPOTrainer:
         V_step = None
         A_step = None
         token_advantage: torch.Tensor
+        adv_values_for_stats: torch.Tensor
 
         if method in {"ppo", "grpo"}:
             # No segmentation. PPO uses sequence terminal rewards with a
@@ -1261,6 +1280,7 @@ class CASPOTrainer:
             )
             mean_step_advantage = float(adv_per_seq.abs().mean().item())
             mean_step_count = 1.0
+            adv_values_for_stats = adv_per_seq
         else:
             # Segment for caspo + vineppo
             if cfg.segmentation_mode == "latex_aware":
@@ -1318,16 +1338,23 @@ class CASPOTrainer:
             token_advantage = broadcast_step_advantage_to_tokens(
                 A_step, seg.step_id, response_mask,
             )
-            valid_A = A_step[A_step != 0]
+            valid_step_mask = (
+                torch.arange(A_step.shape[1], device=A_step.device).unsqueeze(0)
+                < seg.step_count.to(A_step.device).unsqueeze(1)
+            )
+            valid_A = A_step[valid_step_mask]
             mean_step_advantage = float(valid_A.abs().mean().item()) if valid_A.numel() else 0.0
             mean_step_count = float(seg.step_count.float().mean().item())
             value_stats["t_value_forward_s"] = t_value
+            adv_values_for_stats = valid_A
         t_advantage = time.time() - t_advantage_start - t_value
+        adv_stats = _scalar_tensor_stats(adv_values_for_stats)
 
         # Reward stats
         rewards_grouped = rewards.view(num_prompts, G)
         pass_at_g = float((rewards_grouped > 0.5).any(dim=1).float().mean().item())
-        mean_reward = float(rewards.mean().item())
+        reward_stats = _scalar_tensor_stats(rewards)
+        mean_reward = reward_stats["mean"]
         positive_frac = float((rewards >= 0.5).float().mean().item())
 
         # 7. Micro-batched policy forward + PPO loss
@@ -1346,12 +1373,16 @@ class CASPOTrainer:
         total_loss = 0.0
         total_pg = 0.0
         total_kl = 0.0
+        total_logp = 0.0
         total_clip_frac = 0.0
         total_ratio = 0.0
         total_kl_seen = 0   # only counts micros that produced a KL estimate
         n_micro = 0
         token_weight_denom = 0.0
         n_optim_steps = 0
+        grad_norm_sum = 0.0
+        grad_norm_max = 0.0
+        grad_norm_count = 0
 
         t_ref_logprobs_start = time.time()
         ref_logprobs_full = self._precompute_ref_logprobs(
@@ -1417,6 +1448,7 @@ class CASPOTrainer:
                 with torch.no_grad():
                     total_loss += float(loss.item()) * micro_tokens
                     total_pg += float(stats["pg_loss"].item()) * micro_tokens
+                    total_logp += float(stats["mean_logp"].item()) * micro_tokens
                     total_clip_frac += float(stats["clip_frac"].item()) * micro_tokens
                     total_ratio += float(stats["mean_ratio"].item()) * micro_tokens
                     token_weight_denom += micro_tokens
@@ -1436,6 +1468,10 @@ class CASPOTrainer:
                                 max_norm=cfg.grad_clip,
                             )
                         )
+                    if grad_norm is not None:
+                        grad_norm_sum += float(grad_norm)
+                        grad_norm_max = max(grad_norm_max, float(grad_norm))
+                        grad_norm_count += 1
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -1457,18 +1493,32 @@ class CASPOTrainer:
         result = {
             "loss": total_loss / denom,
             "pg_loss": total_pg / denom,
+            "mean_logp": total_logp / denom,
             "mean_ratio": total_ratio / denom,
             "clip_frac": total_clip_frac / denom,
             "mean_reward": mean_reward,
+            "reward_std": reward_stats["std"],
+            "reward_min": reward_stats["min"],
+            "reward_max": reward_stats["max"],
             "pass_at_g": pass_at_g,
             "positive_frac": positive_frac,
             "mean_step_count": mean_step_count,
             "mean_step_advantage": mean_step_advantage,
+            "adv_mean": adv_stats["mean"],
+            "adv_std": adv_stats["std"],
+            "adv_min": adv_stats["min"],
+            "adv_max": adv_stats["max"],
             "num_prompts": num_prompts,
             "num_responses": B,
+            "prompt_tokens_mean": prompt_len_stats["mean"],
+            "prompt_tokens_max": prompt_len_stats["max"],
+            "response_tokens_mean": response_len_stats["mean"],
+            "response_tokens_max": response_len_stats["max"],
+            "response_tokens_total": response_tokens_total,
             "lr": self.optimizer.param_groups[0]["lr"],
             "method": method,
             "epochs_per_rollout": n_epochs,
+            "n_microbatches": n_micro,
             "n_optim_steps": n_optim_steps,
             "t_rollout_s": t_rollout,
             "t_device_s": t_device,
@@ -1481,6 +1531,10 @@ class CASPOTrainer:
         }
         if total_kl_seen > 0:
             result["mean_kl"] = total_kl / denom
+            result["kl_term"] = float(cfg.kl_coef) * result["mean_kl"]
+        if grad_norm_count > 0:
+            result["grad_norm_mean"] = grad_norm_sum / float(grad_norm_count)
+            result["grad_norm_max"] = grad_norm_max
         if value_stats:
             result.update(value_stats)
             if self.value_optimizer is not None:
@@ -1500,7 +1554,7 @@ class CASPOTrainer:
         if self.dist.is_distributed:
             result = reduce_numeric_stats(
                 result,
-                sum_keys=("num_prompts", "num_responses"),
+                sum_keys=("num_prompts", "num_responses", "response_tokens_total"),
             )
             result["world_size"] = self.dist.world_size
 
@@ -1617,14 +1671,32 @@ class CASPOTrainer:
         log_payload = {
             "policy/loss": stats["loss"],
             "policy/pg_loss": stats["pg_loss"],
+            "policy/mean_logp": float(stats.get("mean_logp", 0.0)),
             "policy/mean_ratio": stats["mean_ratio"],
             "policy/clip_frac": stats["clip_frac"],
             "policy/lr": stats["lr"],
             "reward/mean": stats["mean_reward"],
+            "reward/std": float(stats.get("reward_std", 0.0)),
+            "reward/min": float(stats.get("reward_min", 0.0)),
+            "reward/max": float(stats.get("reward_max", 0.0)),
             "reward/pass_at_g": stats["pass_at_g"],
             "reward/positive_frac": stats["positive_frac"],
             "seg/mean_step_count": stats["mean_step_count"],
             "adv/abs_mean": stats["mean_step_advantage"],
+            "adv/mean": float(stats.get("adv_mean", 0.0)),
+            "adv/std": float(stats.get("adv_std", 0.0)),
+            "adv/min": float(stats.get("adv_min", 0.0)),
+            "adv/max": float(stats.get("adv_max", 0.0)),
+            "rollout/num_prompts": int(stats.get("num_prompts", 0)),
+            "rollout/num_responses": int(stats.get("num_responses", 0)),
+            "rollout/prompt_tokens_mean": float(stats.get("prompt_tokens_mean", 0.0)),
+            "rollout/prompt_tokens_max": float(stats.get("prompt_tokens_max", 0.0)),
+            "rollout/response_tokens_mean": float(stats.get("response_tokens_mean", 0.0)),
+            "rollout/response_tokens_max": float(stats.get("response_tokens_max", 0.0)),
+            "rollout/response_tokens_total": float(stats.get("response_tokens_total", 0.0)),
+            "optim/epochs_per_rollout": int(stats.get("epochs_per_rollout", 0)),
+            "optim/n_microbatches": int(stats.get("n_microbatches", 0)),
+            "optim/n_steps": int(stats.get("n_optim_steps", 0)),
             "time/rollout_s": stats["t_rollout_s"],
             "time/device_s": float(stats.get("t_device_s", 0.0)),
             "time/old_logprobs_s": float(stats.get("t_old_logprobs_s", 0.0)),
@@ -1639,6 +1711,11 @@ class CASPOTrainer:
         }
         if "mean_kl" in stats:
             log_payload["policy/mean_kl"] = stats["mean_kl"]
+        if "kl_term" in stats:
+            log_payload["policy/kl_term"] = stats["kl_term"]
+        if "grad_norm_mean" in stats:
+            log_payload["optim/grad_norm_mean"] = stats["grad_norm_mean"]
+            log_payload["optim/grad_norm_max"] = stats.get("grad_norm_max", 0.0)
         for k in ("value_loss", "value_acc", "v_bar_pos", "v_bar_neg",
                   "adb_v_x_mean", "adb_v_x_std", "dlw_w_mean", "dlw_w_std",
                   "value_lr", "vineppo_mc_K", "caspo_advantage_transform_id",

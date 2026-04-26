@@ -79,6 +79,7 @@ scripts/launch_rho1b_vineppo_ddp2.sh   Fast two-GPU VinePPO DDP path
 scripts/launch_rho1b_caspo_ablations.sh
 scripts/launch_rho1b_caspo_frozen_rm.sh
 scripts/launch_eval_all.sh
+scripts/launch_eval_rho1b_{sample,final}_all8.sh
 scripts/train_value.py                 Phase-1 IPVRM training
 scripts/train_caspo.py                 Phase-2 RL entrypoint
 scripts/collect_value_data.py          Phase-1 rollout data collection
@@ -546,29 +547,46 @@ GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
 
 ## Evaluation
 
-Do cheap sample evals at saved checkpoints and full eval only at the end.
+Do cheap sample evals at saved checkpoints and full eval only at the end. The
+training loop does not run eval in-process; eval is launched from saved
+checkpoints with vLLM. Keep the sample cadence aligned with checkpointing:
+`step_250`, `step_500`, `step_750`, and `final`.
 
-Sample eval example:
+Standard seven-method sample eval:
 
 ```bash
 RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 \
-EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 \
-EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+EVAL_GPU_LIST="0 1 2 3 4 5 6" ./scripts/launch_eval_rho1b_sample_all8.sh
 ```
 
-Full final eval:
+This defaults to `math500`, `EVAL_LIMIT=100`, and `EVAL_K=8`. On Rho-1B, the
+old full MATH-500 k=16 eval took about 1-2 minutes per model including vLLM
+startup; the 100-problem k=8 sample is expected to be well under that. If all
+seven methods are evaluated in parallel, sample eval wall-clock should usually
+be a couple of minutes, but it needs free eval GPUs.
+
+Standard seven-method full final eval:
 
 ```bash
-RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+RUN_TAG=paper512_seed0 EVAL_GPU_LIST="0 1 2 3 4 5 6" \
+  ./scripts/launch_eval_rho1b_final_all8.sh
 ```
+
+This runs `math500,math,collegemath,olympiadbench` at `k=16`. The prior
+Rho-1B MATH-500 k=16 generation time was about 56 seconds per model after vLLM
+startup. Full final eval is dominated by full MATH test, so budget roughly
+15-25 minutes wall-clock when the seven methods run in parallel on seven free
+H100s.
 
 The eval launcher supports:
 
-- `METHODS`: space-separated checkpoint directory tags, default `caspo grpo vineppo ppo`; use `METHODS="caspo_prob caspo_logprob caspo_frozen_rm vineppo_ddp2"` for ablations/DDP runs.
+- `METHODS`: space-separated checkpoint directory tags, default `grpo ppo vineppo_ddp2 caspo caspo_prob caspo_logprob caspo_frozen_rm`.
 - `CKPT_SUBDIR`: checkpoint under each method output dir, e.g. `step_250` or `final`.
 - `EVAL_BENCHMARKS`: comma-separated list, default `math500,math,collegemath,olympiadbench`.
 - `EVAL_LIMIT`: optional per-benchmark problem cap for sample eval.
 - `EVAL_K`: samples per problem, default `16`.
+- `EVAL_VLLM_GPU_MEMORY_UTILIZATION`: defaults to `0.85` because eval does not
+  share the GPU with a trainer.
 
 ## Latest Paper-Faithful Speed Probe
 
