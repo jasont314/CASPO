@@ -634,6 +634,54 @@ class CASPOTrainer:
             if m.__class__.__name__ in names
         }
 
+    def _make_block_group_wrap_policy(
+        self,
+        root_module: torch.nn.Module,
+        layer_classes: set[type],
+        group_size: int,
+    ):
+        """Build an FSDP auto-wrap policy that groups every ``group_size``
+        transformer blocks into one FSDP unit.
+
+        At 7B (32 blocks) ``group_size=4`` cuts the backward reduce-scatter
+        call count from 32 to 8, doubling each collective's payload from
+        ~440 MB to ~1.7 GB and lifting NVLink BW utilization. Embedding /
+        LM head stay in the root flat-param (not separately wrapped), which
+        is the desired layout — leaving contiguous unwrapped layers between
+        wrap points lets PyTorch FSDP collapse them into the parent unit.
+
+        Implementation: pre-walk the module tree to enumerate transformer
+        blocks in module-tree (post-order via ``modules()``) order, mark
+        every Nth block (the last of each group) as a wrap point by
+        ``id(module)``, then return a closure that consults the membership
+        set. We use ``id`` (not the module object) for the set key to avoid
+        relying on ``__hash__`` semantics for nn.Module subclasses.
+        """
+        layer_set = tuple(layer_classes)
+        blocks = [m for m in root_module.modules() if isinstance(m, layer_set)]
+        # Mark the last block of each contiguous group of ``group_size``
+        # as the FSDP wrap point. The earlier blocks in the group remain
+        # unwrapped and get folded into the parent flat-param, producing
+        # one FSDP unit per N consecutive blocks end-to-end.
+        wrap_ids = {
+            id(b) for i, b in enumerate(blocks)
+            if (i % group_size) == (group_size - 1)
+        }
+        # Always wrap the trailing partial group (if total_blocks % N != 0)
+        # so the final block(s) don't get pulled into the root unit.
+        if blocks and id(blocks[-1]) not in wrap_ids:
+            wrap_ids.add(id(blocks[-1]))
+
+        def policy(module, recurse, nonwrapped_numel, **kwargs):
+            if recurse:
+                # Always descend into children so we visit every block.
+                return True
+            if isinstance(module, layer_set):
+                return id(module) in wrap_ids
+            return False
+
+        return policy
+
     def _wrap_fsdp_if_enabled(
         self,
         module: torch.nn.Module,
@@ -769,10 +817,30 @@ class CASPOTrainer:
         if self.cfg.fsdp_auto_wrap:
             layer_classes = self._infer_fsdp_layer_classes(module)
             if layer_classes:
-                kwargs["auto_wrap_policy"] = functools.partial(
-                    transformer_auto_wrap_policy,
-                    transformer_layer_cls=layer_classes,
-                )
+                if self.cfg.fsdp_wrap_block_group_size > 1:
+                    # Coarser wrap: group every N transformer blocks into
+                    # one FSDP unit. Cuts reduce-scatter call count by N at
+                    # backward, giving each collective a bigger payload
+                    # (better NVLink BW utilization).
+                    kwargs["auto_wrap_policy"] = self._make_block_group_wrap_policy(
+                        module, layer_classes, self.cfg.fsdp_wrap_block_group_size,
+                    )
+                    if self.dist.is_main:
+                        n_blocks = sum(
+                            1 for m in module.modules()
+                            if isinstance(m, tuple(layer_classes))
+                        )
+                        print(
+                            f"[trainer] FSDP coarser wrap: "
+                            f"group_size={self.cfg.fsdp_wrap_block_group_size}, "
+                            f"transformer_blocks={n_blocks} for {module_name}",
+                            flush=True,
+                        )
+                else:
+                    kwargs["auto_wrap_policy"] = functools.partial(
+                        transformer_auto_wrap_policy,
+                        transformer_layer_cls=layer_classes,
+                    )
             elif self.dist.is_main:
                 warnings.warn(
                     f"FSDP auto-wrap found no transformer block classes for "

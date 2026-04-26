@@ -334,6 +334,13 @@ class CASPOConfig:
     fsdp_backward_prefetch: Literal[
         "backward_pre", "backward_post", "none"
     ] = "backward_pre"
+    # When >1, group every Nth transformer block into a single FSDP unit
+    # instead of wrapping each block individually. At 7B (32 blocks) the
+    # default per-block wrap issues 32 reduce-scatter calls per backward at
+    # ~440 MB each; group_size=4 cuts that to 8 calls at ~1.7 GB, lifting
+    # NVLink BW utilization (target step-time win 10-18%). Default 1 keeps
+    # the existing per-block wrap behaviour byte-for-byte.
+    fsdp_wrap_block_group_size: int = 1
     # Override FSDP MixedPrecision reduce_dtype. ``None`` (default) means
     # "match cfg.torch_dtype" — without this, FSDP reduces grads in fp32 even
     # under bf16 params, doubling reduce-scatter wire bytes for no accuracy
@@ -535,6 +542,11 @@ class CASPOConfig:
         if self.profile_steps < 0:
             raise ValueError(
                 f"profile_steps must be >= 0 (0 disables profiling), got {self.profile_steps}"
+            )
+        if self.fsdp_wrap_block_group_size < 1:
+            raise ValueError(
+                "fsdp_wrap_block_group_size must be >= 1 (1 = per-block wrap), "
+                f"got {self.fsdp_wrap_block_group_size}"
             )
         if self.reward_workers < 1:
             raise ValueError(

@@ -238,6 +238,37 @@ def _infer_fsdp_layer_classes(module: torch.nn.Module) -> set:
     }
 
 
+def _make_block_group_wrap_policy(
+    root_module: torch.nn.Module,
+    layer_classes: set,
+    group_size: int,
+):
+    """Mirror of CASPOTrainer._make_block_group_wrap_policy for the value phi.
+
+    Groups every ``group_size`` transformer blocks into one FSDP unit so
+    backward reduce-scatter call count drops by N (bigger payload per
+    collective, better NVLink BW utilization). See caspo_trainer.py for
+    the full rationale.
+    """
+    layer_set = tuple(layer_classes)
+    blocks = [m for m in root_module.modules() if isinstance(m, layer_set)]
+    wrap_ids = {
+        id(b) for i, b in enumerate(blocks)
+        if (i % group_size) == (group_size - 1)
+    }
+    if blocks and id(blocks[-1]) not in wrap_ids:
+        wrap_ids.add(id(blocks[-1]))
+
+    def policy(module, recurse, nonwrapped_numel, **kwargs):
+        if recurse:
+            return True
+        if isinstance(module, layer_set):
+            return id(module) in wrap_ids
+        return False
+
+    return policy
+
+
 def _wrap_phi_fsdp(
     phi: torch.nn.Module,
     cfg: CASPOConfig,
@@ -348,10 +379,17 @@ def _wrap_phi_fsdp(
     if cfg.fsdp_auto_wrap:
         layer_classes = _infer_fsdp_layer_classes(phi)
         if layer_classes:
-            kwargs["auto_wrap_policy"] = functools.partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls=layer_classes,
-            )
+            if cfg.fsdp_wrap_block_group_size > 1:
+                # Coarser wrap: group every N transformer blocks into one
+                # FSDP unit (cuts reduce-scatter call count by N).
+                kwargs["auto_wrap_policy"] = _make_block_group_wrap_policy(
+                    phi, layer_classes, cfg.fsdp_wrap_block_group_size,
+                )
+            else:
+                kwargs["auto_wrap_policy"] = functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls=layer_classes,
+                )
         else:
             warnings.warn(
                 "FSDP auto-wrap found no transformer block classes for value phi; "
