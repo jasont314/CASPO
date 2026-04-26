@@ -14,10 +14,10 @@
 #
 # Defaults preserve the paper-faithful global batch:
 #   2 ranks x 32 prompts/rank x G=8 = 512 responses/global outer step
-#   2 ranks x grad_accum_steps=32 x micro_batch_size=1 = 64-response global PPO minibatch
+#   2 ranks x grad_accum_steps=8 x micro_batch_size=4 = 64-response global PPO minibatch
 #
 # Usage:
-#   RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
+#   RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline \
 #     ./scripts/launch_rho1b_vineppo_ddp2.sh
 #
 # vLLM tuning knobs are accepted with a CASPO_ prefix so they are not
@@ -27,7 +27,7 @@
 # Smoke:
 #   MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
 #   GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
-#   GPU_LIST="6 7" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
+#   GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
 #
 set -eo pipefail
 # Don't use 'set -u' - conda activate scripts have unbound vars.
@@ -47,9 +47,9 @@ BASE_CONFIG="${BASE_CONFIG:-configs/caspo_rho1b_math.yaml}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29577}"
 
-read -r -a GPUS <<< "${GPU_LIST:-6 7}"
+read -r -a GPUS <<< "${GPU_LIST:-2 3}"
 if (( ${#GPUS[@]} != 2 )); then
-    echo "[vineppo-ddp2] ERROR: GPU_LIST must contain exactly 2 GPU ids; got: ${GPU_LIST:-6 7}"
+    echo "[vineppo-ddp2] ERROR: GPU_LIST must contain exactly 2 GPU ids; got: ${GPU_LIST:-2 3}"
     exit 2
 fi
 
@@ -68,10 +68,11 @@ LOG1="$LOGDIR/phase2_${METHOD_TAG}_rank1.log"
 
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-32}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-32}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
 VINEPPO_MC_ROLLOUTS="${VINEPPO_MC_ROLLOUTS:-9}"
-USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
+LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-16}"
 CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.45}}"
 CASPO_VLLM_MULTI_SAMPLE_MODE="${CASPO_VLLM_MULTI_SAMPLE_MODE:-${VLLM_MULTI_SAMPLE_MODE:-auto}}"
 CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-256}}"

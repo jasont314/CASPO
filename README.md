@@ -72,6 +72,9 @@ Launch/eval scripts:
 
 ```text
 scripts/launch_rho1b_parallel.sh       PPO/CASPO/GRPO/VinePPO, one GPU each
+scripts/launch_rho1b_all8_standard.sh  Full seven-run, eight-GPU suite
+scripts/launch_rho1b_{grpo,ppo,caspo}.sh
+scripts/launch_rho1b_caspo_delta_{prob,log_prob}.sh
 scripts/launch_rho1b_vineppo_ddp2.sh   Fast two-GPU VinePPO DDP path
 scripts/launch_rho1b_caspo_ablations.sh
 scripts/launch_rho1b_caspo_frozen_rm.sh
@@ -376,6 +379,45 @@ You can override the default cadence and run length:
 SAVE_EVERY=100 MAX_STEPS=300 RUN_TAG=debug ./scripts/launch_rho1b_parallel.sh
 ```
 
+## Standard 8-GPU Suite
+
+For the full current experiment set, use seven launch scripts across eight
+GPUs. The default map is:
+
+| Experiment | GPUs | Script | Output tag |
+|---|---:|---|---|
+| GRPO | 0 | `scripts/launch_rho1b_grpo.sh` | `grpo` |
+| PPO | 1 | `scripts/launch_rho1b_ppo.sh` | `ppo` |
+| VinePPO K=9 DDP2 | 2,3 | `scripts/launch_rho1b_vineppo_ddp2.sh` | `vineppo_ddp2` |
+| CASPO online RM | 4 | `scripts/launch_rho1b_caspo.sh` | `caspo` |
+| CASPO delta-prob | 5 | `scripts/launch_rho1b_caspo_delta_prob.sh` | `caspo_prob` |
+| CASPO delta-log-prob | 6 | `scripts/launch_rho1b_caspo_delta_log_prob.sh` | `caspo_logprob` |
+| CASPO frozen RM | 7 | `scripts/launch_rho1b_caspo_frozen_rm.sh` | `caspo_frozen_rm` |
+
+Launch all seven jobs at once:
+
+```bash
+cd /home/jason/experiment/CASPO
+RUN_TAG=paper512_seed0 GPU_LIST="0 1 2 3 4 5 6 7" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_all8_standard.sh
+```
+
+Or launch a single job by overriding its GPU:
+
+```bash
+RUN_TAG=paper512_seed0 GPU=0 WANDB_MODE=offline ./scripts/launch_rho1b_grpo.sh
+RUN_TAG=paper512_seed0 GPU=1 WANDB_MODE=offline ./scripts/launch_rho1b_ppo.sh
+RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline ./scripts/launch_rho1b_vineppo_ddp2.sh
+RUN_TAG=paper512_seed0 GPU=4 WANDB_MODE=offline ./scripts/launch_rho1b_caspo.sh
+RUN_TAG=paper512_seed0 GPU=5 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_delta_prob.sh
+RUN_TAG=paper512_seed0 GPU=6 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_delta_log_prob.sh
+RUN_TAG=paper512_seed0 GPU=7 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_frozen_rm.sh
+```
+
+All seven scripts use `configs/caspo_rho1b_math.yaml`, vLLM IPC sync,
+`save_every=250`, and the current 1000-step standard unless `MAX_STEPS` or
+`SAVE_EVERY` is overridden.
+
 ## CASPO Advantage Ablations
 
 The direct-value CASPO variant is the normal `caspo` run above. Launch the two
@@ -417,12 +459,12 @@ Output:
 ## Two-GPU VinePPO
 
 For Rho-1B VinePPO, the fastest multi-GPU path is replicated DDP with one
-rank-local vLLM engine per GPU. The dedicated launcher uses GPUs 6 and 7 by
+rank-local vLLM engine per GPU. The dedicated launcher uses GPUs 2 and 3 by
 default, starts one trainer process per physical GPU, and preserves the
 current 512-response global outer step:
 
 ```bash
-RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
+RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline \
   ./scripts/launch_rho1b_vineppo_ddp2.sh
 ```
 
@@ -430,7 +472,7 @@ Default DDP shape:
 
 ```text
 2 ranks x 32 prompts/rank x 8 rollouts = 512 responses/global step
-2 ranks x 32 grad-accum micros x 1 response = 64-response global PPO minibatch
+2 ranks x 8 grad-accum micros x 4 responses = 64-response global PPO minibatch
 ```
 
 Learning/effective-batch note: this two-GPU launcher is configured to match the
@@ -448,7 +490,7 @@ Recommended fastest tested Rho-1B DDP settings:
 # 2 ranks x micro_batch_size=4 x grad_accum_steps=8 = 64 responses.
 MICRO_BATCH_SIZE=4 GRAD_ACCUM_STEPS=8 USE_GRADIENT_CHECKPOINTING=false \
 LOGPROB_MICRO_BATCH_SIZE=16 CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55 \
-RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
+RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline \
   ./scripts/launch_rho1b_vineppo_ddp2.sh
 ```
 
@@ -499,7 +541,7 @@ For an infrastructure smoke:
 ```bash
 MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
 GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
-GPU_LIST="6 7" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
+GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
 ```
 
 ## Evaluation
