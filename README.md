@@ -553,6 +553,15 @@ All seven scripts use `configs/caspo_rho1b_math.yaml`, vLLM IPC sync,
 `save_every=250`, and the current 1000-step standard unless `MAX_STEPS` or
 `SAVE_EVERY` is overridden.
 
+The 8-GPU launcher accepts these orchestration env vars:
+
+| Var | Default | Effect |
+|---|---|---|
+| `AUTO_EVAL_ON_FINISH` | `1` | When a training job exits rc=0, immediately dispatch its eval on the freed GPU instead of waiting for everyone — saves ~7-12 h per suite. Auto-disabled when `WAIT_FOR_CHILDREN=0`. |
+| `WATCHDOG` | `1` | Spawn a sidecar polling each method's log every 60 s; warn on `STATUS: STALE` for ≥2 polls (no auto-kill in v1). |
+| `WAIT_FOR_CHILDREN` | `1` | Set to `0` to write `${LOGDIR}/launcher_pids.json` and exit without blocking — detachable suite. |
+| `WANDB_MODE` | `offline` | Inherited by all per-method launchers. |
+
 ## CASPO Advantage Ablations
 
 The direct-value CASPO variant is the normal `caspo` run above. Launch the two
@@ -639,6 +648,10 @@ CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55
 CASPO_VLLM_MAX_NUM_SEQS=512
 CASPO_VLLM_MAX_NUM_BATCHED_TOKENS=32768
 CASPO_VLLM_MULTI_SAMPLE_MODE=batched
+
+# Round 2 trainer knobs (apply to both 1-GPU and DDP-2 launchers):
+CASPO_REWARD_WORKERS=4   # ProcessPoolExecutor for SymPy verifier (default 4)
+CASPO_COMPILE=false      # torch.compile — leave false (see Round 2 caveats)
 ```
 
 Do not force the aggressive vLLM scheduler knobs by default. In the latest
