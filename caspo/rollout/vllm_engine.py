@@ -104,6 +104,7 @@ class VLLMRolloutEngine:
         self._parallel_sampling_supported: Optional[bool] = None
         self._parallel_sampling_warned = False
         self._return_logprobs = bool(cfg.vllm_return_logprobs)
+        self._weight_sync_backend = str(cfg.vllm_weight_sync_backend)
 
         # Tokenizer (used for response decoding + prompt tokenization).
         tok_path = cfg.tokenizer_name_or_path or cfg.model_name_or_path
@@ -144,6 +145,7 @@ class VLLMRolloutEngine:
         # device visibility isn't permanently mutated (the engine subprocess
         # has already inherited the modified env at fork time).
         prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        prev_allow_insecure = os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION")
         if gpu_id is not None:
             gpu_idx = int(gpu_id)
             if prev_cvd:
@@ -155,6 +157,12 @@ class VLLMRolloutEngine:
                 os.environ["CUDA_VISIBLE_DEVICES"] = visible[gpu_idx]
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+        if self._weight_sync_backend == "ipc":
+            # vLLM's IPC update API serializes CUDA IPC handles through the
+            # EngineCore control channel. This is local-process-only for our
+            # trainer/vLLM topology; the env flag must be visible before the
+            # EngineCore subprocess starts.
+            os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # Sentinels so __del__ / shutdown don't trip on partially-constructed
         # objects if the engine init below throws.
@@ -184,6 +192,8 @@ class VLLMRolloutEngine:
                 engine_kwargs["max_num_seqs"] = int(max_num_seqs)
             if max_num_batched_tokens is not None:
                 engine_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+            if self._weight_sync_backend == "ipc":
+                engine_kwargs["weight_transfer_config"] = {"backend": "ipc"}
             engine_args = AsyncEngineArgs(**engine_kwargs)
             self.engine = AsyncLLM.from_engine_args(engine_args)
         finally:
@@ -194,6 +204,11 @@ class VLLMRolloutEngine:
                     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                 else:
                     os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+            if self._weight_sync_backend == "ipc":
+                if prev_allow_insecure is None:
+                    os.environ.pop("VLLM_ALLOW_INSECURE_SERIALIZATION", None)
+                else:
+                    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = prev_allow_insecure
         # Persistent event loop so we don't create+destroy one per call.
         # If new_event_loop fails (extremely unlikely) we tear the engine
         # down so its EngineCore subprocess + NCCL sockets don't leak.
@@ -830,9 +845,77 @@ class VLLMRolloutEngine:
                 },
             )
         )
+        self._reset_prefix_cache_after_weight_update()
+        return time.time() - t0
+
+    def sync_weights_from_model(self, model: torch.nn.Module) -> float:
+        """Push trainer weights to vLLM through CUDA IPC.
+
+        This uses vLLM 0.19's RL weight-transfer API and avoids the
+        save_pretrained() + reload_weights() disk path. It is valid only when
+        the trainer model tensors and vLLM EngineCore are on the same physical
+        GPU, which is exactly the single-process/single-GPU topology used by
+        the Rho-1B launchers.
+        """
+        if self._weight_sync_backend != "ipc":
+            raise RuntimeError(
+                "sync_weights_from_model requires vllm_weight_sync_backend='ipc'"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA IPC weight sync requires CUDA")
+
+        import pickle
+
+        import pybase64 as base64
+        from torch.multiprocessing.reductions import reduce_tensor
+        from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+
+        t0 = time.time()
+        device_index = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device_index)
+        gpu_uuid = str(props.uuid)
+
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        ipc_handles = []
+        keepalive: list[torch.Tensor] = []
+        for name, tensor in model.named_parameters():
+            if not tensor.is_cuda:
+                raise RuntimeError(
+                    f"parameter {name!r} is on {tensor.device}; IPC sync expects CUDA"
+                )
+            weight = tensor.detach().contiguous()
+            keepalive.append(weight)
+            names.append(name)
+            dtype_names.append(str(weight.dtype).split(".")[-1])
+            shapes.append(list(weight.shape))
+            ipc_handles.append({gpu_uuid: reduce_tensor(weight)})
+
+        pickled_handles = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+        request = WeightTransferUpdateRequest(
+            update_info={
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "ipc_handles_pickled": pickled_handles,
+                "is_checkpoint_format": True,
+            }
+        )
+        # Keep contiguous tensors alive until EngineCore has opened every IPC
+        # handle and copied/loaded the weights.
+        self._ipc_weight_keepalive = keepalive
+        try:
+            self._run(self.engine.update_weights(request))
+        finally:
+            self._ipc_weight_keepalive = []
+        self._reset_prefix_cache_after_weight_update()
+        return time.time() - t0
+
+    def _reset_prefix_cache_after_weight_update(self) -> None:
         # reset_prefix_cache is async on V1 engine — drive it on our event loop.
-        # Strictly AFTER reload_weights so any cache hits during reload are
-        # invalidated, not after a fresh re-population window.
+        # Strictly AFTER the weight update so cached KV from old weights cannot
+        # be reused by subsequent rollouts.
         try:
             reset_coro = self.engine.reset_prefix_cache()
             if hasattr(reset_coro, "__await__"):
@@ -843,10 +926,9 @@ class VLLMRolloutEngine:
                 raise RuntimeError("reset_prefix_cache returned False")
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
-                "reset_prefix_cache failed after vLLM weight reload; "
+                "reset_prefix_cache failed after vLLM weight update; "
                 "continuing could reuse stale KV cache from old weights"
             ) from e
-        return time.time() - t0
 
     async def _collective_rpc(self, method: str, args: tuple = (), kwargs: Optional[dict] = None):
         kwargs = kwargs or {}

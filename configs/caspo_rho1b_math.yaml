@@ -37,6 +37,7 @@ vllm_tensor_parallel_size: 1
 vllm_enforce_eager: false
 vllm_max_num_seqs: 256
 vllm_max_inflight_requests: 1024
+vllm_weight_sync_backend: ipc
 
 # step segmentation — VinePPO-faithful LaTeX-aware splitter (ported from
 # their math_extract_steps_inplace.py).

@@ -49,6 +49,22 @@ def test_fsdp_vllm_rank_local_config_is_valid():
     assert cfg.rollout_backend == "vllm"
 
 
+def test_ipc_weight_sync_requires_single_process_rank_local_vllm():
+    with pytest.raises(ValueError, match="single-process trainer"):
+        CASPOConfig(
+            distributed_backend="fsdp",
+            rollout_backend="vllm",
+            vllm_weight_sync_backend="ipc",
+        )
+
+    with pytest.raises(ValueError, match="vllm_tensor_parallel_size=1"):
+        CASPOConfig(
+            rollout_backend="vllm",
+            vllm_weight_sync_backend="ipc",
+            vllm_tensor_parallel_size=2,
+        )
+
+
 def test_vineppo_requires_vllm_rollout_backend():
     with pytest.raises(ValueError, match="rollout_backend='vllm'"):
         CASPOConfig(method="vineppo", rollout_backend="hf")

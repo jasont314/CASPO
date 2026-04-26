@@ -58,6 +58,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "fsdp_sharding_strategy": ("full_shard", "shard_grad_op", "no_shard"),
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
     "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
+    "vllm_weight_sync_backend": ("checkpoint", "ipc"),
 }
 
 # Bool fields that may arrive as the strings "true"/"false" from YAML when
@@ -250,6 +251,10 @@ class CASPOConfig:
     # Where to dump the policy snapshot for vLLM weight sync each iter.
     # Defaults to {output_dir}/_vllm_sync if None.
     vllm_sync_dir: Optional[str] = None
+    # "checkpoint": save_pretrained() to disk, then vLLM reload_weights().
+    # "ipc": use vLLM's CUDA-IPC RL weight-transfer API. IPC is single-node and
+    # requires trainer and vLLM engine to live on the same physical GPU.
+    vllm_weight_sync_backend: Literal["checkpoint", "ipc"] = "checkpoint"
     # If True, skip the initial sync from disk (use SFT init, faster startup
     # for the very first iter).
     # NOTE: not currently consumed — VLLMRolloutEngine always inits from
@@ -432,6 +437,19 @@ class CASPOConfig:
                     "currently expects one rank-local vLLM engine per process "
                     "(vllm_tensor_parallel_size=1). Use a separate rollout "
                     "topology for tensor-parallel vLLM."
+                )
+        if self.vllm_weight_sync_backend == "ipc":
+            if self.distributed_backend != "none":
+                raise ValueError(
+                    "vllm_weight_sync_backend='ipc' is only supported for the "
+                    "single-process trainer. Use checkpoint sync for FSDP until "
+                    "NCCL weight sync is implemented."
+                )
+            if self.vllm_tensor_parallel_size != 1:
+                raise ValueError(
+                    "vllm_weight_sync_backend='ipc' requires "
+                    "vllm_tensor_parallel_size=1 so trainer and vLLM share one "
+                    "physical GPU."
                 )
         if self.profile_steps < 0:
             raise ValueError(

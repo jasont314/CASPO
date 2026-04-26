@@ -26,6 +26,7 @@ vllm_tensor_parallel_size: 1
 vllm_enforce_eager: false
 vllm_max_num_seqs: 256
 vllm_max_inflight_requests: 1024
+vllm_weight_sync_backend: ipc
 prompts_per_step: 16              # 16 prompts × G=8 = 128 episodes/step (was 8/64); doubled to
                                   # stabilize gradient estimate so we can take a larger lr step.
                                   # GSM8K reward signal is dense (high pass rate post-SFT) so the

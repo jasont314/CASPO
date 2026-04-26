@@ -368,7 +368,9 @@ class CASPOTrainer:
             self._sync_tokenizer_saved = False
             rank0_print(
                 self.dist,
-                f"[trainer] vLLM rollout backend ON — weight sync dir = {self._sync_dir}",
+                "[trainer] vLLM rollout backend ON — "
+                f"weight_sync={cfg.vllm_weight_sync_backend} "
+                f"sync_dir={self._sync_dir}",
                 flush=True,
             )
         else:
@@ -651,6 +653,17 @@ class CASPOTrainer:
         """Save the current policy and push it to the vLLM engine. Returns wall time."""
         if self._sync_dir is None or not hasattr(self.sampler, "sync_weights_from_path"):
             return 0.0
+        if (
+            self.cfg.vllm_weight_sync_backend == "ipc"
+            and hasattr(self.sampler, "sync_weights_from_model")
+        ):
+            if _is_fsdp_module(self.model):
+                raise RuntimeError(
+                    "vllm_weight_sync_backend='ipc' is only implemented for "
+                    "single-process, unsharded trainers. Use checkpoint sync "
+                    "or implement NCCL sync for FSDP."
+                )
+            return self.sampler.sync_weights_from_model(_unwrap_fsdp(self.model))
         t0 = time.time()
         save_tokenizer = not self._sync_tokenizer_saved
         self._save_policy_pretrained(
