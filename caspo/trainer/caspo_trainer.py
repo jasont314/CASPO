@@ -704,17 +704,61 @@ class CASPOTrainer:
         if self.cfg.fsdp_sharding_strategy == "hybrid_shard":
             world_size = int(self.dist.world_size)
             if world_size >= 4 and world_size % 2 == 0:
+                # init_device_mesh requires every rank to see ALL physical
+                # devices in the mesh: a (world_size//2, 2) mesh on "cuda"
+                # binds rank N to local cuda:(N % visible_count). With our
+                # rank-local launcher (one CUDA_VISIBLE_DEVICES gpu per rank,
+                # local_rank=0 always) cuda:0 *is* the only visible device on
+                # every rank, but PyTorch still validates that local_rank <
+                # device_count and silently fails on the higher ranks. The
+                # fix is twofold:
+                #   1. try-catch the init so a hostile environment falls back
+                #      to plain HYBRID_SHARD (no mesh, PyTorch picks default
+                #      replicate groups) instead of deadlocking the run.
+                #   2. only attempt device_mesh when every rank actually
+                #      sees ``world_size`` cuda devices — that is the regime
+                #      where init_device_mesh is sound.
                 try:
                     from torch.distributed.device_mesh import init_device_mesh
                 except ImportError:  # pragma: no cover
                     from torch.distributed._tensor import (  # type: ignore
                         init_device_mesh,
                     )
-                device_mesh = init_device_mesh(
-                    "cuda" if self.device.type == "cuda" else "cpu",
-                    (world_size // 2, 2),
+                visible = (
+                    torch.cuda.device_count() if self.device.type == "cuda" else 1
                 )
-                kwargs["device_mesh"] = device_mesh
+                # Plain HYBRID_SHARD without a device_mesh interprets
+                # LOCAL_WORLD_SIZE as the intra-node shard group size. Our
+                # rank-local launcher sets LOCAL_WORLD_SIZE=1 (one GPU per
+                # process), which collapses HSDP to "no shard, full replicate"
+                # — every rank holds the full 7B param + opt-state (~98 GB)
+                # and OOMs. So if we cannot get a real mesh, downgrade the
+                # strategy to FULL_SHARD instead of pretending HSDP works.
+                if self.device.type == "cuda" and visible < world_size:
+                    if self.dist.is_main:
+                        warnings.warn(
+                            f"hybrid_shard device_mesh requires every rank to "
+                            f"see all {world_size} GPUs, but each rank sees only "
+                            f"{visible}. Downgrading to FULL_SHARD. For HSDP "
+                            f"perf launch with CUDA_VISIBLE_DEVICES exposing all "
+                            f"ranks' GPUs and LOCAL_RANK / LOCAL_WORLD_SIZE set "
+                            f"per-rank."
+                        )
+                    kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
+                else:
+                    try:
+                        device_mesh = init_device_mesh(
+                            "cuda" if self.device.type == "cuda" else "cpu",
+                            (world_size // 2, 2),
+                        )
+                        kwargs["device_mesh"] = device_mesh
+                    except (RuntimeError, ValueError, IndexError) as e:
+                        if self.dist.is_main:
+                            warnings.warn(
+                                f"hybrid_shard init_device_mesh failed: {e}. "
+                                f"Downgrading to FULL_SHARD."
+                            )
+                        kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
             elif self.dist.is_main:
                 warnings.warn(
                     f"fsdp_sharding_strategy='hybrid_shard' but "

@@ -315,11 +315,29 @@ def _wrap_phi_fsdp(
                 from torch.distributed._tensor import (  # type: ignore
                     init_device_mesh,
                 )
-            device_mesh = init_device_mesh(
-                "cuda" if torch.cuda.is_available() else "cpu",
-                (world_size // 2, 2),
-            )
-            kwargs["device_mesh"] = device_mesh
+            visible = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            # Mirror caspo_trainer guard: device_mesh requires every rank
+            # see all GPUs in the mesh; otherwise downgrade to FULL_SHARD.
+            if torch.cuda.is_available() and visible < world_size:
+                warnings.warn(
+                    f"hybrid_shard device_mesh requires every rank to see "
+                    f"all {world_size} GPUs, but each rank sees only "
+                    f"{visible}. Downgrading to FULL_SHARD."
+                )
+                kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
+            else:
+                try:
+                    device_mesh = init_device_mesh(
+                        "cuda" if torch.cuda.is_available() else "cpu",
+                        (world_size // 2, 2),
+                    )
+                    kwargs["device_mesh"] = device_mesh
+                except (RuntimeError, ValueError, IndexError) as e:
+                    warnings.warn(
+                        f"hybrid_shard init_device_mesh failed: {e}. "
+                        f"Downgrading to FULL_SHARD."
+                    )
+                    kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
         else:
             warnings.warn(
                 f"fsdp_sharding_strategy='hybrid_shard' but "
