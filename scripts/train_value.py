@@ -151,22 +151,67 @@ def _eval_val_loss(
     blob: dict,
     val_rows,
     batch_size: int,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict:
-    """Compute average IPVRM loss on the val set. No grad."""
+    """Compute average IPVRM loss on the val set. No grad.
+
+    FSDP-collective: every rank computes loss on its shard of val rows
+    (rows ``rank::world_size``) and the per-batch sums are all-reduced
+    before normalizing. This is required because ``model.phi`` is
+    FSDP-wrapped — its forward needs every rank to participate in the
+    all-gather. Calling on rank 0 only deadlocks at FSDP's collective
+    barrier inside the forward pass.
+
+    Returns global means; the result is identical on every rank.
+    """
     model.phi.eval()
     device = model.device
-    total_loss = 0.0
-    total_acc = 0.0
-    n_batches = 0
     blob_on_device = blob["prompt_ids"].device.type == device.type
     val_rows_t = (
         val_rows
         if torch.is_tensor(val_rows)
         else torch.as_tensor(val_rows, dtype=torch.long)
     )
-    n = val_rows_t.numel()
-    for start in range(0, n, batch_size):
-        rows = val_rows_t[start : start + batch_size]
+    # Per-rank shard of val rows. Each rank does its own batches in lockstep
+    # with the others (collective forwards must be matched count-for-count).
+    if world_size > 1:
+        rank_rows = val_rows_t[rank::world_size]
+    else:
+        rank_rows = val_rows_t
+    n = rank_rows.numel()
+    # All ranks must enter the same number of forward passes; pad the rank
+    # with the smallest count up to the largest count by re-running its
+    # last batch (the sums get all-reduced and divided by the global batch
+    # count, so re-runs cancel out via simple averaging).
+    local_batches = (n + batch_size - 1) // batch_size
+    if world_size > 1:
+        import torch.distributed as _dist
+        local_batches_t = torch.tensor([local_batches], dtype=torch.long, device=device)
+        _dist.all_reduce(local_batches_t, op=_dist.ReduceOp.MAX)
+        global_max_batches = int(local_batches_t.item())
+    else:
+        global_max_batches = local_batches
+
+    total_loss = torch.zeros(1, dtype=torch.float64, device=device)
+    total_acc = torch.zeros(1, dtype=torch.float64, device=device)
+    contributing = torch.zeros(1, dtype=torch.float64, device=device)
+
+    for bi in range(global_max_batches):
+        start = bi * batch_size
+        if start < n:
+            rows = rank_rows[start : start + batch_size]
+            real = True
+        else:
+            # Re-run the last real batch so we participate in the collective
+            # forward without contributing to the loss tally.
+            rows = rank_rows[max(0, n - batch_size):n] if n > 0 else rank_rows[:0]
+            if rows.numel() == 0:
+                # No val data on this rank at all (rare). Use first global row
+                # to avoid empty-batch errors; gate it out via ``real=False``.
+                rows = val_rows_t[:1]
+            real = False
+
         batch = _make_batch(rows, blob)
         if blob_on_device:
             prompt_ids = batch["prompt_ids"]
@@ -187,15 +232,23 @@ def _eval_val_loss(
             outcomes=outcomes,
             margin=model.margin,
         )
-        total_loss += float(stats["loss"])
-        total_acc += float(stats["acc_at_last"])
-        n_batches += 1
+        if real:
+            total_loss += float(stats["loss"])
+            total_acc += float(stats["acc_at_last"])
+            contributing += 1.0
+
+    if world_size > 1:
+        import torch.distributed as _dist
+        _dist.all_reduce(total_loss, op=_dist.ReduceOp.SUM)
+        _dist.all_reduce(total_acc, op=_dist.ReduceOp.SUM)
+        _dist.all_reduce(contributing, op=_dist.ReduceOp.SUM)
+
     model.phi.train()
-    denom = max(1, n_batches)
+    denom = float(contributing.item()) if contributing.item() > 0 else 1.0
     return {
-        "val_loss": total_loss / denom,
-        "val_acc_at_last": total_acc / denom,
-        "val_n_batches": n_batches,
+        "val_loss": float(total_loss.item()) / denom,
+        "val_acc_at_last": float(total_acc.item()) / denom,
+        "val_n_batches": int(contributing.item()),
     }
 
 
@@ -396,13 +449,32 @@ def main() -> None:
         # ---- val eval + early stopping ----
         # value_eval_every <= 0 disables eval (and therefore early stopping
         # and best-checkpoint tracking — falls through to final-save branch).
-        # Validation runs on rank 0 only; the early-stop decision is then
-        # broadcast so all ranks exit the loop in lockstep (otherwise FSDP
-        # all-gathers in save_pretrained would hang waiting for stragglers).
+        # Validation is COLLECTIVE under FSDP: every rank participates in
+        # _eval_val_loss (each rank does its val-row shard), and the loss is
+        # all-reduced so every rank ends with the identical global mean.
+        # The decision (best-step, early-stop) is then computed identically
+        # on every rank, no broadcast needed.
         if int(cfg.value_eval_every) > 0 and (step % int(cfg.value_eval_every) == 0):
             do_break = False
+            val_stats = _eval_val_loss(
+                model, blob, val_rows_t, batch_size=bs,
+                rank=rank, world_size=world_size,
+            )
+            if val_stats["val_loss"] < best_val_loss - 1e-6:
+                best_val_loss = val_stats["val_loss"]
+                best_step = step
+                no_improve_evals = 0
+                save_best_now_flag = True
+            else:
+                no_improve_evals += 1
+                save_best_now_flag = False
+                if (
+                    no_improve_evals >= int(cfg.value_early_stop_patience)
+                    and step >= int(cfg.value_early_stop_min_steps)
+                ):
+                    early_stopped = True
+                    do_break = True
             if is_main:
-                val_stats = _eval_val_loss(model, blob, val_rows_t, batch_size=bs)
                 print(
                     f"[value step {step}] val_loss={val_stats['val_loss']:.4f} "
                     f"val_acc={val_stats['val_acc_at_last']:.3f} "
@@ -410,42 +482,20 @@ def main() -> None:
                     flush=True,
                 )
                 log_file.write(json.dumps({"step": step, **val_stats}) + "\n")
-                if val_stats["val_loss"] < best_val_loss - 1e-6:
-                    best_val_loss = val_stats["val_loss"]
-                    best_step = step
-                    no_improve_evals = 0
-                else:
-                    no_improve_evals += 1
-                    if (
-                        no_improve_evals >= int(cfg.value_early_stop_patience)
-                        and step >= int(cfg.value_early_stop_min_steps)
-                    ):
-                        print(
-                            f"[value] early stop at step {step} "
-                            f"(no val improvement for {no_improve_evals} evals; "
-                            f"best={best_val_loss:.4f} @ step {best_step})",
-                            flush=True,
-                        )
-                        early_stopped = True
-                        do_break = True
+                if early_stopped:
+                    print(
+                        f"[value] early stop at step {step} "
+                        f"(no val improvement for {no_improve_evals} evals; "
+                        f"best={best_val_loss:.4f} @ step {best_step})",
+                        flush=True,
+                    )
 
-            # Broadcast {save_best, do_break} so every rank participates in the
-            # FSDP full-state-dict gather (which all ranks must enter together)
-            # and exits the loop together.
-            if is_dist_initialized():
-                import torch.distributed as _dist
-                flags = torch.tensor(
-                    [
-                        1 if (is_main and best_step == step) else 0,
-                        1 if do_break else 0,
-                    ],
-                    dtype=torch.long, device=rank_device,
-                )
-                _dist.broadcast(flags, src=0)
-                save_best_now = bool(flags[0].item())
-                do_break = bool(flags[1].item())
-            else:
-                save_best_now = is_main and (best_step == step)
+            # _eval_val_loss is collective: every rank ends with the same
+            # global mean val_loss, so best_step / no_improve_evals /
+            # do_break advance identically on every rank. No broadcast
+            # needed; just rely on the shared computation. save_best_now
+            # is True on every rank when this step beat the prior best.
+            save_best_now = save_best_now_flag
 
             if save_best_now:
                 # All ranks must enter save_pretrained together because FSDP's

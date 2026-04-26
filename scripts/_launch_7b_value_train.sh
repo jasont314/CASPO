@@ -73,12 +73,11 @@ VALUE_MAX_EPOCHS="${VALUE_MAX_EPOCHS:-3}"
 VALUE_LR="${VALUE_LR:-5e-7}"
 FSDP_CPU_OFFLOAD="${FSDP_CPU_OFFLOAD:-false}"
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
-# VALUE_EVAL_EVERY=0 disables periodic validation eval. Required default
-# while we run FSDP training because the rank-0-only val forward path
-# in scripts/train_value.py:_eval_val_loss deadlocks under FSDP (other
-# ranks can't satisfy the all-gather). Re-enable once val eval is
-# rewritten as a collective forward.
-VALUE_EVAL_EVERY="${VALUE_EVAL_EVERY:-0}"
+# VALUE_EVAL_EVERY=50 (matches cfg default). Validation is now FSDP-collective:
+# every rank evaluates its own val-row shard, the per-batch losses are
+# all-reduced, and best-step / early-stop decisions advance identically on
+# every rank. No more rank-0-only deadlock.
+VALUE_EVAL_EVERY="${VALUE_EVAL_EVERY:-50}"
 
 OVERRIDES=(
     --override distributed_backend=fsdp
