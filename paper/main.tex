@@ -49,6 +49,17 @@ suffix expansion? The current repository therefore implements \ppo{}, \grpo{},
 \vineppo{}, and \caspo{} in one stack so wall-clock and accuracy can be
 measured under the same vLLM and trainer infrastructure.
 
+\paragraph{Implementation provenance.}
+This codebase is an adaptation and extension of the public \vineppo{} setup, not
+a from-scratch configuration chosen only from the paper. The Rho-1B MATH
+configuration, prompt template, rollout shape, PPO/VinePPO hyperparameters, eval
+protocol, and LaTeX-aware segmentation behavior are matched to or derived from
+the upstream \vineppo{} paper and repository
+\citep{vineppo2024,vineppocode}. \caspo{} is the new extension in this stack:
+it replaces \vineppo{}'s online Monte Carlo prefix rollouts with an
+\ipvrm{}-style learned prefix value model while preserving the comparison setup
+where possible.
+
 \section{Related Work}
 \paragraph{PPO.}
 \ppo{} optimizes a clipped policy-gradient surrogate to prevent excessively

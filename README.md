@@ -11,6 +11,59 @@ The main current target is a paper-faithful Rho-1B MATH run that matches the
 VinePPO Rho-1B MATH setup where possible, while running all four methods in the
 same trainer and vLLM infrastructure.
 
+## Upstream VinePPO Attribution
+
+This project is an adaptation and extension of the VinePPO experimental setup,
+not an independent reimplementation from only the paper text. We use the
+VinePPO paper and public codebase as the reference point for the Rho-1B MATH
+configuration, PPO/VinePPO hyperparameters, rollout shape, prompt template,
+evaluation protocol, and LaTeX-aware step segmentation behavior.
+
+Upstream VinePPO resources:
+
+```text
+paper: https://arxiv.org/abs/2410.01679
+code:  https://github.com/McGill-NLP/VinePPO
+```
+
+Concrete places adapted or matched from VinePPO:
+
+- `configs/caspo_rho1b_math.yaml` mirrors the Rho-1B MATH PPO/VinePPO setup,
+  including 64 prompts, group size 8, 512 responses per outer step,
+  1024-token response budget, PPO epochs, policy LR, KL coefficient, and
+  warmup shape.
+- `caspo/segmentation/latex_splitter.py` is a VinePPO-derived LaTeX-aware step
+  splitter used by both CASPO and VinePPO runs.
+- `method=vineppo` implements the VinePPO-style Monte Carlo prefix-value
+  baseline inside this repo's shared trainer/vLLM stack.
+- CASPO is the project-specific extension: it replaces VinePPO's online Monte
+  Carlo prefix rollouts with an IPVRM-style learned prefix value model while
+  keeping the comparison stack matched where possible.
+
+## Related Work
+
+This repo is built around a direct comparison among several math-RL credit
+assignment approaches:
+
+- PPO: the clipped policy-gradient objective used as the shared policy update
+  backbone. Paper: `https://arxiv.org/abs/1707.06347`.
+- VinePPO: the main upstream experimental reference. VinePPO estimates
+  intermediate reasoning values with Monte Carlo continuations from prefixes.
+  This repo adapts its Rho-1B MATH setup and keeps a VinePPO baseline for direct
+  comparison. Paper: `https://arxiv.org/abs/2410.01679`; code:
+  `https://github.com/McGill-NLP/VinePPO`.
+- IPVRM: the learned prefix-value model used for CASPO's reward/value signal.
+  CASPO replaces VinePPO's online MC prefix values with IPVRM-style learned
+  prefix values and optional online value updates. Paper:
+  `https://arxiv.org/abs/2604.13197`.
+- DeepSeekMath/GRPO: the grouped relative policy optimization baseline. In this
+  repo, GRPO uses grouped terminal rewards over `G=8` responses per prompt and
+  the same clipped PPO loss implementation as the other methods. Paper:
+  `https://arxiv.org/abs/2402.03300`.
+- vLLM: the rollout/eval generation engine used for high-throughput sampling
+  and CUDA-IPC trainer-to-vLLM weight sync on Rho-scale runs. Paper:
+  `https://arxiv.org/abs/2309.06180`.
+
 ## Current Project State
 
 This repo is a working research codebase, not a packaged library. The current
