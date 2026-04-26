@@ -274,15 +274,99 @@ The online value learning rate is set to $10^{-6}$, an order of magnitude
 below the offline rate to control drift.
 
 \subsection{Advantage-transform ablation}
-Equation~\eqref{eq:adv} computes the TD difference on the raw cumulative
-log-ratio $V_\phi$. Two ablations are included:
-\begin{align}
-\text{prob:}     \quad &
-A(s_t) = r_t + \gamma\, \sigma(V_\phi(s_{t+1})) - \sigma(V_\phi(s_t)), \\
-\text{logprob:}  \quad &
-A(s_t) = r_t + \gamma\, \log \sigma(V_\phi(s_{t+1})) - \log \sigma(V_\phi(s_t)).
-\end{align}
-The terminal verifier reward enters identically in all three variants.
+\label{sec:transforms}
+
+A subtle modeling choice in \caspo{} is \emph{which} statistic of $V_\phi$
+should enter the step-TD difference. The three natural choices arise from
+how the IPVRM loss \eqref{eq:ipvrmloss} parameterizes correctness. Recall
+that the BCE margin loss treats $V_\phi$ as a Bradley--Terry score: the
+implied per-prefix correctness probability is
+\begin{equation}
+\label{eq:ptilde}
+\widetilde{p}(s_t) \;\triangleq\; \sigma(V_\phi(s_t)) \;\approx\; \mathbb{P}\!\left[R(x,y)=1 \mid s_t\right],
+\end{equation}
+where $\sigma$ is the logistic function. Equation~\eqref{eq:ptilde} is the
+natural way to convert an unbounded cumulative-log-ratio score into a
+calibrated probability, and it is the quantity the BCE objective directly
+optimizes.
+
+Given this, the step-TD advantage in \eqref{eq:adv} can be computed on three
+different scales:
+
+\begin{description}
+\item[\emph{value}] (raw cumulative log-ratio):
+\begin{equation}
+\label{eq:advV}
+A^{V}(s_t) \;=\; r_t \,+\, \gamma\, V_\phi(s_{t+1}) \,-\, V_\phi(s_t).
+\end{equation}
+\item[\emph{prob}] (Bradley--Terry probability):
+\begin{equation}
+\label{eq:advP}
+A^{P}(s_t) \;=\; r_t \,+\, \gamma\, \widetilde{p}(s_{t+1}) \,-\, \widetilde{p}(s_t)
+            \;=\; r_t \,+\, \gamma\, \sigma(V_\phi(s_{t+1})) \,-\, \sigma(V_\phi(s_t)).
+\end{equation}
+\item[\emph{logprob}] (log Bradley--Terry probability):
+\begin{equation}
+\label{eq:advLP}
+A^{LP}(s_t) \;=\; r_t \,+\, \gamma\, \log \widetilde{p}(s_{t+1}) \,-\, \log \widetilde{p}(s_t).
+\end{equation}
+\end{description}
+
+In all three variants, the terminal verifier reward $r_T = R(x,y)$ enters
+identically; the only difference is the function applied to $V_\phi$ before
+the TD difference.
+
+\paragraph{Intuition.}
+The three transforms have different scales and different bias--variance
+profiles:
+
+\begin{itemize}
+\item \emph{value}: The TD operates on the unbounded log-ratio scale. A
+single token whose log-ratio swings by, say, $-10$ produces an unbounded
+$\Delta V_\phi$, which carries a strong gradient signal but also amplifies
+miscalibrated regions of the prefix value model (e.g.\ tokens far from the
+ref-policy distribution). High signal-to-noise where $V_\phi$ is
+well-calibrated, but heavier tails when it is not. Standardization +
+clipping (Section~\ref{sec:method}, advantage clip $\pm 3$) bounds the
+magnitude empirically, but does not reshape the underlying scale.
+
+\item \emph{prob}: The TD operates on the probability scale, so
+$|A^P(s_t)| \leq 1$ before standardization. By
+\eqref{eq:ptilde}, $\widetilde{p}(s_t) \approx \mathbb{E}[R \mid s_t]$, so
+$A^P$ is the empirical advantage that an idealized binary-reward critic
+would compute: it is the change in the expected terminal reward attributed
+to step $t$. This is the variant most directly compatible with the binary
+verifier we use, but it suffers \emph{near saturation}: when $V_\phi(s_t)$
+is large positive or negative, $\sigma'(V_\phi)$ collapses toward zero, so
+two prefixes with very different log-ratios get essentially the same
+gradient. In practice this means \emph{prob} undersignals on prefixes the
+value model is highly confident about.
+
+\item \emph{logprob}: The TD operates on the log-probability scale, mirroring
+the form of token log-likelihoods used in the PPO ratio
+$\rho_t(\theta)$. For a sequence model trained by maximum likelihood,
+log-probability differences are the canonical update signal; using
+$\log \widetilde{p}$ keeps the value-derived advantage on the same
+information-theoretic scale as the underlying token logits. Numerically,
+$\log \sigma(V) = -\log(1 + e^{-V})$, which behaves linearly for $V \ll 0$
+(matching the value scale on the negative tail) and saturates softly to
+zero for $V \gg 0$ (compressing the high-confidence positive tail). This is
+a smooth interpolation between \emph{value} (linear in the negative regime)
+and \emph{prob} (bounded above).
+\end{itemize}
+
+\paragraph{When each variant should help.}
+If $V_\phi$ is well-calibrated as a Bradley--Terry score, \emph{prob} is the
+mathematically natural choice and admits a clean expected-reward
+interpretation. If $V_\phi$ is well-trained but operates over a wide
+log-ratio range that the BCE objective does not directly bound, \emph{value}
+preserves more of the underlying signal but pays in variance. \emph{logprob}
+is a middle ground: it preserves linear sensitivity in the negative tail
+(where most gradient signal lives early in training) while compressing the
+positive tail (where over-confident prefixes would otherwise dominate the
+batch). Section~\ref{sec:results} reports the three variants on MATH-500
+pass@$16$ to determine which scale matches the empirical
+calibration of $V_\phi$ best for our setup.
 
 \subsection{Step advantage normalization and clipping}
 Let $\mathcal{A} = \{A(s_t)\}$ over all valid step boundaries in the outer
