@@ -133,6 +133,28 @@ def main() -> None:
     # as a backstop, but best-effort shutdown here avoids needing it.
     try:
         trainer.train()
+    except BaseException as _e:
+        # Surface the traceback so silent rank-skew exits (one rank exits
+        # cleanly while others hang waiting on a collective) are diagnosable.
+        # Without this, the bare try/finally swallows the exception detail
+        # because finally() runs destroy_process_group, which reraises a
+        # different error or returns cleanly. Print the full traceback
+        # synchronously to stderr so each rank's log captures *its own*
+        # failure cause.
+        import traceback as _tb
+
+        try:
+            _rank = int(os.environ.get("RANK", "0"))
+        except (TypeError, ValueError):
+            _rank = 0
+        print(
+            f"[train_caspo rank={_rank}] EXCEPTION in trainer.train(): "
+            f"{type(_e).__name__}: {_e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _tb.print_exc()
+        raise
     finally:
         try:
             import torch.distributed as dist

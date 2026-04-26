@@ -72,16 +72,31 @@ def _dataset_cache_hash(
     dataset_name: str,
     max_prompt_len: int,
     prompt_template: Optional[str],
+    dataset_split: str = "",
+    system_prompt: Optional[str] = None,
 ) -> str:
-    """Hash the four key inputs into a stable filename component.
+    """Hash the cache-key inputs into a stable filename component.
 
-    ``|``-separated to prevent substring boundary collisions; the prompt
-    template gets folded in so paper-faithful reproductions (e.g. VinePPO's
-    explicit math template) don't reuse a cache built with the tokenizer's
-    chat template.
+    ``|``-separated to prevent substring boundary collisions. We fold in
+    every cfg field that materially affects the rendered prompts or the
+    set of rows so a stale cache can't be reused under a different config:
+
+    * ``tokenizer_name`` — the chat-template path is tokenizer-specific.
+    * ``dataset_name`` / ``dataset_split`` — different rows entirely.
+    * ``max_prompt_len`` — different post-filter row set.
+    * ``prompt_template`` — paper-faithful reproductions (e.g. VinePPO's
+      explicit math template) must not reuse a cache built with the
+      tokenizer's chat template.
+    * ``system_prompt`` — prepended on the no-template path AND threaded
+      into ``apply_chat_template`` as a system message, so changing it
+      changes every rendered prompt verbatim.
     """
     template = prompt_template if prompt_template is not None else ""
-    key = f"{tokenizer_name}|{dataset_name}|{int(max_prompt_len)}|{template}"
+    sysp = system_prompt if system_prompt is not None else ""
+    key = (
+        f"{tokenizer_name}|{dataset_name}|{dataset_split}|"
+        f"{int(max_prompt_len)}|{template}|{sysp}"
+    )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:_HASH_LEN]
 
 
@@ -158,12 +173,19 @@ def load_train_dataset(cfg: Any, tokenizer: Any = None) -> Iterable[dict]:
 
     tokenizer_key = _resolve_tokenizer_key(cfg, tokenizer)
     dataset_name = getattr(cfg, "dataset_name", "<unknown>")
+    dataset_split = str(getattr(cfg, "dataset_split", "") or "")
     max_prompt_len = int(getattr(cfg, "max_prompt_len", 0) or 0)
     prompt_template = getattr(cfg, "prompt_template", None)
+    system_prompt = getattr(cfg, "system_prompt", None)
 
     cache_dir = _resolve_cache_dir()
     cache_hash = _dataset_cache_hash(
-        tokenizer_key, dataset_name, max_prompt_len, prompt_template
+        tokenizer_key,
+        dataset_name,
+        max_prompt_len,
+        prompt_template,
+        dataset_split=dataset_split,
+        system_prompt=system_prompt,
     )
     cache_path = cache_dir / f"{cache_hash}.pt"
 

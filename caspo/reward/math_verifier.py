@@ -447,9 +447,9 @@ class MathRewardFn:
     def _cache_gt(self, gt: str) -> Tuple[str, str]:
         cached = self._gt_cache.get(gt)
         if cached is not None:
-            # OrderedDict.move_to_end keeps recently-used entries away from
-            # the FIFO eviction tail.
-            self._gt_cache.move_to_end(gt)
+            # True FIFO: insertion order is preserved on hits — we do NOT
+            # move_to_end here. Touching an entry on access would convert
+            # this into LRU and silently break the documented eviction policy.
             return cached
         gt_bare = _strip_to_bare(gt) if gt is not None else ""
         cached = (gt_bare, _normalize(gt_bare))

@@ -99,10 +99,19 @@ class HFRolloutSampler:
         # Cache a GenerationConfig so HF doesn't re-validate sampling kwargs on every
         # call. max_new_tokens is set per-call (depends on prompt length) so we
         # leave it off here and pass it on the generate() call.
+        #
+        # Greedy decoding (do_sample=False) does NOT support
+        # num_return_sequences > 1 — HF's GenerationConfig.validate() raises.
+        # When the user asks for greedy (temperature == 0) with group_size > 1
+        # we generate one sequence per prompt and tile the prompts G times
+        # before calling generate() (see sample()). This produces G identical
+        # rollouts per prompt, which is the only sensible interpretation of
+        # "greedy with G samples".
+        self._gen_num_return_sequences = 1 if not self._do_sample else int(cfg.group_size)
         if _HFGenerationConfig is not None:
             base_kwargs = dict(
                 do_sample=self._do_sample,
-                num_return_sequences=int(cfg.group_size),
+                num_return_sequences=self._gen_num_return_sequences,
                 pad_token_id=self.pad_token_id,
                 eos_token_id=self.eos_token_id,
                 return_dict_in_generate=True,
@@ -201,10 +210,28 @@ class HFRolloutSampler:
             prompt_mask = enc["attention_mask"].to(device, non_blocking=True)
             P_max = prompt_ids.shape[1]
 
+            # Greedy decoding (temperature == 0) does not support
+            # num_return_sequences > 1 in HF. To still emit G rollouts per
+            # prompt under greedy, we repeat each prompt G times along the
+            # batch dim and call generate with num_return_sequences=1. The
+            # resulting layout is identical to HF's [p0_g0,..p0_g(G-1),p1_g0,..]
+            # contract that downstream code (prompt_index, ground_truth tiling)
+            # depends on.
+            if not self._do_sample and G > 1:
+                gen_input_ids = prompt_ids.repeat_interleave(G, dim=0)
+                gen_attn_mask = prompt_mask.repeat_interleave(G, dim=0)
+            else:
+                gen_input_ids = prompt_ids
+                gen_attn_mask = prompt_mask
+
             # Cap max_new_tokens by the model's positional limit so we don't
             # exceed `max_position_embeddings` (== KV cache size). HF will
             # otherwise crash with an index error inside the rotary/positional
-            # embedding when prompt_len + new_tokens overflows.
+            # embedding when prompt_len + new_tokens overflows. If the prompt
+            # already meets-or-exceeds mpe we have to produce zero new tokens —
+            # but generate() refuses max_new_tokens=0, so clamp to 1 and accept
+            # the (extremely unlikely) one-position overflow rather than the
+            # alternative of producing no rollout at all.
             max_new_tokens = int(cfg.max_response_len)
             mpe = getattr(self.model.config, "max_position_embeddings", None)
             if isinstance(mpe, int) and mpe > 0:
@@ -217,17 +244,17 @@ class HFRolloutSampler:
             # whole sampling-kwargs schema on every rollout step.
             if self._generation_config is not None:
                 gen_out = self.model.generate(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
+                    input_ids=gen_input_ids,
+                    attention_mask=gen_attn_mask,
                     generation_config=self._generation_config,
                     max_new_tokens=max_new_tokens,
                 )
             else:  # pragma: no cover - fallback for stripped-down envs
                 gen_kwargs = dict(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
+                    input_ids=gen_input_ids,
+                    attention_mask=gen_attn_mask,
                     do_sample=self._do_sample,
-                    num_return_sequences=G,
+                    num_return_sequences=self._gen_num_return_sequences,
                     max_new_tokens=max_new_tokens,
                     pad_token_id=self.pad_token_id,
                     eos_token_id=self.eos_token_id,

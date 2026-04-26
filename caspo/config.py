@@ -544,6 +544,97 @@ class CASPOConfig:
             raise ValueError(
                 f"gt_cache_max_size must be >= 1, got {self.gt_cache_max_size}"
             )
+        # ---- additional sanity checks for fields with silent failure modes ----
+        if self.prompts_per_step < 1:
+            raise ValueError(
+                f"prompts_per_step must be >= 1, got {self.prompts_per_step}"
+            )
+        if self.max_steps < 1:
+            raise ValueError(
+                f"max_steps must be >= 1, got {self.max_steps}"
+            )
+        if self.value_micro_batch_size < 1:
+            raise ValueError(
+                f"value_micro_batch_size must be >= 1, "
+                f"got {self.value_micro_batch_size}"
+            )
+        if self.value_grad_accum_steps < 1:
+            raise ValueError(
+                f"value_grad_accum_steps must be >= 1, "
+                f"got {self.value_grad_accum_steps}"
+            )
+        if self.value_warmup_steps < 0:
+            raise ValueError(
+                f"value_warmup_steps must be >= 0, got {self.value_warmup_steps}"
+            )
+        if self.warmup_steps < 0:
+            raise ValueError(
+                f"warmup_steps must be >= 0, got {self.warmup_steps}"
+            )
+        # vLLM GPU memory utilization is a fraction in (0, 1); 0 deadlocks the
+        # KV allocator and >1 segfaults the engine. vLLM itself rejects these
+        # but the error there is opaque.
+        if not (0.0 < self.vllm_gpu_memory_utilization <= 1.0):
+            raise ValueError(
+                f"vllm_gpu_memory_utilization must be in (0, 1], "
+                f"got {self.vllm_gpu_memory_utilization}"
+            )
+        # Sampling temperature: 0 is "greedy" but vLLM/HF treat <=0 as a special
+        # path; negative temperature has no defined meaning. Reject negatives.
+        if self.rollout_temperature < 0.0:
+            raise ValueError(
+                f"rollout_temperature must be >= 0, got {self.rollout_temperature}"
+            )
+        if self.value_data_temperature < 0.0:
+            raise ValueError(
+                f"value_data_temperature must be >= 0, "
+                f"got {self.value_data_temperature}"
+            )
+        # top_p must be in (0, 1]; 0 disables sampling entirely (no candidates).
+        if not (0.0 < self.rollout_top_p <= 1.0):
+            raise ValueError(
+                f"rollout_top_p must be in (0, 1], got {self.rollout_top_p}"
+            )
+        # Learning rates: negative values flip the optimizer direction silently.
+        if self.lr < 0.0:
+            raise ValueError(f"lr must be >= 0, got {self.lr}")
+        if self.value_lr < 0.0:
+            raise ValueError(f"value_lr must be >= 0, got {self.value_lr}")
+        if self.online_value_lr < 0.0:
+            raise ValueError(
+                f"online_value_lr must be >= 0, got {self.online_value_lr}"
+            )
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                f"weight_decay must be >= 0, got {self.weight_decay}"
+            )
+        if self.value_weight_decay < 0.0:
+            raise ValueError(
+                f"value_weight_decay must be >= 0, "
+                f"got {self.value_weight_decay}"
+            )
+        # IPVRM β rescales log-ratios into the BCE; 0 collapses V to 0
+        # everywhere, negative β sign-inverts the value head.
+        if self.value_beta <= 0.0:
+            raise ValueError(
+                f"value_beta must be > 0, got {self.value_beta}"
+            )
+        # value_margin is the BCE dead-zone; negative margins invert the loss.
+        if self.value_margin < 0.0:
+            raise ValueError(
+                f"value_margin must be >= 0, got {self.value_margin}"
+            )
+        # Grad-clip <= 0 silently disables gradient clipping in most code
+        # paths. Permit 0 (disabled) but reject negative.
+        if self.grad_clip < 0.0:
+            raise ValueError(
+                f"grad_clip must be >= 0 (0 disables), got {self.grad_clip}"
+            )
+        if self.value_grad_clip < 0.0:
+            raise ValueError(
+                f"value_grad_clip must be >= 0 (0 disables), "
+                f"got {self.value_grad_clip}"
+            )
         if self.vllm_max_num_seqs is not None and self.vllm_max_num_seqs < 1:
             raise ValueError(
                 f"vllm_max_num_seqs must be >= 1 when set, got {self.vllm_max_num_seqs}"

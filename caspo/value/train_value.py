@@ -256,6 +256,7 @@ def _wrap_phi_fsdp(
         BackwardPrefetch,
         CPUOffload,
         FullyShardedDataParallel as FSDP,
+        MixedPrecision,
         ShardingStrategy,
     )
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -264,6 +265,7 @@ def _wrap_phi_fsdp(
         "full_shard": ShardingStrategy.FULL_SHARD,
         "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
         "no_shard": ShardingStrategy.NO_SHARD,
+        "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
     }
     backward_prefetch_map = {
         "backward_pre": BackwardPrefetch.BACKWARD_PRE,
@@ -283,6 +285,47 @@ def _wrap_phi_fsdp(
     backward_prefetch = backward_prefetch_map[cfg.fsdp_backward_prefetch]
     if backward_prefetch is not None:
         kwargs["backward_prefetch"] = backward_prefetch
+
+    # ---- MixedPrecision policy ----
+    # Default FSDP keeps reduce_dtype=fp32 even under bf16 params, doubling
+    # the wire bytes of grad reduce-scatter on every backward — typically
+    # the dominant comm cost at 7B/H100 FSDP. Mirror caspo_trainer's policy
+    # so param/reduce/buffer dtype all match the chosen training dtype (or
+    # the user's fsdp_reduce_dtype override).
+    from caspo.value.prefix_value import _resolve_dtype as _resolve_value_dtype
+    compute_dtype = _resolve_value_dtype(cfg.torch_dtype)
+    reduce_name = cfg.fsdp_reduce_dtype or cfg.torch_dtype
+    reduce_dtype = _resolve_value_dtype(reduce_name)
+    if compute_dtype != torch.float32:
+        kwargs["mixed_precision"] = MixedPrecision(
+            param_dtype=compute_dtype,
+            reduce_dtype=reduce_dtype,
+            buffer_dtype=compute_dtype,
+        )
+
+    # ---- HYBRID_SHARD device mesh ----
+    # HSDP shards within a small intra-node group and replicates across
+    # nodes/groups. Falls back to plain FSDP semantics if the world is too
+    # small or odd (mirrors caspo_trainer's runtime guard).
+    if cfg.fsdp_sharding_strategy == "hybrid_shard":
+        if world_size >= 4 and world_size % 2 == 0:
+            try:
+                from torch.distributed.device_mesh import init_device_mesh
+            except ImportError:  # pragma: no cover
+                from torch.distributed._tensor import (  # type: ignore
+                    init_device_mesh,
+                )
+            device_mesh = init_device_mesh(
+                "cuda" if torch.cuda.is_available() else "cpu",
+                (world_size // 2, 2),
+            )
+            kwargs["device_mesh"] = device_mesh
+        else:
+            warnings.warn(
+                f"fsdp_sharding_strategy='hybrid_shard' but "
+                f"world_size={world_size} is < 4 or not divisible by 2; "
+                f"PyTorch will pick a default replicate-group layout."
+            )
 
     if cfg.fsdp_auto_wrap:
         layer_classes = _infer_fsdp_layer_classes(phi)
