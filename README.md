@@ -190,7 +190,8 @@ Main config: `configs/caspo_rho1b_math.yaml`
 | Rollout group | `group_size=8` |
 | Prompts per step | `64` |
 | Responses per PPO outer step | `64 x 8 = 512` |
-| PPO minibatch | `micro_batch_size=1`, `grad_accum_steps=64` |
+| PPO minibatch (YAML default) | `micro_batch_size=1`, `grad_accum_steps=64` |
+| PPO minibatch (launcher override, recommended) | `micro_batch_size=8`, `grad_accum_steps=8`, `use_gradient_checkpointing=false` |
 | PPO epochs per rollout | `2` |
 | Policy LR | `1e-6` |
 | Warmup | `480` optimizer updates |
@@ -402,9 +403,16 @@ For Rho-1B single-GPU-per-method runs, vLLM weight sync uses CUDA IPC:
 ```yaml
 rollout_backend: vllm
 vllm_weight_sync_backend: ipc
-vllm_gpu_memory_utilization: 0.45
+vllm_gpu_memory_utilization: 0.30   # set by _launch_rho1b_one_gpu.sh; YAML still says 0.45
 vllm_enforce_eager: false
 ```
+
+The launcher's `vllm_gpu_memory_utilization=0.30` default came out of an
+April 2026 Pareto sweep on Rho-1B; vLLM rollout already runs in ~4 s out of a
+50 s step, so KV-cache budget above ~0.30 buys nothing for step time but eats
+trainer headroom. At `u=0.30` the trainer keeps ~3-4 GB margin even for CASPO
+(peak ~77 GB at `mb=8, accum=8, ckpt=false`). Override with
+`CASPO_VLLM_GPU_MEMORY_UTILIZATION=...` if a method needs different headroom.
 
 The trainer also primes vLLM's AsyncLLM frontend loop before generation. This
 avoids a vLLM V1 embedded-engine stall where metadata requests wait for
@@ -711,8 +719,10 @@ The eval launcher supports:
 
 ## Latest Paper-Faithful Speed Probe
 
-Hardware: one H100 80GB per method, GPUs 4-7. Config: Rho-1B MATH, 512
-responses per PPO outer step, vLLM IPC sync, `save_every=0`, `max_steps=3`.
+Hardware: one H100 80GB per method. Config: Rho-1B MATH, 512 responses per PPO
+outer step, vLLM IPC sync, `save_every=0`, `max_steps=3`.
+
+### Pre-optimization defaults (`mb=1, accum=64, ckpt=true, vllm_util=0.45`)
 
 | Method | Mean step time | Rollout | Value/MC phase | Policy phase | Notes |
 |---|---:|---:|---:|---:|---|
@@ -721,15 +731,60 @@ responses per PPO outer step, vLLM IPC sync, `save_every=0`, `max_steps=3`.
 | CASPO | ~141s | ~4s | ~55s | ~69s | IPVRM value forward + online update |
 | VinePPO K=9 | ~237s | ~4s | ~152s | ~69s | MC prefix rollouts dominate |
 
-Approximate 1000-step ETAs:
+### Post-optimization (`mb=8, accum=8, ckpt=false, vllm_util=0.30`, IPC sync)
 
-- PPO: ~25 hours.
-- GRPO: ~26 hours.
-- CASPO: ~39 hours.
-- VinePPO K=9: ~66 hours.
+April 2026 sweep across 18 (mb, accum, ckpt, util) configurations. The
+Pareto-optimal point matches `mb × accum = 64` (same global PPO minibatch as
+the paper) but redistributes to `mb=8 × accum=8` and disables gradient
+checkpointing (zero measurable cost on Rho-1B because activation recompute is
+already free). vLLM utilization drops to 0.30 because rollout is not the
+bottleneck at this batch shape.
 
-If all four methods run in parallel on GPUs 4-7, wall-clock is gated by
-VinePPO: roughly 66-72 hours plus checkpoint/eval overhead.
+| Method | Mean step time | Speedup | Peak GPU mem | Notes |
+|---|---:|---:|---:|---|
+| PPO | ~50s | 1.80x | ~74 GB | 10-step long smoke, mem flat |
+| GRPO | ~48s | 1.92x | ~76 GB | 10-step long smoke, mem flat |
+| CASPO (online RM) | ~75s | 1.88x | ~77 GB | 10 steps at u=0.30, t_sync stable after step 5 |
+| CASPO frozen RM | ~63s | 2.24x | ~64 GB | No value Adam states, ~13 GB headroom |
+| CASPO delta-prob ablation | ~75s | n/a | ~77 GB | Same as standard CASPO |
+| CASPO delta-log-prob ablation | ~75s | n/a | ~77 GB | Same as standard CASPO |
+| VinePPO K=9 (1-GPU) | ~191s | 1.24x | ~73 GB | Gated by K=9 MC rollouts (constant-cost) |
+| VinePPO K=9 (DDP-2) | ~115s | 2.06x | ~70 GB | `mb=4, accum=8, logprob_micro=16` |
+
+Approximate 1000-step ETAs (post-optimization):
+
+- PPO: ~14 hours.
+- GRPO: ~13 hours.
+- CASPO: ~21 hours.
+- CASPO frozen RM: ~18 hours.
+- VinePPO K=9 1-GPU: ~53 hours.
+- VinePPO K=9 DDP-2: ~32 hours.
+
+If all four primary methods run in parallel on H100s, wall-clock is gated by
+CASPO at ~21 hours (single-GPU layout) or VinePPO DDP-2 at ~32 hours, both
+plus checkpoint/eval overhead.
+
+### Why these defaults
+
+- `mb=8 × accum=8 = 64` preserves the global PPO minibatch (same as paper).
+- The trajectory is mathematically identical to `mb=1, accum=64` modulo
+  ~1e-3 bf16 reduction-order noise — well below seed-level variance.
+- `gradient_checkpointing=false` has no measurable step-time cost on Rho-1B
+  but frees ~10 GB of activation memory, which lets `mb=8` fit alongside vLLM.
+- `vllm_util=0.30` leaves ~3-4 GB trainer margin even for the CASPO online-RM
+  path (which loads policy + ref + value + value Adam states all on one GPU).
+- IPC weight sync stabilizes to <0.5 s/step after a one-time spike at
+  steps 3-4 (~24 s + 9 s); total amortized overhead at 1000 steps is ~5 min.
+
+### Override / revert
+
+Each knob is overridable from the launcher CLI for safety:
+
+```bash
+MICRO_BATCH_SIZE=1 GRAD_ACCUM_STEPS=64 USE_GRADIENT_CHECKPOINTING=true \
+CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.45 \
+RUN_TAG=conservative ./scripts/launch_rho1b_caspo.sh
+```
 
 ## Latest Two-GPU VinePPO Probe
 

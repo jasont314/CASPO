@@ -48,16 +48,33 @@ mkdir -p "$LOGDIR"
 OUTDIR="$ROOT/caspo_rho1b_math_${RUN_METHOD_TAG}${RUN_SUFFIX}"
 LOG="$LOGDIR/phase2_${RUN_METHOD_TAG}.log"
 
-CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.45}}"
+CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.30}}"
 CASPO_VLLM_MULTI_SAMPLE_MODE="${CASPO_VLLM_MULTI_SAMPLE_MODE:-${VLLM_MULTI_SAMPLE_MODE:-auto}}"
 CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-256}}"
 CASPO_VLLM_MAX_NUM_BATCHED_TOKENS="${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-${VLLM_MAX_NUM_BATCHED_TOKENS:-}}"
 
-# These four names are launcher aliases, not native vLLM environment variables.
+# Trainer batching: defaults from the 1-GPU Pareto sweep (Apr 2026).
+# mb=8, accum=8 keeps the 64-response PPO minibatch (matches paper) but runs
+# ~45% faster per step than the YAML defaults (mb=1, accum=64). Combined with
+# use_gradient_checkpointing=false (no measurable cost on Rho-1B) and
+# vllm_gpu_memory_utilization=0.30 (vLLM is not the bottleneck above ~0.30,
+# and 0.30 leaves ~3-4 GB trainer headroom for CASPO's value+adam states):
+#   GRPO/PPO: ~92s -> ~51s/step
+#   CASPO (online value): ~141s -> ~75s/step (peak ~77 GB at u=0.30)
+#   caspo-frozen-rm: ~63s/step (no value backward, frees ~13 GB)
+#   VinePPO 1-GPU: ~237s -> ~191s/step (gated by K=9 MC rollouts)
+CASPO_MICRO_BATCH_SIZE="${CASPO_MICRO_BATCH_SIZE:-${MICRO_BATCH_SIZE:-8}}"
+CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-8}}"
+CASPO_USE_GRADIENT_CHECKPOINTING="${CASPO_USE_GRADIENT_CHECKPOINTING:-${USE_GRADIENT_CHECKPOINTING:-false}}"
+
+# These names are launcher aliases, not native vLLM environment variables.
 unset VLLM_GPU_MEMORY_UTILIZATION
 unset VLLM_MULTI_SAMPLE_MODE
 unset VLLM_MAX_NUM_SEQS
 unset VLLM_MAX_NUM_BATCHED_TOKENS
+unset MICRO_BATCH_SIZE
+unset GRAD_ACCUM_STEPS
+unset USE_GRADIENT_CHECKPOINTING
 
 COMMON_OVERRIDES=(
     --override "method=${METHOD}"
@@ -67,6 +84,9 @@ COMMON_OVERRIDES=(
     --override vllm_enforce_eager=false
     --override "vllm_multi_sample_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE}"
     --override "vllm_max_num_seqs=${CASPO_VLLM_MAX_NUM_SEQS}"
+    --override "micro_batch_size=${CASPO_MICRO_BATCH_SIZE}"
+    --override "grad_accum_steps=${CASPO_GRAD_ACCUM_STEPS}"
+    --override "use_gradient_checkpointing=${CASPO_USE_GRADIENT_CHECKPOINTING}"
     --override "save_every=${SAVE_EVERY:-250}"
     --override "wandb_mode=${WANDB_MODE:-online}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
@@ -82,6 +102,7 @@ fi
 
 echo "[rho1b-onegpu] ${RUN_METHOD_TAG} method=${METHOD} gpu=${SELECTED_GPU} out=${OUTDIR}"
 echo "[rho1b-onegpu] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
+echo "[rho1b-onegpu] mb=${CASPO_MICRO_BATCH_SIZE} accum=${CASPO_GRAD_ACCUM_STEPS} grad_ckpt=${CASPO_USE_GRADIENT_CHECKPOINTING}"
 echo "[rho1b-onegpu] log=${LOG}"
 
 CUDA_VISIBLE_DEVICES="$SELECTED_GPU" "$PYTHON_BIN" -u -m scripts.train_caspo \
