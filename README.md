@@ -937,10 +937,102 @@ CUDA_VISIBLE_DEVICES=4 /opt/conda/envs/scalable/bin/python \
   --output-dir /tmp/caspo_vllm_ipc_probe
 ```
 
-## 7B Notes
+## 7B Infrastructure (Apr 2026)
 
-The 7B configs remain available, but they are not the current four-method
-single-node production target. Full-model 7B training should use FSDP; current
-7B vLLM weight sync remains checkpoint-based until NCCL/in-memory sync is added
-for the exact vLLM runtime. Do not assume the Rho-1B one-GPU-per-method plan
-transfers to 7B.
+Full FSDP + vLLM-IPC weight-sync stack for DeepSeekMath-7B-MATH. Validated
+end-to-end on all 5 methods. Per-rank manual bash launch (matches the
+rho-1B DDP-2 pattern); torchrun's `--standalone` rdzv conflicts with
+vLLM's EngineCore distributed init.
+
+### Layout
+
+| Method | World size | Default util | Steady step time |
+|---|---:|---:|---:|
+| PPO | 4 (FSDP) | 0.30 | ~30 s |
+| GRPO | 4 (FSDP) | 0.30 | ~30 s |
+| CASPO frozen-RM | 4 (FSDP) | 0.30 | ~35 s |
+| CASPO online | 4 (FSDP) | **0.20** | ~45 s |
+| VinePPO K=9 | 8 (FSDP) | 0.30 | ~570 s |
+
+CASPO online needs the lower vLLM util because it carries a full
+trainable phi (params + Adam fp32 m+v ≈ 70 GB / 4 ranks = ~17 GB
+sharded) on top of the policy. PPO/GRPO/frozen-RM stay at u=0.30.
+
+VinePPO 8-GPU is dominated by `t_value` (~315 s) — K=9 MC continuations
+at 7B is the heaviest workload in the stack.
+
+### Pareto sweep (4-GPU FSDP, GRPO smoke)
+
+| Config | Step time | Notes |
+|---|---:|---|
+| mb=1, accum=16, ckpt=true, util=0.30 | ~40 s | Old default |
+| **mb=2, accum=8, ckpt=true, util=0.30** | **~30 s** | Winning default |
+| mb=4, accum=4, ckpt=true, util=0.30 | hangs | Silent OOM on rank 0 |
+| mb=4, accum=4, ckpt=true, util=0.30 + fsdp_cpu_offload=true | ~76 s | CPU↔GPU dominates |
+
+mb=2 is 25-27% faster than mb=1 with no memory or stability issues.
+Global PPO minibatch stays 64 (FSDP=4 × mb=2 × accum=8).
+
+### Critical fixes for FSDP + vLLM colocation
+
+1. `VLLM_WORKER_MULTIPROC_METHOD=spawn` (perf_env.sh): vLLM's default
+   `fork` makes EngineCore inherit the trainer's torch.distributed
+   state, causing the child's TP=1 init to collide and hang on
+   TCPStore client validation.
+2. `VLLM_HOST_IP=127.0.0.1` (set per-rank in `caspo/rollout/vllm_engine.py`):
+   vLLM's get_ip() falls back to the cluster-external interface IP;
+   force loopback so each rank's EngineCore can bind a private TCPStore.
+3. Manual per-rank bash spawn (no `torch.distributed.run --standalone`):
+   torchrun's rdzv backend can't be cleanly inherited by vLLM's
+   EngineCore subprocess.
+4. FSDP→vLLM IPC sync (`caspo/trainer/caspo_trainer.py:_sync_vllm_weights_fsdp`):
+   `summon_full_params(writeback=False)` collectively, then push
+   directly through `sampler.sync_weights_from_model` while the
+   context is alive; strip `_fsdp_wrapped_module.` prefix from the
+   FSDP-injected parameter names so vLLM's HF loader matches them.
+
+### Launchers
+
+```bash
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_grpo.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_ppo.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_frozen_rm.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo.sh
+GPU_LIST="0 1 2 3 4 5 6 7" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_vineppo.sh
+```
+
+Env knobs: `CASPO_VLLM_GPU_MEMORY_UTILIZATION`, `CASPO_MICRO_BATCH_SIZE`,
+`CASPO_GRAD_ACCUM_STEPS`, `CASPO_USE_GRADIENT_CHECKPOINTING`,
+`CASPO_FSDP_CPU_OFFLOAD`, `CASPO_REWARD_WORKERS`, `MAX_STEPS`,
+`SAVE_EVERY`, `WANDB_MODE`. Defaults computed from `world_size` so
+the global PPO minibatch stays 64 across configurations.
+
+### Phase-1 IPVRM value model (CASPO prerequisite)
+
+Two scripts:
+
+```bash
+# (a) Single-GPU vLLM rollout collection (~25 min on 1 H100 for 4000 prompts)
+./mnt/nvme_tmp/jason_caspo/smoke/run_collect_7b.sh
+
+# (b) FSDP value-model training (4 GPUs)
+GPU_LIST="0 1 2 3" RUN_TAG=value_v1 \
+VALUE_DATA_PATH=/mnt/nvme_tmp/jason_caspo/deepseekmath7b_math/value_data.pt \
+./scripts/_launch_7b_value_train.sh
+```
+
+Phase-1 collection produced ~17.5K mixed-outcome rollouts from 4000 MATH
+prompts (54.5% mixed-outcome rate at G=8, temp=1.0 on DeepSeekMath-7B-SFT).
+
+Known follow-ups: scripts/train_value.py runs validation eval on rank 0
+only, which deadlocks under FSDP (the all-gather requires every rank).
+Default `VALUE_EVAL_EVERY=0` in the launcher disables periodic val and
+early stopping; the trainer just runs to `value_max_epochs`. Re-enable
+once val eval is rewritten as a collective forward.
+
+### Throughput-per-GPU note
+
+For maximum throughput per GPU-hour on a single 7B run, 4 GPUs is the
+sweet spot (vs 1/2/8). On an 8-GPU host, run 2 methods in parallel
+(GPUs 0-3 + 4-7) — the suite finishes ~37% faster end-to-end than
+serial 8-GPU runs and uses ~25% fewer GPU-hours.
