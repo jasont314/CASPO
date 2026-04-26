@@ -92,8 +92,8 @@ lr: 2.0e-6                        # was 1e-6. Conservative 2x bump (vs 3x for rh
 weight_decay: 0.0
 warmup_steps: 60
 grad_clip: 1.0
-micro_batch_size: 1
-grad_accum_steps: 16              # FSDP=4: 4 ranks × 1 mb × 16 accum = 64-episode global minibatch
+micro_batch_size: 2               # Apr 2026: mb=2 cuts step time 41s → 30s vs mb=1 (~27% faster)
+grad_accum_steps: 8               # FSDP=4: 4 ranks × 2 mb × 8 accum = 64-episode global minibatch
 epochs_per_rollout: 2
 max_steps: 1500                   # was 1000. Modest extension; 7B trains slowly per wall-clock.
 seed: 0
