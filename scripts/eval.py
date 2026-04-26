@@ -134,6 +134,7 @@ def main() -> None:
         # same path — building one engine, using it once, shutting it down.
         shared_engine = None
         shared_loop = None
+        tok_path = cfg.tokenizer_name_or_path or cfg.model_name_or_path
         if len(benchmark_names) >= 2:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
@@ -142,7 +143,7 @@ def main() -> None:
                   f"{len(benchmark_names)} benchmarks...", flush=True)
             engine_kwargs = dict(
                 model=cfg.model_name_or_path,
-                tokenizer=cfg.model_name_or_path,
+                tokenizer=tok_path,
                 tokenizer_mode="auto",
                 trust_remote_code=cfg.trust_remote_code,
                 dtype=cfg.torch_dtype,
@@ -150,7 +151,7 @@ def main() -> None:
                 gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
                 enable_prefix_caching=True,
                 enforce_eager=cfg.vllm_enforce_eager,
-                max_model_len=int(max_new_tokens) + 1024,
+                max_model_len=int(max_new_tokens) + int(cfg.max_prompt_len),
                 seed=cfg.seed,
                 disable_log_stats=True,
             )
@@ -180,6 +181,8 @@ def main() -> None:
                     prompt_template=cfg.prompt_template,
                     trust_remote_code=cfg.trust_remote_code,
                     torch_dtype=cfg.torch_dtype,
+                    tokenizer_name_or_path=tok_path,
+                    max_prompt_len=cfg.max_prompt_len,
                     max_num_seqs=cfg.vllm_max_num_seqs,
                     max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
                     engine=shared_engine,

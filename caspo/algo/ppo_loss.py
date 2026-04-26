@@ -152,7 +152,13 @@ def ppo_clipped_loss(
             "kl_coef != 0 but ref_logprobs is None; KL term cannot be computed"
         )
 
-    fmask = response_mask.to(logprobs.dtype)
+    mask_bool = response_mask.to(torch.bool)
+    fmask = mask_bool.to(logprobs.dtype)
+    zeros = torch.zeros((), device=logprobs.device, dtype=logprobs.dtype)
+    # Important: ``nan * 0 == nan``. Use where-based masking before any
+    # arithmetic that touches padded positions.
+    log_ratio_raw = torch.where(mask_bool, logprobs - old_logprobs, zeros)
+    advantage_safe = torch.where(mask_bool, advantage, zeros)
 
     # Clamp the log-ratio before exp to avoid fp overflow under heavy
     # policy drift. ratio itself is unclipped within the clip band; the
@@ -169,14 +175,14 @@ def ppo_clipped_loss(
     # intermediate ``logprobs - old_logprobs`` and unmasked log_ratio are
     # not held as separate live tensors past the clamp.
     log_ratio_safe = torch.clamp(
-        (logprobs - old_logprobs) * fmask,
+        log_ratio_raw,
         min=-_LOG_RATIO_CLAMP,
         max=_LOG_RATIO_CLAMP,
     )
     ratio = torch.exp(log_ratio_safe)
-    unclipped = ratio * advantage
+    unclipped = ratio * advantage_safe
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high)
-    clipped = clipped_ratio * advantage
+    clipped = clipped_ratio * advantage_safe
     # Pre-mask per-token loss inline with the minimum so we don't allocate
     # a separate ``per_token_loss`` tensor only to multiply it by fmask.
     per_token_loss = -torch.minimum(unclipped, clipped)
@@ -206,13 +212,13 @@ def ppo_clipped_loss(
         # masking both inputs) — algebraically equivalent for binary
         # masks and saves one mul + one tensor allocation.
         if kl_estimator == "k3":
-            diff = (ref_logprobs - logprobs) * fmask
+            diff = torch.where(mask_bool, ref_logprobs - logprobs, zeros)
             diff_safe = torch.clamp(
                 diff, min=-_LOG_RATIO_CLAMP, max=_LOG_RATIO_CLAMP
             )
             kl = (torch.exp(diff_safe) - diff_safe - 1.0).clamp_min(0.0)
         elif kl_estimator == "k1":
-            kl = (logprobs - ref_logprobs) * fmask
+            kl = torch.where(mask_bool, logprobs - ref_logprobs, zeros)
         else:
             raise ValueError(
                 f"unknown kl_estimator {kl_estimator!r}; must be 'k1' or 'k3'"
@@ -230,8 +236,8 @@ def ppo_clipped_loss(
         # Removing the host-side ``mask_bool.any()`` short-circuit avoids
         # a GPU→CPU round-trip on every step.
         mean_ratio = (ratio * fmask).sum() / denom
-        mean_adv = (advantage * fmask).sum() / denom
-        mean_logp = (logprobs * fmask).sum() / denom
+        mean_adv = (advantage_safe * fmask).sum() / denom
+        mean_logp = torch.where(mask_bool, logprobs, zeros).sum() / denom
         # A token is "actively clipped" iff (a) it lies outside the
         # clip band AND (b) the ``min`` selected the clipped surrogate
         # (i.e. clip is binding for this advantage sign). Comparing

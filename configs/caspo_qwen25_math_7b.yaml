@@ -61,12 +61,11 @@ value_grad_clip: 1.0
 value_data_path: /mnt/nvme_tmp/jason_caspo/qwen25_math_7b_deepscaler/value_data.pt
 
 # Phase 2 — value usage. Online IPVRM (Eq. 15 with ADB+DLW) ON — this is the
-# actual CASPO contribution and is what should run in the paper-faithful 7B
-# headline. Set update_value_during_policy=false to fall back to a frozen V_φ
-# if memory-bound.
+# actual CASPO contribution. IPVRM reports 1e-4 for LoRA; this config updates
+# the full trainable value model, so 1e-6 is the safer starting point.
 prefix_value_path: /mnt/nvme_tmp/jason_caspo/qwen25_math_7b_deepscaler/value_final
 update_value_during_policy: true
-online_value_lr: 1.0e-4
+online_value_lr: 1.0e-6
 use_adb: true
 use_dlw: true
 adb_dlw_eps: 0.05

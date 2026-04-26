@@ -47,3 +47,8 @@ def test_fsdp_vllm_rank_local_config_is_valid():
 
     assert cfg.distributed_backend == "fsdp"
     assert cfg.rollout_backend == "vllm"
+
+
+def test_vineppo_requires_vllm_rollout_backend():
+    with pytest.raises(ValueError, match="rollout_backend='vllm'"):
+        CASPOConfig(method="vineppo", rollout_backend="hf")

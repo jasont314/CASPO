@@ -83,7 +83,7 @@ CUDA_VISIBLE_DEVICES=3 nohup "$PYTHON_BIN" -u -m scripts.train_caspo \
     --override use_adb=true \
     --override use_dlw=true \
     --override vllm_gpu_memory_utilization=0.45 \
-    --override vllm_enforce_eager=true \
+    --override vllm_enforce_eager=false \
     > "$LOGDIR/phase2_caspo.log" 2>&1 &
 CASPO_PID=$!
 echo "[chain] $(date) CASPO RL launched pid=$CASPO_PID, log=$LOGDIR/phase2_caspo.log"

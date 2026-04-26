@@ -59,6 +59,11 @@ def _validate_cfg(cfg) -> None:
         raise ValueError(
             f"cfg.method={cfg.method!r} not in {{'ppo','caspo','grpo','vineppo'}}"
         )
+    if cfg.method == "vineppo" and cfg.rollout_backend != "vllm":
+        raise ValueError(
+            "cfg.method='vineppo' requires cfg.rollout_backend='vllm' because "
+            "MC prefix value estimation needs sample_with_prefix()."
+        )
     world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
     if world_size > 1 and cfg.distributed_backend == "none":
         raise ValueError(

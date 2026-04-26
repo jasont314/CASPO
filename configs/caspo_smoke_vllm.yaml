@@ -28,7 +28,7 @@ max_steps_per_response: 16
 
 prefix_value_path: /mnt/nvme_tmp/jason_caspo/value_smoke/final
 update_value_during_policy: true
-online_value_lr: 1.0e-4
+online_value_lr: 1.0e-6
 use_adb: true
 use_dlw: true
 

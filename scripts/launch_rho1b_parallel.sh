@@ -40,7 +40,7 @@ trap 'echo "[launch] ERR at line $LINENO (rc=$?)"' ERR
 # Use 0.5 GPU memory for vLLM; trainer + V_φ + ref + optimizer takes the other half.
 COMMON_OVERRIDES=(
     --override vllm_gpu_memory_utilization=0.45
-    --override vllm_enforce_eager=true
+    --override vllm_enforce_eager=false
     --override wandb_mode=online
     --override wandb_project=caspo-rho1b-math
 )

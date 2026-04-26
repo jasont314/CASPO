@@ -375,15 +375,22 @@ def test_vineppo_method_dispatch_sample_with_prefix():
             # below, so the text doesn't matter — just the count.
             return [[_Gen(f"mc-{i}") for i in range(K)] for _ in prefix_token_ids_list]
 
+    graded_text_batches: list[list[str]] = []
+
     # Stub reward_fn: returns 1.0 for every completion → V at every boundary = 1.0.
     def _stub_reward(texts, gts):
+        graded_text_batches.append(list(texts))
         return [1.0] * len(texts)
+
+    class _StubTokenizer:
+        def decode(self, ids, skip_special_tokens=True):
+            return "|".join(str(int(t)) for t in ids)
 
     # ---- Hand-build a CASPOTrainer-like object without running __init__ ----
     cfg = CASPOConfig(
         model_name_or_path="hf-internal-testing/tiny-random-LlamaForCausalLM",
         torch_dtype="float32", attn_implementation="eager",
-        trust_remote_code=False, method="vineppo", group_size=1,
+        trust_remote_code=False, method="vineppo", rollout_backend="vllm", group_size=1,
         prompts_per_step=1, micro_batch_size=1, grad_accum_steps=1,
         device="cpu", max_steps=1, log_every=1, save_every=10, eval_every=0,
         warmup_steps=0, value_warmup_steps=0, vineppo_mc_rollouts=3,
@@ -395,6 +402,7 @@ def test_vineppo_method_dispatch_sample_with_prefix():
     fake.device = torch.device("cpu")
     fake.sampler = _StubSampler()
     fake.reward_fn = _stub_reward
+    fake.tokenizer = _StubTokenizer()
 
     V_step = CASPOTrainer._vineppo_mc_step_values(fake, rollout, seg)
 
@@ -409,6 +417,9 @@ def test_vineppo_method_dispatch_sample_with_prefix():
     # Mid-prefix requests may appear in a second max-token bucket.
     assert [100, 101, 1, 2, 3, 9] in captured_prefixes
     assert [200, 201, 8, 7, 6, 5, 9] in captured_prefixes
+    graded_flat = [text for batch in graded_text_batches for text in batch]
+    assert any(text.startswith("1|2|3|9") for text in graded_flat)
+    assert any(text.startswith("8|7|6|5|9") for text in graded_flat)
 
     # V at prompt and mid-step = mean reward = 1.0; terminal V stays 0.
     assert torch.allclose(V_step[:, 0], torch.ones(2))

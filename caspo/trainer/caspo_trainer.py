@@ -354,6 +354,7 @@ class CASPOTrainer:
                 seed=cfg.seed,
                 max_num_seqs=cfg.vllm_max_num_seqs,
                 max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+                max_inflight_requests=cfg.vllm_max_inflight_requests,
                 gpu_id=(
                     self.dist.local_rank
                     if self.dist.is_distributed
@@ -674,12 +675,29 @@ class CASPOTrainer:
             )
 
         self.value_optimizer.zero_grad(set_to_none=True)
-        n_micro = max(1, (B + mb - 1) // mb)
+        micro_ranges = [(start, min(start + mb, B)) for start in range(0, B, mb)]
+        valid_rows = (response_mask.sum(dim=1) > 0).detach().cpu()
+        pos_rows = ((outcomes >= 0.5) & (response_mask.sum(dim=1) > 0)).detach().cpu()
+        neg_rows = ((outcomes < 0.5) & (response_mask.sum(dim=1) > 0)).detach().cpu()
+        micro_row_counts = [
+            float(valid_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        micro_pos_counts = [
+            float(pos_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        micro_neg_counts = [
+            float(neg_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        total_rows = max(1.0, sum(micro_row_counts))
+        total_pos_rows = max(1.0, sum(micro_pos_counts))
+        total_neg_rows = max(1.0, sum(micro_neg_counts))
         out_chunks = []
         agg = {"value_loss": 0.0, "value_acc": 0.0,
                "v_bar_pos": 0.0, "v_bar_neg": 0.0}
-        for start in range(0, B, mb):
-            end = min(start + mb, B)
+        for micro_idx, (start, end) in enumerate(micro_ranges):
             out = self.value_model(
                 prompt_ids[start:end], prompt_mask[start:end],
                 response_ids[start:end], response_mask[start:end],
@@ -694,11 +712,19 @@ class CASPOTrainer:
                 prompt_value_baseline=V_x_slice,
                 loss_weights=w_slice,
             )
-            (v_loss / n_micro).backward()
-            agg["value_loss"] += v_stats["loss"] / n_micro
-            agg["value_acc"] += v_stats["acc_at_last"] / n_micro
-            agg["v_bar_pos"] += v_stats["mean_v_bar_pos"] / n_micro
-            agg["v_bar_neg"] += v_stats["mean_v_bar_neg"] / n_micro
+            micro_rows = micro_row_counts[micro_idx]
+            weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
+            (v_loss * weight).backward()
+            agg["value_loss"] += v_stats["loss"] * weight
+            agg["value_acc"] += v_stats["acc_at_last"] * weight
+            agg["v_bar_pos"] += (
+                v_stats["mean_v_bar_pos"]
+                * (micro_pos_counts[micro_idx] / total_pos_rows)
+            )
+            agg["v_bar_neg"] += (
+                v_stats["mean_v_bar_neg"]
+                * (micro_neg_counts[micro_idx] / total_neg_rows)
+            )
             out_chunks.append(out["log_ratio"].detach())
 
         if cfg.value_grad_clip and cfg.value_grad_clip > 0:
@@ -920,15 +946,20 @@ class CASPOTrainer:
         # Per-prefix metadata so we can reduce after generation.
         # kind == "prompt": payload is the unique prompt index p.
         # kind == "step":   payload is (row b, step boundary index t_next).
-        prefix_meta: List[Tuple[str, int, int]] = []
+        # last tuple entry is the already-generated response prefix text that
+        # must be prepended before grading the sampled continuation.
+        prefix_meta: List[Tuple[str, int, int, str]] = []
 
         prompt_token_lists: List[List[int]] = []
         for p_idx in range(prompt_ids_cpu.shape[0]):
             pmask = prompt_mask_cpu[p_idx]
             prompt_token_lists.append(prompt_ids_cpu[p_idx][pmask.bool()].tolist())
             prefix_token_lists.append(prompt_token_lists[-1])
-            prefix_max_tokens.append(int(cfg.max_response_len))
-            prefix_meta.append(("prompt", p_idx, 0))
+            initial_budget = int(cfg.max_response_len)
+            if int(cfg.vineppo_mc_max_tokens) > 0:
+                initial_budget = min(initial_budget, int(cfg.vineppo_mc_max_tokens))
+            prefix_max_tokens.append(initial_budget)
+            prefix_meta.append(("prompt", p_idx, 0, ""))
 
         prompt_to_rows: dict[int, List[int]] = {}
         for b, p_idx in enumerate(prompt_index_cpu):
@@ -959,10 +990,19 @@ class CASPOTrainer:
                     # terminal — V(s_T) = 0 in VinePPO convention; skip MC.
                     continue
                 prefix = p_ids + r_ids[: k + 1]
+                prefix_response_text = self.tokenizer.decode(
+                    r_ids[: k + 1],
+                    skip_special_tokens=True,
+                )
                 prefix_token_lists.append(prefix)
                 # The continuation only needs the remaining response budget.
-                prefix_max_tokens.append(max(1, int(cfg.max_response_len) - (k + 1)))
-                prefix_meta.append(("step", b, t + 1))  # V at start of step t+1
+                remaining = max(1, int(cfg.max_response_len) - (k + 1))
+                if int(cfg.vineppo_mc_max_tokens) > 0:
+                    remaining = min(remaining, int(cfg.vineppo_mc_max_tokens))
+                prefix_max_tokens.append(remaining)
+                prefix_meta.append(
+                    ("step", b, t + 1, prefix_response_text)
+                )  # V at start of step t+1
 
         # Generate K rollouts from each prefix.
         if not hasattr(self.sampler, "sample_with_prefix"):
@@ -975,23 +1015,17 @@ class CASPOTrainer:
             V_step = torch.zeros(B, S_max + 1, device=device, dtype=torch.float32)
             return V_step
 
-        # vLLM takes one max_tokens per call, but different prefixes have
-        # different remaining budgets. Bucket by budget to avoid asking the
-        # engine to generate past max_model_len for late-step prefixes.
-        gens: List[Optional[list]] = [None] * len(prefix_token_lists)
-        by_budget: dict[int, List[int]] = {}
-        for i, mt in enumerate(prefix_max_tokens):
-            by_budget.setdefault(int(mt), []).append(i)
-        for mt, indices in by_budget.items():
-            sub_gens = self.sampler.sample_with_prefix(
-                [prefix_token_lists[i] for i in indices],
-                K=K,
-                max_tokens=mt,
-                temperature=cfg.rollout_temperature,
-                top_p=cfg.rollout_top_p,
-            )
-            for i, g in zip(indices, sub_gens):
-                gens[i] = g
+        # Keep per-prefix max-token budgets exact, but submit them as one
+        # mixed-SamplingParams batch so vLLM can schedule all prefixes
+        # together. The engine falls back internally if this vLLM build cannot
+        # return K completions from one SamplingParams(n=K) request.
+        gens = self.sampler.sample_with_prefix(
+            prefix_token_lists,
+            K=K,
+            max_tokens=prefix_max_tokens,
+            temperature=cfg.rollout_temperature,
+            top_p=cfg.rollout_top_p,
+        )
 
         # For each generated rollout, the MC value estimate = binary correctness.
         # Decode the COMPLETE trajectory (prefix's response part + new tokens)
@@ -1001,19 +1035,17 @@ class CASPOTrainer:
         V_step = torch.zeros(B, S_max + 1, device="cpu", dtype=torch.float32)
         # Defensive: also build a presence mask so we can fill missing slots
         # with the row's "last known" value (constant tail).
-        for (kind, first, second), per_prefix_gens in zip(prefix_meta, gens):
-            if per_prefix_gens is None:
-                continue
-            # Concat prefix's response part (decoded) + the new generation,
-            # then grade. Simpler: grade the continuation text — the verifier
-            # extracts boxed answers, which appear at the end.
+        for (kind, first, second, prefix_text), per_prefix_gens in zip(prefix_meta, gens):
+            # Grade the complete partial trajectory, not only the continuation:
+            # prefixes can already contain \boxed{...} or an unfinished boxed
+            # marker that the continuation completes.
             if kind == "prompt":
                 p_idx = first
                 gt = ground_truths[p_idx]
             else:
                 b = first
                 gt = ground_truths[prompt_index_cpu[b]]
-            texts = [g.text for g in per_prefix_gens]
+            texts = [prefix_text + g.text for g in per_prefix_gens]
             scores = self.reward_fn(texts, [gt] * len(texts))
             value = float(sum(scores) / max(len(scores), 1))
             if kind == "prompt":
@@ -1030,7 +1062,7 @@ class CASPOTrainer:
 
     # ------------------------------------------------------------------ step
 
-    def step(self, examples: List[dict]) -> dict:
+    def step(self, examples: List[dict], *, sync_vllm: bool = True) -> dict:
         cfg = self.cfg
         G = int(cfg.group_size)
 
@@ -1174,6 +1206,7 @@ class CASPOTrainer:
         total_ratio = 0.0
         total_kl_seen = 0   # only counts micros that produced a KL estimate
         n_micro = 0
+        token_weight_denom = 0.0
         n_optim_steps = 0
 
         ref_logprobs_full = self._precompute_ref_logprobs(
@@ -1184,23 +1217,26 @@ class CASPOTrainer:
         # frozen (computed before this loop); only π_θ updates each epoch.
         # This is standard PPO behavior — the importance ratio drifts away
         # from 1 over epochs, and the clipped surrogate guards against it.
-        # Pre-compute the size of every accum group within an epoch so the
-        # last (possibly partial) group divides by its actual micro count
-        # instead of ``accum``. Without this, ``loss / accum`` silently
-        # scales the partial-tail gradient by k/accum (e.g. 2/3 when
-        # accum=3 and 2 micros remain at end-of-epoch), corrupting that
-        # optim step.
-        n_micros_total = (B + mb - 1) // mb
-        # Each micro's group size: micros 0..accum-1 → group 0 (size accum),
-        # ..., final partial group has (n_micros_total % accum) micros if
-        # not divisible by accum.
-        last_group_size = n_micros_total % accum or accum
+        # ppo_clipped_loss returns a valid-token mean for each microbatch.
+        # Weight each micro by its token count inside the accumulation group
+        # so the optimizer sees the same objective as one large token-mean
+        # batch. Equal averaging of micro means overweights short responses.
+        micro_ranges = [(start, min(start + mb, B)) for start in range(0, B, mb)]
+        n_micros_total = len(micro_ranges)
+        row_token_counts = response_mask.sum(dim=1).detach().cpu()
+        micro_token_counts = [
+            float(row_token_counts[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        group_token_counts = [
+            sum(micro_token_counts[i : min(i + accum, n_micros_total)])
+            for i in range(0, n_micros_total, accum)
+        ]
         for epoch in range(n_epochs):
             # Reset accumulator counter so the optimizer step boundary
             # ``n_micro_in_epoch % accum == 0`` is computed within the epoch.
             n_micro_in_epoch = 0
-            for start in range(0, B, mb):
-                end = min(start + mb, B)
+            for micro_idx, (start, end) in enumerate(micro_ranges):
                 new_logprobs = self._forward_policy_logprobs(
                     tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
                     response_ids[start:end], response_mask[start:end],
@@ -1221,26 +1257,23 @@ class CASPOTrainer:
                     ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
                     kl_estimator=cfg.kl_estimator,
                 )
-                # Determine which accum group this micro belongs to and
-                # divide by that group's true size. For micros in any full
-                # group this is ``accum``; for micros in the trailing
-                # partial group it's ``last_group_size``.
-                # Group index of this micro (0-indexed within the epoch):
-                group_idx = n_micro_in_epoch // accum
-                in_last_partial = (
-                    last_group_size != accum
-                    and group_idx == n_micros_total // accum
+                group_idx = micro_idx // accum
+                group_tokens = group_token_counts[group_idx] if group_token_counts else 0.0
+                micro_tokens = micro_token_counts[micro_idx]
+                grad_weight = (
+                    micro_tokens / group_tokens
+                    if group_tokens > 0.0 else 0.0
                 )
-                divisor = last_group_size if in_last_partial else accum
-                (loss / divisor).backward()
+                (loss * grad_weight).backward()
 
                 with torch.no_grad():
-                    total_loss += float(loss.item())
-                    total_pg += float(stats["pg_loss"].item())
-                    total_clip_frac += float(stats["clip_frac"].item())
-                    total_ratio += float(stats["mean_ratio"].item())
+                    total_loss += float(loss.item()) * micro_tokens
+                    total_pg += float(stats["pg_loss"].item()) * micro_tokens
+                    total_clip_frac += float(stats["clip_frac"].item()) * micro_tokens
+                    total_ratio += float(stats["mean_ratio"].item()) * micro_tokens
+                    token_weight_denom += micro_tokens
                     if "mean_kl" in stats:
-                        total_kl += float(stats["mean_kl"].item())
+                        total_kl += float(stats["mean_kl"].item()) * micro_tokens
                         total_kl_seen += 1
                     n_micro += 1
                     n_micro_in_epoch += 1
@@ -1261,10 +1294,13 @@ class CASPOTrainer:
                     n_optim_steps += 1
         t_policy = time.time() - t_policy_start
 
-        # Sync vLLM weights for the next rollout (if applicable)
-        t_sync = self._sync_vllm_weights() if self._sync_dir else 0.0
+        # Sync vLLM weights for the next rollout (if applicable). The train
+        # loop passes ``sync_vllm=False`` for its final step because no later
+        # rollout will consume the engine; direct callers keep the historical
+        # default of syncing after every step.
+        t_sync = self._sync_vllm_weights() if self._sync_dir and sync_vllm else 0.0
 
-        denom = max(1, n_micro)
+        denom = max(1.0, token_weight_denom)
         # Average KL only over the micros that actually produced one
         # (i.e. when ref_policy is enabled). When no KL was produced
         # (no ref_policy, kl_coef=0), omit ``mean_kl`` from the result so
@@ -1291,7 +1327,7 @@ class CASPOTrainer:
             "t_sync_s": t_sync,
         }
         if total_kl_seen > 0:
-            result["mean_kl"] = total_kl / total_kl_seen
+            result["mean_kl"] = total_kl / denom
         if value_stats:
             result.update(value_stats)
             if self.value_optimizer is not None:
@@ -1353,18 +1389,32 @@ class CASPOTrainer:
             ) as prof:
                 while self.global_step < cfg.max_steps:
                     examples = self._next_examples(cfg.prompts_per_step)
-                    stats = self.step(examples)
+                    is_final_step = (self.global_step + 1) >= int(cfg.max_steps)
+                    stats = self.step(examples, sync_vllm=not is_final_step)
                     self.global_step += 1
                     if cfg.log_every and (self.global_step % cfg.log_every == 0):
                         self._log(stats, t0)
+                    if (
+                        cfg.save_every
+                        and self.global_step < int(cfg.max_steps)
+                        and self.global_step % int(cfg.save_every) == 0
+                    ):
+                        self.save_checkpoint(final=False)
                     prof.step()
         else:
             while self.global_step < cfg.max_steps:
                 examples = self._next_examples(cfg.prompts_per_step)
-                stats = self.step(examples)
+                is_final_step = (self.global_step + 1) >= int(cfg.max_steps)
+                stats = self.step(examples, sync_vllm=not is_final_step)
                 self.global_step += 1
                 if cfg.log_every and (self.global_step % cfg.log_every == 0):
                     self._log(stats, t0)
+                if (
+                    cfg.save_every
+                    and self.global_step < int(cfg.max_steps)
+                    and self.global_step % int(cfg.save_every) == 0
+                ):
+                    self.save_checkpoint(final=False)
 
         self.save_checkpoint(final=True)
         if self._wandb is not None:

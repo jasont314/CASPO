@@ -96,6 +96,20 @@ def test_padding_does_not_contribute() -> None:
     )
 
 
+def test_masked_nan_padding_does_not_poison_loss() -> None:
+    log_ratio = torch.tensor([[0.2, float("nan")]], requires_grad=True)
+    mask = torch.tensor([[1.0, 0.0]])
+    outcomes = torch.tensor([1.0])
+
+    loss, stats = ipvrm_loss(log_ratio, mask, outcomes, margin=1.0)
+
+    assert torch.isfinite(loss).item()
+    assert all(math.isfinite(v) for v in stats.values())
+    loss.backward()
+    assert torch.isfinite(log_ratio.grad).all().item()
+    assert log_ratio.grad[0, 1].item() == 0.0
+
+
 def test_all_padded_row_safe() -> None:
     B, R = 3, 5
     log_ratio = torch.randn(B, R, requires_grad=True)

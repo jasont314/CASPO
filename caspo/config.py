@@ -22,7 +22,6 @@ import yaml
 # lose the reason mapping. We freeze the message lookup at module load.
 _DEPRECATED_OR_UNUSED: dict[str, str] = {
     "compile": "torch.compile is not wired up in CASPOTrainer; ignored at runtime.",
-    "save_every": "checkpointing is only triggered at end-of-run (save_checkpoint(final=True)); not consumed.",
     "eval_every": "in-loop eval is not wired up in CASPOTrainer; run scripts/eval.py separately.",
     "vllm_skip_initial_sync": "vLLM engine always inits from cfg.model_name_or_path; flag not consumed.",
     "value_save_every": "scripts/train_value.py only writes a single 'final' checkpoint; periodic save not consumed.",
@@ -58,6 +57,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "distributed_backend": ("none", "fsdp"),
     "fsdp_sharding_strategy": ("full_shard", "shard_grad_op", "no_shard"),
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
+    "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
 }
 
 # Bool fields that may arrive as the strings "true"/"false" from YAML when
@@ -161,7 +161,10 @@ class CASPOConfig:
     value_data_path: Optional[str] = None  # .pt produced by collect_value_data.py
     # Online updating during phase 2 (off by default — keep V_phi frozen).
     update_value_during_policy: bool = False
-    online_value_lr: float = 1e-4
+    # IPVRM reports 1e-4 for LoRA/adapters. This implementation updates the
+    # full trainable value phi unless the model is externally PEFT-wrapped, so
+    # the safer default is the same order as policy/value full fine-tuning.
+    online_value_lr: float = 1e-6
     # Online stabilization (IPVRM §3.3, Eq. 15) — only meaningful when
     # update_value_during_policy=True. ADB shifts the BCE boundary by the
     # per-prompt logit μ(x); DLW weights each example by outcome rarity.
@@ -178,6 +181,10 @@ class CASPOConfig:
     # * "vineppo" — step segmentation + K MC rollouts at each boundary + step TD
     method: Literal["ppo", "caspo", "grpo", "vineppo"] = "caspo"
     vineppo_mc_rollouts: int = 9       # K in VinePPO Eq. 5
+    # Optional speed/quality tradeoff for VinePPO MC value estimates. 0 keeps
+    # the paper-faithful remaining-response budget; positive values cap each
+    # prefix continuation to this many new tokens.
+    vineppo_mc_max_tokens: int = 0
 
     # ---- step-level TD ----
     gamma: float = 1.0                # discount; VinePPO uses 1.0
@@ -211,9 +218,8 @@ class CASPOConfig:
     max_steps: int = 1000
     seed: int = 0
     log_every: int = 1
-    # NOTE: save_every and eval_every are NOT consumed by CASPOTrainer.train()
-    # — only the final checkpoint is saved at end-of-run, and eval is invoked
-    # via scripts/eval.py. Kept for YAML compat.
+    # ``save_every`` writes periodic policy checkpoints; ``eval_every`` is
+    # currently metadata only, with eval invoked via scripts/eval.py.
     save_every: int = 200
     eval_every: int = 200
 
@@ -225,6 +231,17 @@ class CASPOConfig:
     # for high-throughput rollout jobs after confirming KV cache headroom.
     vllm_max_num_seqs: Optional[int] = None
     vllm_max_num_batched_tokens: Optional[int] = None
+    # "expanded": one vLLM request per sample (safe on all observed vLLM V1
+    # builds, but Python-heavy for GRPO/VinePPO).
+    # "batched": one request with SamplingParams(n=K); fail fast if the vLLM
+    # runtime does not return K completions.
+    # "auto": try batched once, then fall back to expanded if this runtime has
+    # the vLLM V1 n>1 regression.
+    vllm_multi_sample_mode: Literal["auto", "expanded", "batched"] = "auto"
+    # Client-side cap on concurrently submitted AsyncLLM requests. This does
+    # not change vLLM's scheduler caps; it prevents VinePPO MC batches from
+    # creating thousands of live Python async generators at once.
+    vllm_max_inflight_requests: Optional[int] = 1024
     # Where to dump the policy snapshot for vLLM weight sync each iter.
     # Defaults to {output_dir}/_vllm_sync if None.
     vllm_sync_dir: Optional[str] = None
@@ -369,9 +386,27 @@ class CASPOConfig:
                 f"vineppo_mc_rollouts must be >= 1 for method='vineppo', "
                 f"got {self.vineppo_mc_rollouts}"
             )
+        if self.method == "vineppo" and self.rollout_backend != "vllm":
+            raise ValueError(
+                "method='vineppo' requires rollout_backend='vllm' because "
+                "MC prefix value estimation needs sample_with_prefix()."
+            )
+        if self.vineppo_mc_max_tokens < 0:
+            raise ValueError(
+                f"vineppo_mc_max_tokens must be >= 0 (0 disables), "
+                f"got {self.vineppo_mc_max_tokens}"
+            )
         if self.epochs_per_rollout < 1:
             raise ValueError(
                 f"epochs_per_rollout must be >= 1, got {self.epochs_per_rollout}"
+            )
+        if self.save_every < 0:
+            raise ValueError(
+                f"save_every must be >= 0 (0 disables periodic save), got {self.save_every}"
+            )
+        if self.eval_every < 0:
+            raise ValueError(
+                f"eval_every must be >= 0 (0 disables), got {self.eval_every}"
             )
         if self.grad_accum_steps < 1:
             raise ValueError(
@@ -413,6 +448,14 @@ class CASPOConfig:
             raise ValueError(
                 "vllm_max_num_batched_tokens must be >= 1 when set, "
                 f"got {self.vllm_max_num_batched_tokens}"
+            )
+        if (
+            self.vllm_max_inflight_requests is not None
+            and self.vllm_max_inflight_requests < 1
+        ):
+            raise ValueError(
+                "vllm_max_inflight_requests must be >= 1 when set, "
+                f"got {self.vllm_max_inflight_requests}"
             )
         if self.prompt_template is not None and "{query}" not in self.prompt_template:
             # Silent fallback to chat template would otherwise hide the typo.

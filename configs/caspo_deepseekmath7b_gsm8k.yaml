@@ -42,7 +42,7 @@ value_data_path: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_gsm8k/value_data.pt
 
 prefix_value_path: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_gsm8k/value_final
 update_value_during_policy: true
-online_value_lr: 1.0e-4
+online_value_lr: 1.0e-6
 use_adb: true
 use_dlw: true
 adb_dlw_eps: 0.05

@@ -64,11 +64,13 @@ def ipvrm_loss(
     # Promote to fp32 for cumsum stability on long prefixes (bf16 cumsum
     # accumulates round-off catastrophically beyond ~T=512).
     log_ratio_f = log_ratio.float()
-    mask_f = response_mask.to(log_ratio_f.dtype)
+    mask_bool = response_mask.to(torch.bool)
+    mask_f = mask_bool.to(log_ratio_f.dtype)
     outcomes_f = outcomes.to(log_ratio_f.dtype).view(B)
 
     # cumulative sum over t = 1..R (so cumsum[:, t-1] is V at prefix-length t).
-    cumsum = torch.cumsum(log_ratio_f * mask_f, dim=1)  # [B, R]
+    log_ratio_safe = torch.where(mask_bool, log_ratio_f, torch.zeros_like(log_ratio_f))
+    cumsum = torch.cumsum(log_ratio_safe, dim=1)  # [B, R]
     t_idx = torch.arange(1, R + 1, device=device, dtype=log_ratio_f.dtype).unsqueeze(0)  # [1, R]
     v_bar = cumsum / t_idx  # [B, R]
 
@@ -273,22 +275,32 @@ class PrefixValueTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         agg = {"loss": 0.0, "mean_v_bar_pos": 0.0, "mean_v_bar_neg": 0.0, "acc_at_last": 0.0}
-        n_micro = 0
-        # Pre-compute the size of each accumulation block so that the partial
-        # tail (when B % (mb * accum) != 0) is scaled by its actual micro count
-        # rather than the nominal ``accum`` — otherwise the trailing optimizer
-        # step receives an under-scaled gradient.
-        total_micros = (B + mb - 1) // mb
-        block_sizes = []
-        remaining = total_micros
-        while remaining > 0:
-            block = min(accum, remaining)
-            block_sizes.append(block)
-            remaining -= block
-        cur_block_idx = 0
-        cur_block_pos = 0
-        for start in range(0, B, mb):
-            end = min(start + mb, B)
+        micro_ranges = [(start, min(start + mb, B)) for start in range(0, B, mb)]
+        total_micros = len(micro_ranges)
+        valid_rows = (response_mask.sum(dim=1) > 0).detach().cpu()
+        pos_rows = ((outcomes >= 0.5) & (response_mask.sum(dim=1) > 0)).detach().cpu()
+        neg_rows = ((outcomes < 0.5) & (response_mask.sum(dim=1) > 0)).detach().cpu()
+        micro_row_counts = [
+            float(valid_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        micro_pos_counts = [
+            float(pos_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        micro_neg_counts = [
+            float(neg_rows[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        group_row_counts = [
+            sum(micro_row_counts[i : min(i + accum, total_micros)])
+            for i in range(0, total_micros, accum)
+        ]
+        total_rows = max(1.0, sum(micro_row_counts))
+        total_pos_rows = max(1.0, sum(micro_pos_counts))
+        total_neg_rows = max(1.0, sum(micro_neg_counts))
+        n_micro_in_block = 0
+        for micro_idx, (start, end) in enumerate(micro_ranges):
             out = self.model(
                 prompt_ids[start:end], prompt_mask[start:end],
                 response_ids[start:end], response_mask[start:end],
@@ -299,13 +311,21 @@ class PrefixValueTrainer:
                 outcomes=outcomes[start:end],
                 margin=self.model.margin,
             )
-            block_div = block_sizes[cur_block_idx] if block_sizes else 1
-            (loss / block_div).backward()
-            for k in agg:
-                agg[k] += stats[k]
-            n_micro += 1
-            cur_block_pos += 1
-            if cur_block_pos >= block_div or end == B:
+            group_idx = micro_idx // accum
+            group_rows = group_row_counts[group_idx] if group_row_counts else 0.0
+            micro_rows = micro_row_counts[micro_idx]
+            grad_weight = micro_rows / group_rows if group_rows > 0.0 else 0.0
+            (loss * grad_weight).backward()
+            agg["loss"] += stats["loss"] * micro_rows
+            agg["acc_at_last"] += stats["acc_at_last"] * micro_rows
+            agg["mean_v_bar_pos"] += (
+                stats["mean_v_bar_pos"] * micro_pos_counts[micro_idx]
+            )
+            agg["mean_v_bar_neg"] += (
+                stats["mean_v_bar_neg"] * micro_neg_counts[micro_idx]
+            )
+            n_micro_in_block += 1
+            if n_micro_in_block >= accum or end == B:
                 if cfg.value_grad_clip and cfg.value_grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.phi.parameters(), max_norm=cfg.value_grad_clip,
@@ -313,11 +333,14 @@ class PrefixValueTrainer:
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
-                cur_block_idx += 1
-                cur_block_pos = 0
+                n_micro_in_block = 0
 
-        denom = max(1, n_micro)
-        merged = {k: v / denom for k, v in agg.items()}
+        merged = {
+            "loss": agg["loss"] / total_rows,
+            "acc_at_last": agg["acc_at_last"] / total_rows,
+            "mean_v_bar_pos": agg["mean_v_bar_pos"] / total_pos_rows,
+            "mean_v_bar_neg": agg["mean_v_bar_neg"] / total_neg_rows,
+        }
         merged["lr"] = self.optimizer.param_groups[0]["lr"]
         self.global_step += 1
         return merged

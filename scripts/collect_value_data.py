@@ -212,6 +212,7 @@ def main() -> None:
             seed=cfg.seed,
             max_num_seqs=cfg.vllm_max_num_seqs,
             max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+            max_inflight_requests=cfg.vllm_max_inflight_requests,
         )
     else:
         from transformers import AutoModelForCausalLM

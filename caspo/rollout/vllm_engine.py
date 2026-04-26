@@ -14,8 +14,9 @@ Public API:
 * ``VLLMRolloutEngine.sample(examples)`` — drop-in for
   :meth:`HFRolloutSampler.sample`; returns a :class:`RolloutBatch`.
 * ``VLLMRolloutEngine.sample_with_prefix(prefix_ids, K, sampling_params)``
-  — for VinePPO MC rollouts. Uses ``SamplingParams(n=K)`` so vLLM batches
-  the K samples and reuses the prefix KV cache automatically.
+  — for VinePPO MC rollouts. In ``vllm_multi_sample_mode=auto`` it first
+  tries ``SamplingParams(n=K)`` and falls back to expanded requests if the
+  installed vLLM runtime does not return K completions.
 * ``VLLMRolloutEngine.sync_weights_from_path(path)`` — reload the engine
   from a checkpoint dir. Call after each policy gradient step.
 * ``VLLMRolloutEngine.shutdown()`` — clean up the background EngineCore.
@@ -29,7 +30,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 import torch
 
@@ -81,6 +82,7 @@ class VLLMRolloutEngine:
         seed: int = 0,
         max_num_seqs: Optional[int] = None,
         max_num_batched_tokens: Optional[int] = None,
+        max_inflight_requests: Optional[int] = None,
         extra_stop_strings: Optional[Sequence[str]] = None,
     ) -> None:
         from vllm import SamplingParams
@@ -94,6 +96,13 @@ class VLLMRolloutEngine:
         self.SamplingParams = SamplingParams
         self.RequestOutputKind = RequestOutputKind
         self.AsyncLLM = AsyncLLM
+        self.max_inflight_requests = (
+            int(max_inflight_requests)
+            if max_inflight_requests is not None else None
+        )
+        self._multi_sample_mode = str(cfg.vllm_multi_sample_mode)
+        self._parallel_sampling_supported: Optional[bool] = None
+        self._parallel_sampling_warned = False
 
         # Tokenizer (used for response decoding + prompt tokenization).
         tok_path = cfg.tokenizer_name_or_path or cfg.model_name_or_path
@@ -249,7 +258,19 @@ class VLLMRolloutEngine:
 
     async def _drain_many(self, requests: Sequence):
         """Drain a list of (prompt, sampling_params, request_id) tuples concurrently."""
-        tasks = [self._drain_one(p, sp, rid) for p, sp, rid in requests]
+        cap = self.max_inflight_requests
+        if cap is None or cap >= len(requests):
+            tasks = [self._drain_one(p, sp, rid) for p, sp, rid in requests]
+            return await asyncio.gather(*tasks)
+
+        sem = asyncio.Semaphore(max(1, int(cap)))
+
+        async def _limited(req):
+            p, sp, rid = req
+            async with sem:
+                return await self._drain_one(p, sp, rid)
+
+        tasks = [_limited(req) for req in requests]
         return await asyncio.gather(*tasks)
 
     def _run(self, coro):
@@ -296,6 +317,65 @@ class VLLMRolloutEngine:
         if seed is not None:
             kwargs["seed"] = int(seed)
         return self.SamplingParams(**kwargs)
+
+    def _can_try_parallel_sampling(self, n: int) -> bool:
+        """Whether to submit one vLLM request with ``SamplingParams(n=n)``."""
+        if int(n) <= 1:
+            return True
+        if self._multi_sample_mode == "expanded":
+            return False
+        if self._multi_sample_mode == "batched":
+            return True
+        return self._parallel_sampling_supported is not False
+
+    def _mark_parallel_sampling_ok(self, n: int) -> None:
+        if int(n) > 1 and self._multi_sample_mode == "auto":
+            self._parallel_sampling_supported = True
+
+    def _parallel_sampling_mismatch(
+        self, *, context: str, expected: int, counts: Sequence[int],
+    ) -> bool:
+        """Handle a vLLM runtime that did not return ``expected`` completions.
+
+        Returns True if callers should fall back to expanded requests. In
+        explicit ``batched`` mode this raises instead, because falling back
+        would hide that the requested optimized path is unavailable.
+        """
+        detail = ", ".join(str(int(c)) for c in counts[:8])
+        if len(counts) > 8:
+            detail += ", ..."
+        msg = (
+            f"vLLM parallel sampling mismatch in {context}: expected "
+            f"{expected} completions/request, got counts [{detail}]."
+        )
+        if self._multi_sample_mode == "batched":
+            raise RuntimeError(msg)
+        self._parallel_sampling_supported = False
+        if not self._parallel_sampling_warned:
+            self._parallel_sampling_warned = True
+            warnings.warn(
+                msg + " Falling back to expanded one-request-per-sample mode."
+            )
+        return True
+
+    def _normalize_prefix_max_tokens(
+        self,
+        max_tokens: Optional[Union[int, Sequence[int]]],
+        n_prefixes: int,
+    ) -> List[int]:
+        if max_tokens is None:
+            return [int(self.cfg.max_response_len)] * n_prefixes
+        if isinstance(max_tokens, int):
+            return [max(1, int(max_tokens))] * n_prefixes
+        if isinstance(max_tokens, (str, bytes)):
+            raise TypeError("max_tokens must be an int or sequence of ints")
+        values = [max(1, int(v)) for v in max_tokens]
+        if len(values) != n_prefixes:
+            raise ValueError(
+                f"max_tokens sequence length {len(values)} does not match "
+                f"prefix count {n_prefixes}"
+            )
+        return values
 
     # Class-level once-flag so the logprob-contract warning fires at most
     # once per process. Without this, a corrupted contract would emit
@@ -423,49 +503,70 @@ class VLLMRolloutEngine:
                 ids = ids[-max_p:]
             prompt_token_ids.append(list(ids))
 
-        # vLLM v1 quirk: SamplingParams(n=G) is documented but the AsyncLLM
-        # collector returns only 1 completion per request even with
-        # output_kind=FINAL_ONLY in many 0.19.x builds. Match the eval path
-        # (caspo/eval/benchmarks.py): submit G independent n=1 requests per
-        # prompt and aggregate. As a bonus this gives the continuous batcher
-        # more independent work units to interleave.
-        sp = self._build_sampling_params(n=1, max_tokens=int(cfg.max_response_len))
-
         from vllm.inputs import TokensPrompt
+        from vllm.outputs import CompletionOutput as _CompCls  # type: ignore
 
         # Order matters: emit (prompt p, sample 0..G-1) contiguously so that
         # outputs[i*G + j] corresponds to (prompt i, sample j) and prompt_index
         # == [0]*G + [1]*G + ... matches HFRolloutSampler's layout.
-        requests = []
-        for prompt_i, ids in enumerate(prompt_token_ids):
-            tp = TokensPrompt(prompt_token_ids=ids)
-            for samp_j in range(G):
-                requests.append(
-                    (tp, sp, f"req-p{prompt_i}-s{samp_j}-{uuid.uuid4().hex}")
+        token_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
+
+        comps_flat = None
+        if self._can_try_parallel_sampling(G):
+            sp_batched = self._build_sampling_params(
+                n=G, max_tokens=int(cfg.max_response_len),
+            )
+            requests = [
+                (tp, sp_batched, f"req-p{prompt_i}-n{G}-{uuid.uuid4().hex}")
+                for prompt_i, tp in enumerate(token_prompts)
+            ]
+            outputs = self._run(self._drain_many(requests))
+            comps_by_prompt = [
+                list((req_out.outputs if req_out is not None else None) or [])
+                for req_out in outputs
+            ]
+            counts = [len(comps) for comps in comps_by_prompt]
+            if all(c == G for c in counts):
+                self._mark_parallel_sampling_ok(G)
+                comps_flat = [
+                    comp
+                    for comps in comps_by_prompt
+                    for comp in comps[:G]
+                ]
+            else:
+                self._parallel_sampling_mismatch(
+                    context="sample", expected=G, counts=counts,
                 )
-        outputs = self._run(self._drain_many(requests))
+
+        if comps_flat is None:
+            sp = self._build_sampling_params(n=1, max_tokens=int(cfg.max_response_len))
+            requests = []
+            for prompt_i, tp in enumerate(token_prompts):
+                for samp_j in range(G):
+                    requests.append(
+                        (tp, sp, f"req-p{prompt_i}-s{samp_j}-{uuid.uuid4().hex}")
+                    )
+            outputs = self._run(self._drain_many(requests))
+            comps_flat = []
+            for req_out in outputs:
+                comps = list((req_out.outputs if req_out is not None else None) or [])
+                if comps:
+                    comps_flat.append(comps[0])
+                else:
+                    comps_flat.append(
+                        _CompCls(  # type: ignore[call-arg]
+                            index=0, text="", token_ids=[],
+                            cumulative_logprob=None, logprobs=[],
+                            finish_reason="error", stop_reason=None,
+                        )
+                    )
 
         # Each output has 1 CompletionOutput; flatten in submitted order.
         flat_token_ids: List[List[int]] = []
         flat_logprobs: List[List[float]] = []
         flat_responses: List[str] = []
-        from vllm.outputs import CompletionOutput as _CompCls  # type: ignore
-        for req_out in outputs:
-            # _drain_one returns None if the engine produced no RequestOutput
-            # at all (e.g. the request was aborted before any token landed).
-            comps = list((req_out.outputs if req_out is not None else None) or [])
-            if not comps:
-                # Failed request: emit a stub so the (prompt, G) layout stays
-                # aligned with prompt_index. Reward function sees an empty
-                # response and the trainer assigns reward 0 / mask 0.
-                comps = [
-                    _CompCls(  # type: ignore[call-arg]
-                        index=0, text="", token_ids=[], cumulative_logprob=None,
-                        logprobs=[], finish_reason="error", stop_reason=None,
-                    )
-                ]
-            # n=1 — take the first (only) completion.
-            gen = self._extract_completion(comps[0])
+        for comp in comps_flat:
+            gen = self._extract_completion(comp)
             flat_token_ids.append(gen.token_ids)
             flat_logprobs.append(gen.sampling_logprobs)
             flat_responses.append(gen.text)
@@ -474,7 +575,11 @@ class VLLMRolloutEngine:
 
         # Pack tensors. Prompts are left-padded; responses right-padded.
         prompt_ids_packed = self._pad_left(prompt_token_ids, self.pad_token_id)
-        prompt_mask = (prompt_ids_packed != self.pad_token_id).to(torch.long)
+        prompt_mask = torch.zeros_like(prompt_ids_packed, dtype=torch.long)
+        P = prompt_ids_packed.shape[1]
+        for i, ids in enumerate(prompt_token_ids):
+            if ids:
+                prompt_mask[i, P - len(ids) :] = 1
 
         response_ids = self._pad_right(flat_token_ids, self.pad_token_id)
         R = response_ids.shape[1] if response_ids.numel() > 0 else 0
@@ -512,7 +617,7 @@ class VLLMRolloutEngine:
         prefix_token_ids_list: List[List[int]],
         K: int,
         *,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[Union[int, Sequence[int]]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         seed: Optional[int] = None,
@@ -528,46 +633,89 @@ class VLLMRolloutEngine:
         """
         if not prefix_token_ids_list:
             return []
-        if max_tokens is None:
-            max_tokens = int(self.cfg.max_response_len)
-
-        sp = self._build_sampling_params(
-            n=1,
-            max_tokens=int(max_tokens),
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
+        max_tokens_by_prefix = self._normalize_prefix_max_tokens(
+            max_tokens, len(prefix_token_ids_list),
         )
 
         from vllm.inputs import TokensPrompt
         from vllm.outputs import CompletionOutput as _CompCls  # type: ignore
 
         K_int = int(K)
-        requests = []
-        for prefix_i, p in enumerate(prefix_token_ids_list):
-            tp = TokensPrompt(prompt_token_ids=list(p))
-            for samp_j in range(K_int):
-                requests.append(
-                    (tp, sp, f"prefix-p{prefix_i}-s{samp_j}-{uuid.uuid4().hex}")
+        token_prompts = [
+            TokensPrompt(prompt_token_ids=list(p)) for p in prefix_token_ids_list
+        ]
+        sp_cache: dict[tuple[int, int], Any] = {}
+
+        def _sp(n: int, mt: int):
+            key = (int(n), int(mt))
+            cached = sp_cache.get(key)
+            if cached is None:
+                cached = self._build_sampling_params(
+                    n=int(n),
+                    max_tokens=int(mt),
+                    temperature=temperature,
+                    top_p=top_p,
+                    seed=seed,
                 )
-        outputs = self._run(self._drain_many(requests))
+                sp_cache[key] = cached
+            return cached
+
+        comps_by_prefix = None
+        if self._can_try_parallel_sampling(K_int):
+            requests = [
+                (
+                    tp,
+                    _sp(K_int, max_tokens_by_prefix[prefix_i]),
+                    f"prefix-p{prefix_i}-n{K_int}-{uuid.uuid4().hex}",
+                )
+                for prefix_i, tp in enumerate(token_prompts)
+            ]
+            outputs = self._run(self._drain_many(requests))
+            maybe = [
+                list((req_out.outputs if req_out is not None else None) or [])
+                for req_out in outputs
+            ]
+            counts = [len(comps) for comps in maybe]
+            if all(c == K_int for c in counts):
+                self._mark_parallel_sampling_ok(K_int)
+                comps_by_prefix = [comps[:K_int] for comps in maybe]
+            else:
+                self._parallel_sampling_mismatch(
+                    context="sample_with_prefix", expected=K_int, counts=counts,
+                )
+
+        if comps_by_prefix is None:
+            requests = []
+            for prefix_i, tp in enumerate(token_prompts):
+                sp = _sp(1, max_tokens_by_prefix[prefix_i])
+                for samp_j in range(K_int):
+                    requests.append(
+                        (tp, sp, f"prefix-p{prefix_i}-s{samp_j}-{uuid.uuid4().hex}")
+                    )
+            outputs = self._run(self._drain_many(requests))
+            comps_by_prefix = []
+            for prefix_i in range(len(prefix_token_ids_list)):
+                slice_out = outputs[prefix_i * K_int : (prefix_i + 1) * K_int]
+                comps: List[Any] = []
+                for req_out in slice_out:
+                    one = list((req_out.outputs if req_out is not None else None) or [])
+                    if one:
+                        comps.append(one[0])
+                    else:
+                        comps.append(
+                            _CompCls(  # type: ignore[call-arg]
+                                index=0, text="", token_ids=[],
+                                cumulative_logprob=None, logprobs=[],
+                                finish_reason="error", stop_reason=None,
+                            )
+                        )
+                comps_by_prefix.append(comps)
 
         out_per_prefix: List[List[_Generation]] = []
-        for prefix_i in range(len(prefix_token_ids_list)):
-            slice_out = outputs[prefix_i * K_int : (prefix_i + 1) * K_int]
+        for comps in comps_by_prefix:
             gens: List[_Generation] = []
-            for req_out in slice_out:
-                # _drain_one can return None (no RequestOutput ever yielded);
-                # produce a stub so caller always sees K entries per prefix.
-                comps = list((req_out.outputs if req_out is not None else None) or [])
-                if not comps:
-                    comps = [
-                        _CompCls(  # type: ignore[call-arg]
-                            index=0, text="", token_ids=[], cumulative_logprob=None,
-                            logprobs=[], finish_reason="error", stop_reason=None,
-                        )
-                    ]
-                gens.append(self._extract_completion(comps[0]))
+            for comp in comps:
+                gens.append(self._extract_completion(comp))
             out_per_prefix.append(gens)
         return out_per_prefix
 
@@ -627,9 +775,16 @@ class VLLMRolloutEngine:
         try:
             reset_coro = self.engine.reset_prefix_cache()
             if hasattr(reset_coro, "__await__"):
-                self._run(reset_coro)
+                reset_ok = self._run(reset_coro)
+            else:
+                reset_ok = reset_coro
+            if reset_ok is False:
+                raise RuntimeError("reset_prefix_cache returned False")
         except Exception as e:  # pragma: no cover
-            warnings.warn(f"reset_prefix_cache failed: {e}")
+            raise RuntimeError(
+                "reset_prefix_cache failed after vLLM weight reload; "
+                "continuing could reuse stale KV cache from old weights"
+            ) from e
         return time.time() - t0
 
     async def _collective_rpc(self, method: str, args: tuple = (), kwargs: Optional[dict] = None):

@@ -76,6 +76,26 @@ def test_mask_excludes_padding():
     assert abs(loss_a.item() - loss_b.item()) < 1e-6
 
 
+def test_masked_nan_padding_does_not_poison_loss_or_kl():
+    logp = torch.tensor([[0.0, float("nan")]], requires_grad=True)
+    old = torch.zeros(1, 2)
+    A = torch.ones(1, 2)
+    mask = torch.tensor([[1.0, 0.0]])
+    ref = torch.tensor([[0.0, float("nan")]])
+
+    loss, stats = ppo_clipped_loss(
+        logp, old, A, mask,
+        ref_logprobs=ref, kl_coef=0.1, kl_estimator="k3",
+    )
+
+    assert torch.isfinite(loss).item()
+    for v in stats.values():
+        assert torch.isfinite(v).all().item()
+    loss.backward()
+    assert torch.isfinite(logp.grad).all().item()
+    assert logp.grad[0, 1].item() == 0.0
+
+
 def test_clip_frac_stat():
     # Build a batch where exactly half the valid positions are clipped.
     # 4 tokens, 2 with ratio outside [0.8, 1.2], 2 inside.

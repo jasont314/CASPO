@@ -52,9 +52,11 @@ value_grad_clip: 1.0
 value_data_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_data.pt
 
 # Phase 2 — value usage. Online updates ON (Eq. 15 with ADB+DLW per §3.3).
+# Paper IPVRM uses 1e-4 with LoRA; this full-model value update path is kept
+# at 1e-6 to avoid the saturation seen in earlier runs.
 prefix_value_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
 update_value_during_policy: true
-online_value_lr: 1.0e-4
+online_value_lr: 1.0e-6
 use_adb: true
 use_dlw: true
 adb_dlw_eps: 0.05

@@ -40,12 +40,16 @@ from caspo.config import CASPOConfig  # noqa: E402
 REPORT_KEYS: tuple[str, ...] = (
     "method",
     "lr",
+    "online_value_lr",
     "kl_coef",
     "max_steps",
     "group_size",
     "prompts_per_step",
     "micro_batch_size",
     "grad_accum_steps",
+    "vllm_enforce_eager",
+    "vllm_multi_sample_mode",
+    "save_every",
 )
 
 
@@ -165,12 +169,24 @@ def _validate(report: ConfigReport) -> list[str]:
             f"method='grpo' requires group_size>=2, got {cfg.group_size}"
         )
 
+    if cfg.method == "vineppo" and cfg.rollout_backend != "vllm":
+        issues.append(
+            "method='vineppo' requires rollout_backend='vllm' "
+            "because sample_with_prefix() is required"
+        )
+
     # 4. value model is referenced by CASPO/VinePPO but only required by
     # CASPO for the V_phi prefix value head; warn if unset.
     if cfg.method == "caspo" and not value_only and not cfg.prefix_value_path:
         issues.append(
             "method='caspo' but prefix_value_path is unset "
             "(phase-2 needs a phase-1 checkpoint)"
+        )
+
+    if cfg.update_value_during_policy and cfg.online_value_lr >= 1e-5:
+        issues.append(
+            f"online_value_lr={cfg.online_value_lr:g} is high for the "
+            "full-model value update path; use ~1e-6 unless phi is PEFT/LoRA-only"
         )
 
     return issues

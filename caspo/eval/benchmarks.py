@@ -211,6 +211,8 @@ def evaluate_vllm(
     prompt_template: Optional[str] = None,
     trust_remote_code: bool = False,
     torch_dtype: str = "bfloat16",
+    tokenizer_name_or_path: Optional[str] = None,
+    max_prompt_len: int = 1024,
     max_num_seqs: Optional[int] = None,
     max_num_batched_tokens: Optional[int] = None,
     engine=None,
@@ -296,6 +298,9 @@ def evaluate_vllm(
         # batched/tokenizer-wrapper paths may produce [[...]].
         if ids and isinstance(ids[0], list):
             ids = ids[0]
+        max_p = int(max_prompt_len) if max_prompt_len else 0
+        if max_p and len(ids) > max_p:
+            ids = ids[-max_p:]
         return TokensPrompt(prompt_token_ids=[int(t) for t in ids])
 
     token_prompts = [_token_prompt(p) for p in prompts]
@@ -307,7 +312,7 @@ def evaluate_vllm(
 
         engine_kwargs = dict(
             model=model_name_or_path,
-            tokenizer=model_name_or_path,
+            tokenizer=tokenizer_name_or_path or model_name_or_path,
             tokenizer_mode="auto",
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype,
@@ -315,7 +320,7 @@ def evaluate_vllm(
             gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=True,
             enforce_eager=enforce_eager,
-            max_model_len=int(max_new_tokens) + 1024,    # 1024 max prompt tokens
+            max_model_len=int(max_new_tokens) + int(max_prompt_len),
             seed=seed,
             disable_log_stats=True,
         )

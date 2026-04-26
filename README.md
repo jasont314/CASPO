@@ -128,6 +128,9 @@ This enables:
   `generate`.
 - `vllm_tensor_parallel_size=1`: one rank-local vLLM engine per GPU. This is
   the supported distributed topology for the current trainer.
+- `vllm_multi_sample_mode=auto`: use vLLM `SamplingParams(n=K)` when the
+  installed runtime returns all completions, otherwise fall back to the safe
+  expanded request path.
 
 `prompts_per_step` is interpreted per rank in this mode, so the global prompt
 batch is `prompts_per_step * NUM_GPUS`.
@@ -135,3 +138,14 @@ batch is `prompts_per_step * NUM_GPUS`.
 The project launchers default to `/opt/conda/envs/scalable/bin/python` (and
 `/opt/conda/envs/scalable/bin/torchrun` for FSDP). Override `PYTHON_BIN` or
 `TORCHRUN_BIN` only when intentionally testing another environment.
+
+For 1B single-GPU H100 runs, leave `vllm_enforce_eager=false` unless CUDA graph
+memory becomes a problem. Recent speed probes show rollout generation is not
+the bottleneck; per-step trainer-to-vLLM weight sync is.
+
+VinePPO remains intrinsically slower than PPO because it samples K continuations
+at each reasoning-step prefix. The optimized path batches mixed prefix budgets
+in one vLLM submission and tries true `n=K` parallel sampling, but the method
+still scales with roughly `responses * nonterminal_steps * K` extra
+continuations. `vineppo_mc_max_tokens` can cap those MC continuations for speed
+experiments; keep it at `0` for paper-faithful remaining-budget rollouts.

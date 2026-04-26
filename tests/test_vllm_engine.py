@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,6 +56,52 @@ def _make_cfg():
 
 def _stub_reward_fn(responses, ground_truths):
     return [0.0] * len(responses)
+
+
+def test_vllm_prefix_max_tokens_sequence_validation():
+    """Mixed VinePPO prefix budgets should be accepted without GPU/vLLM init."""
+    from caspo.rollout.vllm_engine import VLLMRolloutEngine
+
+    engine = object.__new__(VLLMRolloutEngine)
+    engine.cfg = SimpleNamespace(max_response_len=17)
+
+    assert engine._normalize_prefix_max_tokens(None, 3) == [17, 17, 17]
+    assert engine._normalize_prefix_max_tokens(5, 2) == [5, 5]
+    assert engine._normalize_prefix_max_tokens([8, 0, 3], 3) == [8, 1, 3]
+    with pytest.raises(ValueError):
+        engine._normalize_prefix_max_tokens([1, 2], 3)
+
+
+def test_vllm_parallel_sampling_auto_fallback_state():
+    """Auto mode should disable n>1 after a runtime mismatch."""
+    from caspo.rollout.vllm_engine import VLLMRolloutEngine
+
+    engine = object.__new__(VLLMRolloutEngine)
+    engine._multi_sample_mode = "auto"
+    engine._parallel_sampling_supported = None
+    engine._parallel_sampling_warned = False
+
+    assert engine._can_try_parallel_sampling(4)
+    with pytest.warns(UserWarning):
+        assert engine._parallel_sampling_mismatch(
+            context="unit", expected=4, counts=[1, 1],
+        )
+    assert engine._parallel_sampling_supported is False
+    assert not engine._can_try_parallel_sampling(4)
+
+
+def test_vllm_parallel_sampling_batched_mode_raises_on_mismatch():
+    from caspo.rollout.vllm_engine import VLLMRolloutEngine
+
+    engine = object.__new__(VLLMRolloutEngine)
+    engine._multi_sample_mode = "batched"
+    engine._parallel_sampling_supported = None
+    engine._parallel_sampling_warned = False
+
+    with pytest.raises(RuntimeError):
+        engine._parallel_sampling_mismatch(
+            context="unit", expected=8, counts=[1],
+        )
 
 
 @pytest.mark.slow
@@ -193,11 +240,11 @@ def test_vllm_sampling_params_n_returns_k_completions():
 
     Why: in vLLM 0.19.1 we have observed configurations where requesting
     ``n=K`` returns only 1 completion instead of K (the engine silently
-    collapses parallel sampling). Both :meth:`VLLMRolloutEngine.sample` and
-    :meth:`sample_with_prefix` rely on ``n=K`` to generate K diverse
-    rollouts in one batched request. If this regresses again, those paths
-    will silently produce 1 unique sample padded with duplicates / empties,
-    poisoning RL training (per-prompt advantage variance collapses).
+    collapses parallel sampling). ``VLLMRolloutEngine.sample`` and
+    ``VLLMRolloutEngine.sample_with_prefix`` now auto-probe this path and
+    fall back to expanded one-request-per-sample mode if the installed vLLM
+    runtime has the regression. A mismatch here is therefore an upstream
+    performance limitation, not a CASPO correctness failure.
 
     This test bypasses the engine wrapper and probes vLLM's ``AsyncLLM``
     directly so a regression is visible at the vLLM layer (not masked by
@@ -258,15 +305,13 @@ def test_vllm_sampling_params_n_returns_k_completions():
 
             assert req_out is not None, f"K={K}: no RequestOutput returned"
             comps = list(req_out.outputs)
-            assert len(comps) == K, (
-                f"vLLM SamplingParams(n={K}) returned {len(comps)} "
-                f"CompletionOutput entries, expected {K}. "
-                "If this is 1, the n>1 parallel-sampling regression in "
-                "vLLM 0.19.1 has resurfaced. CASPO's rollout pipeline "
-                "(VLLMRolloutEngine.sample / sample_with_prefix) depends "
-                "on n=K returning K completions; without it, GRPO/VinePPO "
-                "advantages collapse. Pin or bump vLLM accordingly."
-            )
+            if len(comps) != K:
+                pytest.xfail(
+                    f"vLLM SamplingParams(n={K}) returned {len(comps)} "
+                    f"CompletionOutput entries, expected {K}. CASPO's wrapper "
+                    "falls back to expanded requests in this case, but the "
+                    "optimized batched path is unavailable on this runtime."
+                )
             # Each completion should be non-empty and carry its own token ids.
             for i, c in enumerate(comps):
                 assert len(list(c.token_ids)) > 0, \
