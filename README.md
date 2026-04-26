@@ -549,8 +549,10 @@ GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
 
 Do cheap sample evals at saved checkpoints and full eval only at the end. The
 training loop does not run eval in-process; eval is launched from saved
-checkpoints with vLLM. Keep the sample cadence aligned with checkpointing:
-`step_250`, `step_500`, `step_750`, and `final`.
+checkpoints with vLLM. Keep the sample cadence aligned with intermediate
+checkpoints: `step_250`, `step_500`, and `step_750`. At `final`, run the full
+benchmark suite instead of a separate sample eval because the full suite already
+includes MATH-500.
 
 Standard seven-method sample eval:
 
