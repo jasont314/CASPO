@@ -828,40 +828,55 @@ class CASPOTrainer:
         ``with`` block (~14 GB for a 7B bf16 model), so callers must ensure no
         other large allocations are live at the same time.
 
-        We clone each parameter inside the context to detach it from FSDP's
-        flat-buffer storage. Otherwise the ``param.data`` view points into a
-        buffer that FSDP frees on context exit, while vLLM may still be
-        holding the IPC handle. The clone keeps the underlying CUDA allocation
-        alive until ``self.sampler._ipc_weight_keepalive`` is cleared at the
-        end of ``sync_weights_from_model``.
+        The IPC kernel pushes one parameter at a time and the EngineCore
+        opens, copies, and closes each cuda IPC handle before the next push,
+        so the source pointer only needs to be valid during the synchronous
+        push. We therefore iterate ``named_parameters()`` *inside* the
+        ``summon_full_params`` context — the unsharded view is alive for the
+        entire push, then immediately re-sharded on context exit. No clone
+        needed, which saves +param_bytes (~14 GB on 7B bf16) per rank.
+
+        Memory cost during summon is +param_bytes/rank (the unsharded
+        materialization). On Rho-1B that's negligible; on 7B it's ~14 GB
+        and combined with vLLM's KV-cache budget can be tight. If OOM hits
+        here, drop ``vllm_gpu_memory_utilization`` or enable
+        ``fsdp_cpu_offload=true`` to push the optimizer state to CPU.
         """
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         t0 = time.time()
         with FSDP.summon_full_params(self.model, writeback=False, with_grads=False):
-            # Detach from FSDP's flat-param storage by cloning into a fresh
-            # contiguous bf16/fp16/fp32 tensor that the IPC keepalive can pin.
             base = _unwrap_parallel(self.model)
-            full_params = torch.nn.ParameterList()  # noqa: F841 (unused)
-            # Use a lightweight nn.Module with identical named_parameters() so
-            # the existing IPC kernel (which iterates ``model.named_parameters()``)
-            # works unchanged.
-            class _NamedParamsView(torch.nn.Module):
-                def __init__(self, named: list[tuple[str, torch.Tensor]]):
+            # FSDP auto_wrap injects `_fsdp_wrapped_module.` into the qualified
+            # name of every leaf parameter (e.g. `layers.0._fsdp_wrapped_module.
+            # self_attn.qkv_proj.weight`). vLLM's checkpoint loader keys on the
+            # bare HF name and raises KeyError otherwise. Strip the marker on
+            # the way out via a tiny named-params view; the underlying tensors
+            # are unmodified so IPC handles still point into FSDP's
+            # summon-full storage.
+            class _FsdpStrippedParamsView(torch.nn.Module):
+                _MARKERS = ("._fsdp_wrapped_module.", "_fsdp_wrapped_module.")
+
+                def __init__(self, src: torch.nn.Module):
                     super().__init__()
-                    self._cloned: list[tuple[str, torch.Tensor]] = named
+                    self._src = src
+
+                @staticmethod
+                def _clean(name: str) -> str:
+                    for m in _FsdpStrippedParamsView._MARKERS:
+                        name = name.replace(m, "." if m.startswith(".") else "")
+                    return name
 
                 def named_parameters(self, *_, **__):  # type: ignore[override]
-                    for name, t in self._cloned:
-                        yield name, t
+                    for raw_name, p in self._src.named_parameters():
+                        yield self._clean(raw_name), p
 
-            cloned: list[tuple[str, torch.Tensor]] = []
-            for name, p in base.named_parameters():
-                cloned.append((name, p.detach().contiguous().clone()))
-            view = _NamedParamsView(cloned)
-            # All ranks push to their rank-local vLLM EngineCore. The IPC
-            # handles are within-device (trainer rank N and vLLM rank N share
-            # one CUDA device), so cudaIpcOpenMemHandle is valid.
+            view = _FsdpStrippedParamsView(base)
+            # Push directly through the IPC kernel — it iterates
+            # view.named_parameters() once and synchronously calls
+            # collective_rpc("update_weights", ...). By the time this
+            # returns, all weights have been copied into vLLM's worker
+            # tensors and the source pointers are no longer referenced.
             self.sampler.sync_weights_from_model(view)
         return time.time() - t0
 

@@ -1,30 +1,18 @@
 # Shared FSDP-based 7B launcher body. Source this from a thin per-method wrapper.
 #
+# Per-rank manual bash spawn (no torchrun) so each Python process has fully
+# independent CUDA / torch.distributed / multiprocessing state. This matches
+# the rho-1B DDP-2 launcher pattern that's known to work with rank-local
+# vLLM EngineCore subprocesses.
+#
 # Required wrapper-set vars:
 #   METHOD=ppo|grpo|caspo|vineppo
 #   RUN_METHOD_TAG=<output/log tag>
 #   GPU_DEFAULT_LIST="0 1 2 3"   # default GPU set (4 or 8 depending on method)
 #   EXTRA_OVERRIDES=(--override key=value ...)
 #
-# Optional env knobs:
-#   GPU_LIST              override default GPU set (space-separated ids)
-#   RUN_TAG               output dir + log suffix (default empty)
-#   MAX_STEPS             override cfg.max_steps
-#   SAVE_EVERY            override save cadence (default 250)
-#   WANDB_MODE            online | offline | disabled (default offline)
-#   WANDB_PROJECT
-#   BASE_CONFIG           path to YAML (default configs/caspo_deepseekmath7b_math.yaml)
-#   CASPO_VLLM_GPU_MEMORY_UTILIZATION   default 0.30 (vLLM rank-local; 7B trainer is tight)
-#   CASPO_VLLM_MAX_NUM_SEQS              default 256
-#   CASPO_VLLM_ENFORCE_EAGER             default false (CUDA graphs on)
-#   CASPO_MICRO_BATCH_SIZE               default 1
-#   CASPO_GRAD_ACCUM_STEPS               default 16 for 4-GPU, 8 for 8-GPU (override via env)
-#   CASPO_USE_GRADIENT_CHECKPOINTING     default true (7B activation memory)
-#   CASPO_FSDP_CPU_OFFLOAD               default false (flip to true if OOM)
-#   CASPO_REWARD_WORKERS                 default 4
-#   PROMPTS_PER_STEP                     default 8 (paper-faithful global)
-#
-# Do not execute this file directly.
+# Optional env knobs: see /home/jason/experiment/CASPO/configs/caspo_deepseekmath7b_math.yaml
+# and the env var block below.
 set -eo pipefail
 
 if [[ -z "${METHOD:-}" || -z "${RUN_METHOD_TAG:-}" ]]; then
@@ -64,7 +52,6 @@ LOGDIR="$ROOT/deepseekmath7b_math${RUN_SUFFIX}/logs"
 mkdir -p "$LOGDIR"
 
 OUTDIR="$ROOT/deepseekmath7b_math_${RUN_METHOD_TAG}${RUN_SUFFIX}"
-LOG="$LOGDIR/phase2_${RUN_METHOD_TAG}.log"
 
 # vLLM and trainer knobs (overridable via env).
 CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.30}}"
@@ -72,8 +59,6 @@ CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-256}}"
 CASPO_VLLM_ENFORCE_EAGER="${CASPO_VLLM_ENFORCE_EAGER:-false}"
 
 CASPO_MICRO_BATCH_SIZE="${CASPO_MICRO_BATCH_SIZE:-${MICRO_BATCH_SIZE:-1}}"
-# Default accum: keep global PPO minibatch = 64 across world_size.
-# 4 ranks × 1 mb × 16 accum = 64; 8 ranks × 1 mb × 8 accum = 64.
 DEFAULT_ACCUM=$(( 64 / NRANK / CASPO_MICRO_BATCH_SIZE ))
 if (( DEFAULT_ACCUM < 1 )); then DEFAULT_ACCUM=1; fi
 CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-$DEFAULT_ACCUM}}"
@@ -83,12 +68,11 @@ CASPO_FSDP_CPU_OFFLOAD="${CASPO_FSDP_CPU_OFFLOAD:-${FSDP_CPU_OFFLOAD:-false}}"
 CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
 PROMPTS_PER_STEP_VAL="${PROMPTS_PER_STEP:-8}"
 
-# Drop alias env names so vLLM doesn't warn.
 unset VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_NUM_SEQS
 unset MICRO_BATCH_SIZE GRAD_ACCUM_STEPS USE_GRADIENT_CHECKPOINTING
 unset FSDP_CPU_OFFLOAD REWARD_WORKERS PROMPTS_PER_STEP
 
-COMMON_OVERRIDES=(
+OVERRIDES=(
     --override "method=${METHOD}"
     --override rollout_backend=vllm
     --override vllm_weight_sync_backend=ipc
@@ -112,30 +96,74 @@ COMMON_OVERRIDES=(
     --override "wandb_run_name=7b_math_${RUN_METHOD_TAG}_seed0${RUN_SUFFIX}"
 )
 if [[ -n "${MAX_STEPS:-}" ]]; then
-    COMMON_OVERRIDES+=(--override "max_steps=${MAX_STEPS}")
+    OVERRIDES+=(--override "max_steps=${MAX_STEPS}")
 fi
+
+# Pick a fixed MASTER_PORT for this run. All ranks share this rdzv endpoint.
+MASTER_PORT="${MASTER_PORT:-$(( ((RANDOM<<15) | RANDOM) % 24000 + 30000 ))}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
 echo "[7b-fsdp] ${RUN_METHOD_TAG} method=${METHOD} gpus=${GPUS[*]} (world=${NRANK}) out=${OUTDIR}"
 echo "[7b-fsdp] mb=${CASPO_MICRO_BATCH_SIZE} accum=${CASPO_GRAD_ACCUM_STEPS} grad_ckpt=${CASPO_USE_GRADIENT_CHECKPOINTING} prompts/step=${PROMPTS_PER_STEP_VAL}"
 echo "[7b-fsdp] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} fsdp_cpu_offload=${CASPO_FSDP_CPU_OFFLOAD}"
-echo "[7b-fsdp] log=${LOG}"
+echo "[7b-fsdp] rdzv=${MASTER_ADDR}:${MASTER_PORT}"
 
-# Pick a free MASTER_PORT.
-MASTER_PORT="${MASTER_PORT:-$(( ((RANDOM<<15) | RANDOM) % 24000 + 30000 ))}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+PIDS=()
+cleanup_children() {
+    local code=$?
+    echo "[7b-fsdp] caught signal/exit; killing rank PIDs: ${PIDS[*]:-none}"
+    for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    exit "$code"
+}
+trap cleanup_children INT TERM
 
-GPU_CSV=$(IFS=,; echo "${GPUS[*]}")
+launch_rank() {
+    local rank="$1"
+    local gpu="$2"
+    local log="$3"
+    echo "[7b-fsdp] launch rank=${rank} physical_gpu=${gpu} log=${log}"
+    CUDA_VISIBLE_DEVICES="$gpu" \
+    RANK="$rank" \
+    LOCAL_RANK=0 \
+    WORLD_SIZE="$NRANK" \
+    LOCAL_WORLD_SIZE=1 \
+    MASTER_ADDR="$MASTER_ADDR" \
+    MASTER_PORT="$MASTER_PORT" \
+    PYTHONUNBUFFERED=1 \
+    "$PYTHON_BIN" -u -m scripts.train_caspo \
+        --config "$BASE_CONFIG" \
+        "${OVERRIDES[@]}" \
+        "${EXTRA_OVERRIDES[@]}" \
+        > "$log" 2>&1 &
+    PIDS+=("$!")
+}
 
-CUDA_VISIBLE_DEVICES="$GPU_CSV" "$PYTHON_BIN" -u -m torch.distributed.run \
-    --standalone \
-    --nnodes=1 \
-    --nproc_per_node="$NRANK" \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    -m scripts.train_caspo \
-    --config "$BASE_CONFIG" \
-    "${COMMON_OVERRIDES[@]}" \
-    "${EXTRA_OVERRIDES[@]}" \
-    > "$LOG" 2>&1
+for ((i=0; i<NRANK; i++)); do
+    LOG_RANK="$LOGDIR/phase2_${RUN_METHOD_TAG}_rank${i}.log"
+    launch_rank "$i" "${GPUS[$i]}" "$LOG_RANK"
+done
 
-echo "[7b-fsdp] DONE ${RUN_METHOD_TAG} - log=${LOG}"
+remaining=${#PIDS[@]}
+while (( remaining > 0 )); do
+    if wait -n; then
+        remaining=$((remaining - 1))
+    else
+        status=$?
+        echo "[7b-fsdp] ERROR: rank process failed with status ${status}"
+        for pid in "${PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        wait || true
+        echo "[7b-fsdp] rank logs in: $LOGDIR"
+        exit "$status"
+    fi
+done
+
+trap - INT TERM
+echo "[7b-fsdp] DONE ${RUN_METHOD_TAG}"

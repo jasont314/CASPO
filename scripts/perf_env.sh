@@ -36,6 +36,21 @@ export PYTHONUNBUFFERED=1
 export VLLM_NO_USAGE_STATS=1
 export VLLM_LOGGING_LEVEL=WARNING
 
+# vLLM EngineCore subprocess start method. Default is "fork", which makes the
+# child inherit torch.distributed state (TCPStore connections, NCCL groups)
+# from the parent. When the parent is FSDP/DDP-wrapped, the child's
+# init_distributed_environment for its rank-local TP=1 process group
+# collides with the inherited state and hangs on TCPStore client validation
+# (observed: 600 s timeout on 127.0.0.1:<port>). "spawn" gives the
+# EngineCore a clean Python+libtorch state. Required for FSDP+vLLM
+# colocated on the same rank.
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# vLLM IPC handle serialization through the EngineCore control channel.
+# Required for our IPC weight-sync path; without it vLLM rejects the
+# pickle-based collective_rpc with a security error.
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+
 # Suppress HF "you may want to upgrade" / config advisory noise.
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 

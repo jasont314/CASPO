@@ -174,8 +174,31 @@ class VLLMRolloutEngine:
                 os.environ["CUDA_VISIBLE_DEVICES"] = visible[gpu_idx]
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-            for key in dist_env_keys:
+            # vLLM EngineCore unconditionally calls init_distributed_environment
+            # even at TP=1. Inheriting torchrun's MASTER_ADDR/MASTER_PORT makes
+            # the EngineCore try to join the trainer's rendezvous (timeouts /
+            # RuntimeError). Override to a per-rank-local TCP store on
+            # 127.0.0.1:<unique port>, world_size=1, rank=0. The port is
+            # offset by gpu_idx to avoid collisions when multiple ranks
+            # share a host. Saved values are restored after engine init.
+            base_port = 41000
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(base_port + gpu_idx)
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["LOCAL_WORLD_SIZE"] = "1"
+            for key in ("GROUP_RANK", "ROLE_RANK", "ROLE_WORLD_SIZE"):
                 os.environ.pop(key, None)
+            # vLLM picks its TCP-store host via VLLM_HOST_IP, falling back
+            # to socket.gethostbyname(socket.gethostname()) which resolves
+            # to the machine's external IP (e.g., 10.128.0.20). On a
+            # multi-rank trainer that means each rank's EngineCore tries
+            # to connect to the same external IP — torch.distributed
+            # creates a duplicate-master collision and times out. Force
+            # 127.0.0.1 so each rank gets its own loopback TCPStore.
+            prev_dist_env["VLLM_HOST_IP"] = os.environ.get("VLLM_HOST_IP")
+            os.environ["VLLM_HOST_IP"] = "127.0.0.1"
         if self._weight_sync_backend == "ipc":
             # vLLM's IPC update API serializes CUDA IPC handles through the
             # EngineCore control channel. This is local-process-only for our
