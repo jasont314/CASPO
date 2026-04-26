@@ -78,18 +78,24 @@ $\mathcal{O}(1)$ forward passes per response rather than $\mathcal{O}(K \cdot
 \text{steps})$ generations, and online updates of $V_\phi$ during policy
 training mitigate distribution shift.
 
-\paragraph{Contributions.} We contribute (i) \caspo{}: a method that drops
-\vineppo{}'s prefix MC step in favor of an \ipvrm{}-style prefix value model,
-including the step-TD construction and an online update path with ADB and DLW
-corrections; (ii) a unified comparison stack that implements \ppo{},
-\grpo{}, \vineppo{}, and \caspo{} under one trainer, one verifier, and one
-rollout engine, controlling everything except the algorithmic credit-signal
-choice; (iii) a CASPO advantage-transform ablation that probes the role of the
-prefix-value parameterization; (iv) a frozen-RM \caspo{} ablation that turns
-off the online value update; and (v) implementation infrastructure for
-full-finetune 7B-scale RL with FSDP-sharded trainer and rank-local vLLM
-generation, including a CUDA-IPC weight-sync path that is collective with
-\texttt{summon\_full\_params}.
+\paragraph{Contributions.} We contribute:
+(i) \caspo{}: a method that drops \vineppo{}'s prefix Monte Carlo step in
+favor of an \ipvrm{}-style learned prefix value model, including the step-TD
+construction and an online update path with ADB and DLW corrections;
+(ii) a family of three principled step-TD advantage formulations
+(\emph{value}, \emph{prob}, \emph{logprob}) derived from the Bradley--Terry
+interpretation of $V_\phi$ under the IPVRM BCE loss, each operating on a
+different scale of the prefix value (raw cumulative log-ratio, implied
+correctness probability, or its log) and motivated by a different
+bias--variance regime;
+(iii) a frozen reward-model variant (\caspo{}-frozen-RM) that disables online
+value updates and isolates the cost/benefit of online value drift correction;
+(iv) a unified comparison stack that implements \ppo{}, \grpo{}, \vineppo{},
+and \caspo{} under one trainer, one verifier, and one rollout engine,
+controlling everything except the algorithmic credit-signal choice; and
+(v) implementation infrastructure for full-finetune 7B-scale RL with
+FSDP-sharded trainer and rank-local vLLM generation, including a CUDA-IPC
+weight-sync path that is collective with \texttt{summon\_full\_params}.
 
 \paragraph{Implementation provenance.} The codebase is an adaptation and
 extension of the public \vineppo{} setup \citep{vineppo2024,vineppocode}. The
@@ -273,14 +279,14 @@ or all-incorrect.
 The online value learning rate is set to $10^{-6}$, an order of magnitude
 below the offline rate to control drift.
 
-\subsection{Advantage-transform ablation}
+\subsection{Three step-TD advantage formulations from $V_\phi$}
 \label{sec:transforms}
 
-A subtle modeling choice in \caspo{} is \emph{which} statistic of $V_\phi$
-should enter the step-TD difference. The three natural choices arise from
-how the IPVRM loss \eqref{eq:ipvrmloss} parameterizes correctness. Recall
-that the BCE margin loss treats $V_\phi$ as a Bradley--Terry score: the
-implied per-prefix correctness probability is
+A central modeling choice in \caspo{} is \emph{which} statistic of $V_\phi$
+enters the step-TD difference. We derive and propose three principled
+formulations from how the IPVRM loss \eqref{eq:ipvrmloss} parameterizes
+correctness. Recall that the BCE margin loss treats $V_\phi$ as a
+Bradley--Terry score: the implied per-prefix correctness probability is
 \begin{equation}
 \label{eq:ptilde}
 \widetilde{p}(s_t) \;\triangleq\; \sigma(V_\phi(s_t)) \;\approx\; \mathbb{P}\!\left[R(x,y)=1 \mid s_t\right],
@@ -290,8 +296,9 @@ natural way to convert an unbounded cumulative-log-ratio score into a
 calibrated probability, and it is the quantity the BCE objective directly
 optimizes.
 
-Given this, the step-TD advantage in \eqref{eq:adv} can be computed on three
-different scales:
+Equation~\eqref{eq:adv} is then well-defined on three distinct scales of
+$V_\phi$, each with a different statistical interpretation. We propose all
+three as named formulations of \caspo{}:
 
 \begin{description}
 \item[\emph{value}] (raw cumulative log-ratio):
@@ -355,18 +362,29 @@ a smooth interpolation between \emph{value} (linear in the negative regime)
 and \emph{prob} (bounded above).
 \end{itemize}
 
-\paragraph{When each variant should help.}
-If $V_\phi$ is well-calibrated as a Bradley--Terry score, \emph{prob} is the
-mathematically natural choice and admits a clean expected-reward
-interpretation. If $V_\phi$ is well-trained but operates over a wide
-log-ratio range that the BCE objective does not directly bound, \emph{value}
-preserves more of the underlying signal but pays in variance. \emph{logprob}
-is a middle ground: it preserves linear sensitivity in the negative tail
-(where most gradient signal lives early in training) while compressing the
-positive tail (where over-confident prefixes would otherwise dominate the
-batch). Section~\ref{sec:results} reports the three variants on MATH-500
-pass@$16$ to determine which scale matches the empirical
-calibration of $V_\phi$ best for our setup.
+\paragraph{When each formulation is preferable.}
+The three formulations are not interchangeable: each is the principled
+choice under a different calibration regime of $V_\phi$.
+\emph{prob} (\eqref{eq:advP}) is the natural statistical match when $V_\phi$
+is well-calibrated as a Bradley--Terry score, and admits a clean
+expected-terminal-reward interpretation $A^P(s_t) = r_t + \gamma\,
+\mathbb{E}[R \mid s_{t+1}] - \mathbb{E}[R \mid s_t]$ via
+\eqref{eq:ptilde}.
+\emph{value} (\eqref{eq:advV}) is preferred when $V_\phi$ has wide log-ratio
+dynamic range that the BCE objective does not directly bound, in which case
+operating on $\sigma(V_\phi)$ would discard signal at the saturation tails;
+the price is heavier-tailed advantages, controlled in our setup by
+$\pm 3$ standardized clipping.
+\emph{logprob} (\eqref{eq:advLP}) provides a smooth interpolation: it
+preserves linear sensitivity in the negative-$V_\phi$ regime (where most
+gradient signal lives early in training, when the policy is still mostly
+off-distribution) and softly compresses the positive-$V_\phi$ regime
+(where over-confident prefixes would otherwise dominate the batch). It also
+matches the information-theoretic scale of the underlying token logits used
+in the PPO ratio $\rho_t(\theta)$, which is a desirable invariance property
+under reparameterization of $\pi_\phi$.
+We treat these three as a contributed family of step-TD formulations and
+report all three on MATH-500 pass@$16$ in Section~\ref{sec:results}.
 
 \subsection{Step advantage normalization and clipping}
 Let $\mathcal{A} = \{A(s_t)\}$ over all valid step boundaries in the outer
@@ -405,10 +423,12 @@ $G=8$.
 \item[\vineppo{}] $K=9$ Monte Carlo continuations from each non-terminal step
 boundary; step-TD advantages.
 \item[\caspo{}] \ipvrm{} prefix value model with online updates; step-TD
-advantages over $V_\phi$.
+advantages over $V_\phi$. We report all three step-TD formulations from
+Section~\ref{sec:transforms} (\caspo{}-\emph{value}, \caspo{}-\emph{prob},
+\caspo{}-\emph{logprob}) as separate runs, and a fourth variant
+\caspo{}-frozen-RM that uses the \emph{value} formulation but disables
+online updates of $V_\phi$ during policy training.
 \end{description}
-We additionally report two \caspo{} ablations: \emph{advantage-transform
-prob/logprob} and \emph{frozen-RM} (no online value updates).
 
 \subsection{Hyperparameters}
 All four methods share the same PPO infrastructure. Table~\ref{tab:hp}
@@ -491,9 +511,12 @@ method per scale).
 \item Training curves on MATH-500 sample evaluation at \texttt{step\_250},
 \texttt{step\_500}, \texttt{step\_750}, and \texttt{final}, summarizing
 sample efficiency.
-\item \caspo{} advantage-transform ablation (\emph{value} vs.\ \emph{prob} vs.\
-\emph{logprob}) on MATH-500 pass@$16$.
-\item \caspo{} frozen-RM ablation (online value updates on/off).
+\item Per-formulation comparison of the three step-TD advantage variants
+(\caspo{}-\emph{value} vs.\ \caspo{}-\emph{prob} vs.\ \caspo{}-\emph{logprob})
+on MATH-500 pass@$16$, mapping the empirical winner to the calibration
+regime predicted in Section~\ref{sec:transforms}.
+\item \caspo{}-frozen-RM vs.\ \caspo{} (default, online value updates on)
+to quantify the contribution of the online update path.
 \item Wall-clock summary: per-method step time, per-method 1500-step ETA,
 and the implied GPU-hour cost of the four-method comparison.
 \end{itemize}
@@ -539,7 +562,9 @@ accuracy/wall-clock trade-off.
 \caspo{}'s online value updates are gated by ADB and DLW corrections, but no
 correction perfectly defends against pathological feedback loops (e.g.\ a
 value head that learns to predict the policy's surface form rather than its
-correctness). The frozen-RM ablation isolates this risk.
+correctness). The \caspo{}-frozen-RM variant in our contributed family
+isolates this risk by holding $V_\phi$ fixed during policy training, at the
+cost of distribution-shift bias.
 
 \paragraph{Segmenter quality.}
 The LaTeX-aware step splitter is a structural heuristic. Manual spot checks
