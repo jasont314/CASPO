@@ -577,6 +577,17 @@ class CASPOTrainer:
     ) -> None:
         """Save policy weights, handling FSDP full-state gathering when needed."""
 
+        def _raise_if_save_failed(error_msg: Optional[str]) -> None:
+            if self.dist.is_distributed:
+                import torch.distributed as dist
+
+                if dist.is_available() and dist.is_initialized():
+                    payload: list[Optional[str]] = [error_msg if self.dist.is_main else None]
+                    dist.broadcast_object_list(payload, src=0)
+                    error_msg = payload[0]
+            if error_msg:
+                raise RuntimeError(f"save_pretrained failed at {path}: {error_msg}")
+
         if _is_fsdp_module(self.model):
             from torch.distributed.fsdp import (
                 FullStateDictConfig,
@@ -591,23 +602,35 @@ class CASPOTrainer:
                 state_dict = self.model.state_dict()
 
             if self.dist.is_main:
-                os.makedirs(path, exist_ok=True)
-                _unwrap_fsdp(self.model).save_pretrained(
-                    path,
-                    state_dict=state_dict,
-                    safe_serialization=safe_serialization,
-                )
-                if save_tokenizer:
-                    self.tokenizer.save_pretrained(path)
-            dist_barrier()
+                error_msg = None
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    _unwrap_fsdp(self.model).save_pretrained(
+                        path,
+                        state_dict=state_dict,
+                        safe_serialization=safe_serialization,
+                    )
+                    if save_tokenizer:
+                        self.tokenizer.save_pretrained(path)
+                except Exception as e:  # noqa: BLE001
+                    error_msg = f"{type(e).__name__}: {e}"
+            else:
+                error_msg = None
+            _raise_if_save_failed(error_msg)
             return
 
         if self.dist.is_main:
-            os.makedirs(path, exist_ok=True)
-            self.model.save_pretrained(path, safe_serialization=safe_serialization)
-            if save_tokenizer:
-                self.tokenizer.save_pretrained(path)
-        dist_barrier()
+            error_msg = None
+            try:
+                os.makedirs(path, exist_ok=True)
+                self.model.save_pretrained(path, safe_serialization=safe_serialization)
+                if save_tokenizer:
+                    self.tokenizer.save_pretrained(path)
+            except Exception as e:  # noqa: BLE001
+                error_msg = f"{type(e).__name__}: {e}"
+        else:
+            error_msg = None
+        _raise_if_save_failed(error_msg)
 
     def _auto_run_name(self) -> str:
         cfg = self.cfg
@@ -1482,18 +1505,30 @@ class CASPOTrainer:
         cfg = self.cfg
         sub = "final" if final else f"step_{self.global_step}"
         path = os.path.join(cfg.output_dir, sub)
-        try:
-            self._save_policy_pretrained(
-                path, safe_serialization=True, save_tokenizer=True,
-            )
-        except Exception as e:
-            warnings.warn(f"save_pretrained failed at {path}: {e}")
+        self._save_policy_pretrained(
+            path, safe_serialization=True, save_tokenizer=True,
+        )
+        meta_error: Optional[str] = None
         if self.dist.is_main:
-            os.makedirs(path, exist_ok=True)
-            with open(os.path.join(path, "caspo_run_config.json"), "w") as f:
-                json.dump(asdict(cfg), f, indent=2, default=str)
-            with open(os.path.join(path, "step.json"), "w") as f:
-                json.dump({"global_step": self.global_step}, f)
-            print(f"[checkpoint] saved to {path}", flush=True)
+            try:
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, "caspo_run_config.json"), "w") as f:
+                    json.dump(asdict(cfg), f, indent=2, default=str)
+                with open(os.path.join(path, "step.json"), "w") as f:
+                    json.dump({"global_step": self.global_step}, f)
+                print(f"[checkpoint] saved to {path}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                meta_error = f"{type(e).__name__}: {e}"
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                payload: list[Optional[str]] = [
+                    meta_error if self.dist.is_main else None
+                ]
+                dist.broadcast_object_list(payload, src=0)
+                meta_error = payload[0]
+        if meta_error:
+            raise RuntimeError(f"checkpoint metadata write failed at {path}: {meta_error}")
         dist_barrier()
         return path

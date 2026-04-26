@@ -29,6 +29,15 @@ rollout_backend: vllm
 prompts_per_step: 8               # 8 prompts × G=8 = 64 episodes per step
                                   # VinePPO: 512/iter @ 8 epochs/iter ≈ 64 episodes/grad-step
 
+# vLLM runtime. Trainer/ref/value/optimizer share the same 80GB H100 as vLLM
+# for 1B single-GPU runs, so keep the engine below half-memory and use CUDA
+# graphs for higher decode throughput.
+vllm_gpu_memory_utilization: 0.45
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: false
+vllm_max_num_seqs: 256
+vllm_max_inflight_requests: 1024
+
 # step segmentation — VinePPO-faithful LaTeX-aware splitter (ported from
 # their math_extract_steps_inplace.py).
 segmentation_mode: latex_aware

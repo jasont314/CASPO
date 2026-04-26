@@ -49,7 +49,14 @@ REPORT_KEYS: tuple[str, ...] = (
     "grad_accum_steps",
     "vllm_enforce_eager",
     "vllm_multi_sample_mode",
+    "vllm_return_logprobs",
+    "vllm_gpu_memory_utilization",
+    "vllm_max_num_seqs",
+    "vllm_max_inflight_requests",
+    "distributed_backend",
     "save_every",
+    "eval_every",
+    "value_save_every",
 )
 
 

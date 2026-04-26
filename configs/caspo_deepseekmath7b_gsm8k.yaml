@@ -19,6 +19,11 @@ rollout_top_p: 0.9
 rollout_top_k: -1
 value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
 rollout_backend: vllm
+vllm_gpu_memory_utilization: 0.55     # FSDP trainer shards + rank-local vLLM 7B engine share each H100
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: false
+vllm_max_num_seqs: 256
+vllm_max_inflight_requests: 1024
 prompts_per_step: 8
 
 segmentation_mode: latex_aware

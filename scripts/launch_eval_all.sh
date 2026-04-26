@@ -5,6 +5,7 @@
 #
 # Usage:
 #   ./scripts/launch_eval_all.sh
+#   EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 #
 # Each method gets one GPU; runs sequentially per method but parallel across methods.
 
@@ -48,6 +49,12 @@ trap 'echo "[eval] ERR at line $LINENO (rc=$?)"' ERR
 # Headline benchmarks. Skip aime24 / aime25 / amc23 here (too small to be
 # headline numbers); add them for the OOD section in the paper.
 BENCHMARKS="math500,math,collegemath,olympiadbench"
+METHODS=(caspo grpo vineppo ppo)
+IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-4 5 6 7}"
+if (( ${#EVAL_GPUS[@]} < ${#METHODS[@]} )); then
+    echo "[eval] EVAL_GPU_LIST must provide at least ${#METHODS[@]} GPUs; got: ${EVAL_GPU_LIST:-4 5 6 7}" >&2
+    exit 1
+fi
 
 eval_method() {
     local method=$1
@@ -59,7 +66,7 @@ eval_method() {
         echo "[eval] SKIP ${method} — no checkpoint at ${ckpt}"
         return
     fi
-    echo "[eval] ${method} → GPU ${gpu} → ckpt=${ckpt}"
+    echo "[eval] ${method} -> GPU ${gpu} -> ckpt=${ckpt}"
     # python -u for unbuffered output (belt-and-suspenders with PYTHONUNBUFFERED).
     CUDA_VISIBLE_DEVICES="$gpu" nohup "$PYTHON_BIN" -u -m scripts.eval \
         --config configs/caspo_rho1b_math.yaml \
@@ -78,10 +85,9 @@ eval_method() {
     echo "  pid=$pid log=$log"
 }
 
-eval_method caspo   0
-eval_method grpo    1
-eval_method vineppo 2
-eval_method ppo     3
+for i in "${!METHODS[@]}"; do
+    eval_method "${METHODS[$i]}" "${EVAL_GPUS[$i]}"
+done
 
 echo "[eval] launched ${#PIDS[@]} job(s); logs in $LOGDIR/"
 echo "[eval] aggregate results live at $ROOT/caspo_rho1b_math_<method>/eval_results.json"

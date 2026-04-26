@@ -69,6 +69,7 @@ _BOOL_FIELDS: tuple[str, ...] = (
     "update_value_during_policy", "use_adb", "use_dlw",
     "standardize_step_advantage",
     "vllm_enforce_eager", "vllm_skip_initial_sync",
+    "vllm_return_logprobs",
     "wandb_enabled",
     "compile", "use_gradient_checkpointing",
     "fsdp_auto_wrap", "fsdp_use_orig_params", "fsdp_cpu_offload",
@@ -238,6 +239,10 @@ class CASPOConfig:
     # "auto": try batched once, then fall back to expanded if this runtime has
     # the vLLM V1 n>1 regression.
     vllm_multi_sample_mode: Literal["auto", "expanded", "batched"] = "auto"
+    # Trainer recomputes π_old logprobs with the policy model before PPO, so
+    # vLLM logprobs are optional diagnostics. Keeping them off trims rollout
+    # payload size and decode-side logprob work.
+    vllm_return_logprobs: bool = False
     # Client-side cap on concurrently submitted AsyncLLM requests. This does
     # not change vLLM's scheduler caps; it prevents VinePPO MC batches from
     # creating thousands of live Python async generators at once.

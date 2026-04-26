@@ -31,11 +31,13 @@ rollout_top_k: -1
 rollout_backend: vllm
 value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
 
-# vLLM runtime knobs (7B fp16 weights ≈ 14GB; KV at 5120 tokens fits with 0.85
-# util on a single 80GB GPU — leaves room for trainer + optimizer state).
+# vLLM runtime knobs (7B bf16 weights are ~14GB; KV at 5120 tokens needs
+# explicit headroom because trainer/ref/value/optimizer state share the GPU).
 vllm_gpu_memory_utilization: 0.55     # trainer + V_φ + ref + optimizer share GPU
 vllm_tensor_parallel_size: 1
 vllm_enforce_eager: true              # avoid CUDA-graph compile cost on weight-sync churn
+vllm_max_num_seqs: 256
+vllm_max_inflight_requests: 1024
 
 # step segmentation — latex-aware splitter (port of VinePPO's
 # math_extract_steps_inplace.py). Required for DeepScaleR-style problems

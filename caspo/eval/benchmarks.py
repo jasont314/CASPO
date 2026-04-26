@@ -361,8 +361,19 @@ def evaluate_vllm(
     # Some tokenizers (custom code-LM checkpoints, ad-hoc fast tokenizers)
     # report ``eos_token_id is None``. Don't crash here — just omit the
     # explicit stop token; vLLM will still cap generation at max_tokens.
+    stop_ids: set[int] = set()
     eos_id = getattr(tokenizer, "eos_token_id", None)
-    stop_token_ids = [int(eos_id)] if eos_id is not None else []
+    if eos_id is not None:
+        stop_ids.add(int(eos_id))
+    for attr in ("eos_token_ids", "additional_eos_token_ids"):
+        extra = getattr(tokenizer, attr, None)
+        if extra:
+            try:
+                for t in extra:
+                    stop_ids.add(int(t))
+            except TypeError:
+                pass
+    stop_token_ids = sorted(stop_ids)
     sp = SamplingParams(
         n=1,
         temperature=float(temperature),
@@ -393,6 +404,12 @@ def evaluate_vllm(
                 async for out in engine.generate(prompt=prompt, sampling_params=sp, request_id=request_id):
                     final = out
             except Exception:
+                try:
+                    abort = engine.abort(request_id)
+                    if hasattr(abort, "__await__"):
+                        await abort
+                except Exception:
+                    pass
                 return None
             return final
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Auto-chain CASPO phases:
 #   1. wait for phase 1a (collect) to finish — signal: value_data.pt exists
-#   2. launch phase 1b (V_φ training) on VALUE_GPU (default 0)
+#   2. launch phase 1b (V_phi training) on VALUE_GPU (default 4)
 #   3. wait for phase 1b to finish — signal: final/ exists with caspo_value_meta.json
-#   4. launch CASPO RL (phase 2) on CASPO_GPU (default 3)
+#   4. launch CASPO RL (phase 2) on CASPO_GPU (default 7)
 #
 # Ignores GRPO/VinePPO which were launched separately on GPUs 1-2.
 #
@@ -19,8 +19,8 @@ cd "$(dirname "$0")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-VALUE_GPU="${VALUE_GPU:-0}"
-CASPO_GPU="${CASPO_GPU:-3}"
+VALUE_GPU="${VALUE_GPU:-4}"
+CASPO_GPU="${CASPO_GPU:-7}"
 trap 'echo "[chain] ERR at line $LINENO (rc=$?)"' ERR
 
 ROOT=/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math

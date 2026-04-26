@@ -104,6 +104,49 @@ def test_vllm_parallel_sampling_batched_mode_raises_on_mismatch():
         )
 
 
+def test_vllm_parallel_sampling_auto_fallback_on_exception():
+    """Auto mode should also disable n>1 after runtime exceptions."""
+    from caspo.rollout.vllm_engine import VLLMRolloutEngine
+
+    engine = object.__new__(VLLMRolloutEngine)
+    engine._multi_sample_mode = "auto"
+    engine._parallel_sampling_supported = None
+    engine._parallel_sampling_warned = False
+
+    assert engine._can_try_parallel_sampling(4)
+    with pytest.warns(UserWarning):
+        assert engine._parallel_sampling_exception(
+            context="unit", expected=4, error=RuntimeError("boom"),
+        )
+    assert engine._parallel_sampling_supported is False
+    assert not engine._can_try_parallel_sampling(4)
+
+
+def test_vllm_response_mask_uses_lengths_when_pad_equals_eos():
+    """Padded EOS tokens must not be counted as generated tokens."""
+    from caspo.rollout.vllm_engine import VLLMRolloutEngine
+
+    eos = 2
+    response_ids = torch.tensor([
+        [10, eos, eos, eos],
+        [11, 12, 13, eos],
+        [eos, eos, eos, eos],
+    ])
+
+    mask = VLLMRolloutEngine._build_response_mask(
+        response_ids,
+        eos_id=eos,
+        pad_id=eos,
+        lengths=[2, 3, 0],
+    )
+
+    assert mask.tolist() == [
+        [1, 1, 0, 0],
+        [1, 1, 1, 0],
+        [0, 0, 0, 0],
+    ]
+
+
 @pytest.mark.slow
 def test_vllm_engine_sample_shapes():
     """End-to-end sample call returns shapes consistent with HFRolloutSampler."""

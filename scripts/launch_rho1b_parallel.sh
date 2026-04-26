@@ -27,7 +27,7 @@ BASE_CONFIG=configs/caspo_rho1b_math.yaml
 LOGDIR="$ROOT/caspo_rho1b_math/logs"
 mkdir -p "$LOGDIR"
 PIDS=()
-read -r -a GPUS <<< "${GPU_LIST:-3 0 1 2}"
+read -r -a GPUS <<< "${GPU_LIST:-4 5 6 7}"
 if (( ${#GPUS[@]} < 4 )); then
     echo "[launch] ERROR: GPU_LIST must contain at least 4 GPU ids; got: ${GPU_LIST:-}"
     exit 2
