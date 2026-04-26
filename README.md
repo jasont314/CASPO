@@ -151,6 +151,72 @@ The YAML still documents VinePPO's original save cadence, but the production
 launcher overrides `save_every=250` so each method writes four checkpoints total
 for a 1000-step run.
 
+## Exact Models And Data
+
+All current standard runs use the same base policy, tokenizer, RL prompt set,
+prompt format, verifier, and eval suite unless explicitly overridden.
+
+Training/RL policy model:
+
+```text
+realtreetune/rho-1b-sft-MATH
+```
+
+The tokenizer defaults to the same path as the policy model/checkpoint unless a
+checkpoint directory supplies its own tokenizer files.
+
+RL prompt data:
+
+```text
+DigitalLearningGmbH/MATH-lighteval
+split: train
+question field: problem
+prompt template: [MATH_TASK] Problem:\n{query}\n\nSolution:
+```
+
+During RL, each outer step samples 64 prompts and generates 8 responses per
+prompt, for 512 responses per step. Rollout sampling uses temperature `0.6`,
+top-p `0.9`, top-k disabled, and max response length `1024`.
+
+Phase-1 IPVRM value data artifact:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_data.pt
+```
+
+Current IPVRM prefix value checkpoint used by CASPO:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
+```
+
+This is a symlink to the trained value checkpoint directory:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/final
+```
+
+Standard final eval suite:
+
+| Eval name | Dataset | Split/config | Default size |
+|---|---|---|---:|
+| `math500` | `HuggingFaceH4/MATH-500` | `test` | 500 |
+| `math` | `DigitalLearningGmbH/MATH-lighteval` | `test` | full test |
+| `collegemath` | `realtreetune/college_math` | `test` | 500-problem default limit |
+| `olympiadbench` | `Hothan/OlympiadBench` | `OE_TO_maths_en_COMP`, `train` | 674 |
+
+Standard method output roots for `RUN_TAG=paper512_seed0`:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_grpo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_ppo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_vineppo_ddp2_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_prob_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_logprob_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_frozen_rm_paper512_seed0
+```
+
 ## Value Model
 
 CASPO uses an IPVRM-style prefix value model:
