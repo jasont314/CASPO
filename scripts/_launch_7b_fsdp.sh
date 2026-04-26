@@ -66,11 +66,16 @@ CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-$DEFAULT_A
 CASPO_USE_GRADIENT_CHECKPOINTING="${CASPO_USE_GRADIENT_CHECKPOINTING:-${USE_GRADIENT_CHECKPOINTING:-true}}"
 CASPO_FSDP_CPU_OFFLOAD="${CASPO_FSDP_CPU_OFFLOAD:-${FSDP_CPU_OFFLOAD:-false}}"
 CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
-PROMPTS_PER_STEP_VAL="${PROMPTS_PER_STEP:-8}"
+# Logprob micro-batch for the no-grad rescore + ref-logprob passes.
+# Default 8: bigger than mb=2 (the trainable forward) because there's no
+# autograd graph to keep, so larger forwards amortize python/launch
+# overhead. Verified at rho-1B DDP-2 (=16 there). Override via env.
+CASPO_LOGPROB_MICRO_BATCH_SIZE="${CASPO_LOGPROB_MICRO_BATCH_SIZE:-${LOGPROB_MICRO_BATCH_SIZE:-8}}"
+PROMPTS_PER_STEP_VAL="${PROMPTS_PER_STEP:-64}"
 
 unset VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_NUM_SEQS
 unset MICRO_BATCH_SIZE GRAD_ACCUM_STEPS USE_GRADIENT_CHECKPOINTING
-unset FSDP_CPU_OFFLOAD REWARD_WORKERS PROMPTS_PER_STEP
+unset FSDP_CPU_OFFLOAD REWARD_WORKERS PROMPTS_PER_STEP LOGPROB_MICRO_BATCH_SIZE
 
 OVERRIDES=(
     --override "method=${METHOD}"
@@ -87,6 +92,7 @@ OVERRIDES=(
     --override "micro_batch_size=${CASPO_MICRO_BATCH_SIZE}"
     --override "grad_accum_steps=${CASPO_GRAD_ACCUM_STEPS}"
     --override "use_gradient_checkpointing=${CASPO_USE_GRADIENT_CHECKPOINTING}"
+    --override "logprob_micro_batch_size=${CASPO_LOGPROB_MICRO_BATCH_SIZE}"
     --override "prompts_per_step=${PROMPTS_PER_STEP_VAL}"
     --override "reward_workers=${CASPO_REWARD_WORKERS}"
     --override "save_every=${SAVE_EVERY:-250}"
