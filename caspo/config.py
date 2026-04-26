@@ -496,12 +496,6 @@ class CASPOConfig:
                 "per process (vllm_tensor_parallel_size=1)."
             )
         if self.vllm_weight_sync_backend == "ipc":
-            if self.distributed_backend == "fsdp":
-                raise ValueError(
-                    "vllm_weight_sync_backend='ipc' is only supported for the "
-                    "single-process or DDP replicated trainer. Use checkpoint "
-                    "sync for FSDP until NCCL weight sync is implemented."
-                )
             if self.vllm_tensor_parallel_size != 1:
                 raise ValueError(
                     "vllm_weight_sync_backend='ipc' requires "

@@ -816,6 +816,56 @@ class CASPOTrainer:
             warnings.warn(f"wandb.log failed: {e}")
 
     @torch.no_grad()
+    def _sync_vllm_weights_fsdp(self) -> float:
+        """IPC sync from an FSDP-wrapped policy to the rank-local vLLM engine.
+
+        Collective requirement: ``FSDP.summon_full_params`` is a collective op,
+        so EVERY rank must enter this function (do NOT gate by rank). With
+        ``rank0_only=False`` each rank temporarily materializes the unsharded
+        parameters on its own GPU; this is necessary because each rank also
+        runs its own vLLM EngineCore that consumes the full weights.
+        Memory cost is roughly +param_bytes per rank for the duration of the
+        ``with`` block (~14 GB for a 7B bf16 model), so callers must ensure no
+        other large allocations are live at the same time.
+
+        We clone each parameter inside the context to detach it from FSDP's
+        flat-buffer storage. Otherwise the ``param.data`` view points into a
+        buffer that FSDP frees on context exit, while vLLM may still be
+        holding the IPC handle. The clone keeps the underlying CUDA allocation
+        alive until ``self.sampler._ipc_weight_keepalive`` is cleared at the
+        end of ``sync_weights_from_model``.
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        t0 = time.time()
+        with FSDP.summon_full_params(self.model, writeback=False, with_grads=False):
+            # Detach from FSDP's flat-param storage by cloning into a fresh
+            # contiguous bf16/fp16/fp32 tensor that the IPC keepalive can pin.
+            base = _unwrap_parallel(self.model)
+            full_params = torch.nn.ParameterList()  # noqa: F841 (unused)
+            # Use a lightweight nn.Module with identical named_parameters() so
+            # the existing IPC kernel (which iterates ``model.named_parameters()``)
+            # works unchanged.
+            class _NamedParamsView(torch.nn.Module):
+                def __init__(self, named: list[tuple[str, torch.Tensor]]):
+                    super().__init__()
+                    self._cloned: list[tuple[str, torch.Tensor]] = named
+
+                def named_parameters(self, *_, **__):  # type: ignore[override]
+                    for name, t in self._cloned:
+                        yield name, t
+
+            cloned: list[tuple[str, torch.Tensor]] = []
+            for name, p in base.named_parameters():
+                cloned.append((name, p.detach().contiguous().clone()))
+            view = _NamedParamsView(cloned)
+            # All ranks push to their rank-local vLLM EngineCore. The IPC
+            # handles are within-device (trainer rank N and vLLM rank N share
+            # one CUDA device), so cudaIpcOpenMemHandle is valid.
+            self.sampler.sync_weights_from_model(view)
+        return time.time() - t0
+
+    @torch.no_grad()
     def _sync_vllm_weights(self) -> float:
         """Save the current policy and push it to the vLLM engine. Returns wall time."""
         if self._sync_dir is None or not hasattr(self.sampler, "sync_weights_from_path"):
@@ -825,11 +875,7 @@ class CASPOTrainer:
             and hasattr(self.sampler, "sync_weights_from_model")
         ):
             if _is_fsdp_module(self.model):
-                raise RuntimeError(
-                    "vllm_weight_sync_backend='ipc' is only implemented for "
-                    "single-process, unsharded trainers. Use checkpoint sync "
-                    "or implement NCCL sync for FSDP."
-                )
+                return self._sync_vllm_weights_fsdp()
             return self.sampler.sync_weights_from_model(_unwrap_parallel(self.model))
         t0 = time.time()
         save_tokenizer = not self._sync_tokenizer_saved

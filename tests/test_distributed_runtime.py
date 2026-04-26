@@ -49,13 +49,16 @@ def test_fsdp_vllm_rank_local_config_is_valid():
     assert cfg.rollout_backend == "vllm"
 
 
-def test_ipc_weight_sync_rejects_fsdp_rank_local_vllm():
-    with pytest.raises(ValueError, match="DDP replicated trainer"):
-        CASPOConfig(
-            distributed_backend="fsdp",
-            rollout_backend="vllm",
-            vllm_weight_sync_backend="ipc",
-        )
+def test_ipc_weight_sync_accepts_fsdp_rank_local_vllm():
+    """FSDP + IPC is now supported via summon_full_params (rank-local vLLM)."""
+    cfg = CASPOConfig(
+        distributed_backend="fsdp",
+        rollout_backend="vllm",
+        vllm_weight_sync_backend="ipc",
+        vllm_tensor_parallel_size=1,
+    )
+    assert cfg.distributed_backend == "fsdp"
+    assert cfg.vllm_weight_sync_backend == "ipc"
 
     with pytest.raises(ValueError, match="vllm_tensor_parallel_size=1"):
         CASPOConfig(

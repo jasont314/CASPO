@@ -1,9 +1,18 @@
 # CASPO on DeepSeekMath-7B-MATH — matches VinePPO setup for direct
 # comparison against their published numbers on the 7B scale.
-# Inherits everything from caspo_rho1b_math.yaml; only the SFT init changes.
+#
+# Trainer: FSDP=4 (full_shard) on 4 H100s, vLLM colocated rank-local.
+# Default settings target the 4-GPU layout for PPO/GRPO/CASPO/CASPO-frozen-RM.
+# VinePPO uses an 8-GPU launcher (see scripts/launch_7b_vineppo.sh) since
+# K=9 MC continuations per step boundary at 7B is the heaviest workload.
+#
+# Effective PPO minibatch is preserved at 64 (paper-faithful):
+#   global = world_size × micro_batch_size × grad_accum_steps
+#          = 4 × 1 × 16 = 64
+# For VinePPO 8-GPU set GRAD_ACCUM_STEPS=8 (8 × 1 × 8 = 64).
 model_name_or_path: realtreetune/deepseekmath-7b-sft-MATH-v2
 torch_dtype: bfloat16
-attn_implementation: flash_attention_2
+attn_implementation: flash_attention_3
 trust_remote_code: false
 
 dataset_name: DigitalLearningGmbH/MATH-lighteval
@@ -21,12 +30,23 @@ rollout_top_p: 0.9
 rollout_top_k: -1
 value_data_temperature: 1.0          # IPVRM phase-1 uses temp 1.0 for diversity (paper §C)
 rollout_backend: vllm
-vllm_gpu_memory_utilization: 0.55     # FSDP trainer shards + rank-local vLLM 7B engine share each H100
+vllm_gpu_memory_utilization: 0.30    # tighter than rho-1B because each rank carries 14 GB ref + 14 GB sharded opt
 vllm_tensor_parallel_size: 1
 vllm_enforce_eager: false
 vllm_max_num_seqs: 256
 vllm_max_inflight_requests: 1024
-prompts_per_step: 8
+vllm_weight_sync_backend: ipc        # FSDP-aware IPC sync (summon_full_params + per-rank push)
+prompts_per_step: 8                  # paper-faithful: 8 × G=8 = 64 episodes / outer step
+
+# FSDP — required for 7B full-finetune.
+distributed_backend: fsdp
+fsdp_sharding_strategy: full_shard
+fsdp_use_orig_params: true
+fsdp_auto_wrap: true
+fsdp_cpu_offload: false              # try false first; flip to true if OOM under pressure
+fsdp_forward_prefetch: true
+fsdp_limit_all_gathers: true
+fsdp_backward_prefetch: backward_pre
 
 segmentation_mode: latex_aware
 step_delimiter: "\n"
@@ -57,6 +77,7 @@ adb_dlw_eps: 0.05
 gamma: 1.0
 standardize_step_advantage: true
 standardize_advantage_scope: batch
+advantage_clip: 3.0
 
 clip_eps_low: 0.20
 clip_eps_high: 0.20
@@ -72,15 +93,17 @@ weight_decay: 0.0
 warmup_steps: 60
 grad_clip: 1.0
 micro_batch_size: 1
-grad_accum_steps: 64              # 8 prompts × G=8 = 64 episodes / mb=1 → accum=64 → effective batch 64
+grad_accum_steps: 16              # FSDP=4: 4 ranks × 1 mb × 16 accum = 64-episode global minibatch
 epochs_per_rollout: 2
-max_steps: 1500                   # was 1000. Modest extension; 7B trains slowly per wall-clock,
-                                  # so 1.5x is the cap before each run becomes prohibitive.
+max_steps: 1500                   # was 1000. Modest extension; 7B trains slowly per wall-clock.
 seed: 0
 log_every: 1
 save_every: 40
 eval_every: 40
 
+reward_workers: 4
+gt_cache_max_size: 8192
+compile: false                    # known unusable on this stack — see README
+
 device: cuda
-compile: false
-use_gradient_checkpointing: true
+use_gradient_checkpointing: true  # required at 7B; activations would otherwise OOM
