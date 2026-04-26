@@ -969,6 +969,8 @@ at 7B is the heaviest workload in the stack.
 | **mb=2, accum=8, ckpt=true, util=0.30** | **~30 s** | Winning default |
 | mb=4, accum=4, ckpt=true, util=0.30 | hangs | Silent OOM on rank 0 |
 | mb=4, accum=4, ckpt=true, util=0.30 + fsdp_cpu_offload=true | ~76 s | CPU↔GPU dominates |
+| mb=2, accum=8, ckpt=false, util=0.30 | OOM at vLLM init | Activations claim trainer headroom; vLLM can't claim 24 GB for KV |
+| mb=2, accum=8, ckpt=true, util=0.40 | ~33 s | vLLM not the bottleneck above ~0.30 |
 
 mb=2 is 25-27% faster than mb=1 with no memory or stability issues.
 Global PPO minibatch stays 64 (FSDP=4 × mb=2 × accum=8).
