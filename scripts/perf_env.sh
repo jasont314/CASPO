@@ -22,8 +22,27 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1800
 
-# Only matters for HPC tensor-parallel setups; harmless at TP=1.
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+# NOTE: CUDA_DEVICE_MAX_CONNECTIONS=1 was previously set here. Removed
+# because it serializes CUDA work-issue across streams and demonstrably
+# hurts FSDP's compute/comm overlap on H100 (PyTorch issue #110155 and
+# follow-ups). The "harmless at TP=1" justification was wrong for FSDP —
+# FSDP relies on multiple streams to overlap reduce-scatter / all-gather
+# with backward compute. Leave the variable unset so PyTorch picks the
+# multi-connection default (typically 8).
+#
+# NCCL knobs targeting H100 / NVLink-SHARP topology. NVLink SHARP (NVLS)
+# offloads reduce-scatter / all-reduce reductions to the NVSwitch ASIC,
+# cutting per-collective wire bytes roughly in half on hopper-class boxes;
+# safe to enable when the switch supports it (NCCL silently falls back if
+# it does not). NCHANNELS / NTHREADS / BUFFSIZE bumps give NCCL more
+# parallelism and bigger pipelined chunks, which empirically helps the
+# many-small-collective profile FSDP produces. None of these are
+# correctness-affecting; remove if you observe regressions on a non-H100
+# host.
+export NCCL_NVLS_ENABLE=1
+export NCCL_MIN_NCHANNELS=8
+export NCCL_NTHREADS=512
+export NCCL_BUFFSIZE=8388608  # 8 MiB transport buffer
 
 # HF tokenizers: silence the fork-after-parallelism warning we hit on every
 # DataLoader spawn. We pay the (negligible) single-thread tokenization cost.

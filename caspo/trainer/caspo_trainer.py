@@ -231,6 +231,94 @@ def _unwrap_parallel(module: torch.nn.Module) -> torch.nn.Module:
     return module
 
 
+def _resolve_ac_mode(cfg: CASPOConfig) -> str:
+    """Pick between cfg.activation_checkpointing_mode and the legacy bool.
+
+    ``activation_checkpointing_mode`` defaults to ``"off"``; when the user
+    leaves it at the default, fall back to the bool ``use_gradient_checkpointing``
+    (which has been the legacy knob). Any explicit non-"off" value of the new
+    field overrides the bool. This preserves every existing config's behaviour
+    while letting selective AC opt-in via the new literal.
+    """
+    mode = getattr(cfg, "activation_checkpointing_mode", "off")
+    if mode != "off":
+        return mode
+    return "full" if cfg.use_gradient_checkpointing else "off"
+
+
+def _apply_activation_checkpointing(
+    model: torch.nn.Module, cfg: CASPOConfig,
+) -> None:
+    """Apply activation checkpointing to ``model`` per cfg.
+
+    * ``"off"`` — leave the model alone (default).
+    * ``"full"`` — call HF's ``gradient_checkpointing_enable()`` (every block
+      recomputes its forward on backward; the legacy default when
+      ``cfg.use_gradient_checkpointing=True``).
+    * ``"selective"`` — wrap only attention submodules with PyTorch's
+      ``apply_activation_checkpointing``. Attention activations are the bulk
+      of the per-layer activation memory but are also FLOPS-cheap to recompute,
+      so this is usually the better point on the memory-vs-throughput curve
+      than ``"full"`` (Megatron's ``recompute_granularity="selective"``).
+    """
+    mode = _resolve_ac_mode(cfg)
+    if mode == "off":
+        return
+    if mode == "full":
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception as e:
+            warnings.warn(f"could not enable gradient checkpointing: {e}")
+        return
+    if mode == "selective":
+        try:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                CheckpointImpl,
+                apply_activation_checkpointing,
+                checkpoint_wrapper,
+            )
+        except ImportError as e:  # pragma: no cover
+            warnings.warn(
+                f"selective activation checkpointing unavailable on this "
+                f"torch build ({e}); falling back to full gradient checkpointing."
+            )
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception as e2:
+                warnings.warn(f"could not enable gradient checkpointing: {e2}")
+            return
+
+        def _is_attention(m: torch.nn.Module) -> bool:
+            return m.__class__.__name__.endswith("Attention")
+
+        non_reentrant = checkpoint_wrapper
+        try:
+            non_reentrant = functools.partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            )
+        except Exception:
+            pass
+
+        try:
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=non_reentrant,
+                check_fn=_is_attention,
+            )
+        except Exception as e:
+            warnings.warn(
+                f"selective AC apply failed ({e}); falling back to full "
+                f"gradient checkpointing."
+            )
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception as e2:
+                warnings.warn(f"could not enable gradient checkpointing: {e2}")
+        return
+    warnings.warn(f"unknown activation_checkpointing_mode={mode!r}; ignoring")
+
+
 class CASPOTrainer:
     """End-to-end RL trainer with ``cfg.method`` dispatch."""
 
@@ -298,11 +386,7 @@ class CASPOTrainer:
             self.model.config.use_cache = False
         except AttributeError:
             pass
-        if cfg.use_gradient_checkpointing:
-            try:
-                self.model.gradient_checkpointing_enable()
-            except Exception as e:
-                warnings.warn(f"could not enable gradient checkpointing: {e}")
+        _apply_activation_checkpointing(self.model, cfg)
 
         self.model.to(self.device)
 
@@ -563,6 +647,7 @@ class CASPOTrainer:
             BackwardPrefetch,
             CPUOffload,
             FullyShardedDataParallel as FSDP,
+            MixedPrecision,
             ShardingStrategy,
         )
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -571,6 +656,7 @@ class CASPOTrainer:
             "full_shard": ShardingStrategy.FULL_SHARD,
             "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
             "no_shard": ShardingStrategy.NO_SHARD,
+            "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
         }
         backward_prefetch_map = {
             "backward_pre": BackwardPrefetch.BACKWARD_PRE,
@@ -591,6 +677,51 @@ class CASPOTrainer:
         if backward_prefetch is not None:
             kwargs["backward_prefetch"] = backward_prefetch
 
+        # ---- MixedPrecision policy ----
+        # Default FSDP keeps reduce_dtype in fp32 even under bf16 params, which
+        # silently doubles the wire bytes for grad reduce-scatter on every
+        # backward — typically the dominant comm cost at 7B/H100 FSDP. Build
+        # an explicit MixedPrecision so param/reduce/buffer dtype all match
+        # the chosen training dtype (or the user's override).
+        compute_dtype = _resolve_dtype(self.cfg.torch_dtype)
+        reduce_name = self.cfg.fsdp_reduce_dtype or self.cfg.torch_dtype
+        reduce_dtype = _resolve_dtype(reduce_name)
+        if compute_dtype != torch.float32:
+            kwargs["mixed_precision"] = MixedPrecision(
+                param_dtype=compute_dtype,
+                reduce_dtype=reduce_dtype,
+                buffer_dtype=compute_dtype,
+            )
+
+        # ---- HYBRID_SHARD device mesh ----
+        # HSDP shards within a small intra-node group and replicates across
+        # nodes/groups. With a (world_size//2, 2) mesh the reduce-scatter and
+        # all-gather hops only cross 2 ranks instead of all-world, cutting
+        # comms ~33% at world=4 and more at larger world sizes. Falls back to
+        # plain FSDP semantics if the world is too small or odd; the validator
+        # in __post_init__ allows the literal but we guard at runtime so a
+        # 2-GPU smoke test still works.
+        if self.cfg.fsdp_sharding_strategy == "hybrid_shard":
+            world_size = int(self.dist.world_size)
+            if world_size >= 4 and world_size % 2 == 0:
+                try:
+                    from torch.distributed.device_mesh import init_device_mesh
+                except ImportError:  # pragma: no cover
+                    from torch.distributed._tensor import (  # type: ignore
+                        init_device_mesh,
+                    )
+                device_mesh = init_device_mesh(
+                    "cuda" if self.device.type == "cuda" else "cpu",
+                    (world_size // 2, 2),
+                )
+                kwargs["device_mesh"] = device_mesh
+            elif self.dist.is_main:
+                warnings.warn(
+                    f"fsdp_sharding_strategy='hybrid_shard' but "
+                    f"world_size={world_size} is < 4 or not divisible by 2; "
+                    f"PyTorch will pick a default replicate-group layout."
+                )
+
         if self.cfg.fsdp_auto_wrap:
             layer_classes = self._infer_fsdp_layer_classes(module)
             if layer_classes:
@@ -609,7 +740,8 @@ class CASPOTrainer:
             print(
                 f"[trainer] FSDP wrapped {module_name} "
                 f"(strategy={self.cfg.fsdp_sharding_strategy}, "
-                f"world_size={self.dist.world_size})",
+                f"world_size={self.dist.world_size}, "
+                f"reduce_dtype={reduce_name})",
                 flush=True,
             )
         return wrapped
@@ -1132,17 +1264,33 @@ class CASPOTrainer:
         """
         cfg = self.cfg
         mb = _configured_logprob_micro_batch_size(cfg)
-        B = prompt_ids.shape[0]
+        B, R_max = response_ids.shape[0], response_ids.shape[1]
+        # Per-microbatch padding trim: skip computing logits for trailing
+        # padding tokens nobody scores. Each chunk is padded back to R_max
+        # before cat so the [B, R_max] contract for callers is unchanged.
         out_chunks: List[torch.Tensor] = []
         was_training = self.model.training
         self.model.eval()
         try:
             for start in range(0, B, mb):
                 end = min(start + mb, B)
+                mb_mask_full = response_mask[start:end]
+                R_eff = (
+                    int(mb_mask_full.sum(dim=1).max().item())
+                    if mb_mask_full.numel() else 0
+                )
+                if R_eff <= 0:
+                    R_eff = R_max
                 lp = self._forward_policy_logprobs(
                     prompt_ids[start:end], prompt_mask[start:end],
-                    response_ids[start:end], response_mask[start:end],
+                    response_ids[start:end, :R_eff], mb_mask_full[:, :R_eff],
                 )
+                if R_eff < R_max:
+                    pad = torch.zeros(
+                        (lp.shape[0], R_max - R_eff),
+                        dtype=lp.dtype, device=lp.device,
+                    )
+                    lp = torch.cat([lp, pad], dim=1)
                 out_chunks.append(lp.detach())
         finally:
             if was_training:
@@ -1187,14 +1335,31 @@ class CASPOTrainer:
             return None
         cfg = self.cfg
         mb = _configured_logprob_micro_batch_size(cfg)
-        B = prompt_ids.shape[0]
+        B, R_max = response_ids.shape[0], response_ids.shape[1]
+        # Per-microbatch padding trim, mirroring _rescore_old_logprobs. The
+        # caller (step()) consumes ref_logprobs_full as a [B, R_max] tensor
+        # sliced by [start:end] in the policy loop, so we re-pad each
+        # microbatch's trimmed chunk back to R_max before cat.
         out_chunks: List[torch.Tensor] = []
         for start in range(0, B, mb):
             end = min(start + mb, B)
+            mb_mask_full = response_mask[start:end]
+            R_eff = (
+                int(mb_mask_full.sum(dim=1).max().item())
+                if mb_mask_full.numel() else 0
+            )
+            if R_eff <= 0:
+                R_eff = R_max
             lp = self._forward_ref_logprobs(
                 prompt_ids[start:end], prompt_mask[start:end],
-                response_ids[start:end], response_mask[start:end],
+                response_ids[start:end, :R_eff], mb_mask_full[:, :R_eff],
             )
+            if R_eff < R_max:
+                pad = torch.zeros(
+                    (lp.shape[0], R_max - R_eff),
+                    dtype=lp.dtype, device=lp.device,
+                )
+                lp = torch.cat([lp, pad], dim=1)
             out_chunks.append(lp.detach())
         return torch.cat(out_chunks, dim=0)
 
@@ -1611,10 +1776,23 @@ class CASPOTrainer:
                     if group_tokens > 0.0 else 0.0
                 )
                 will_step = ((n_micro_in_epoch + 1) % accum == 0) or (end == B)
+                # Per-microbatch padding trim: MATH responses average ~600
+                # tokens but max_response_len pads to 1024+. Slice the R-axis
+                # down to the longest live response in this microbatch so the
+                # policy forward (the dominant FLOPS term) doesn't compute
+                # logits for padding it'll just multiply out of the loss.
+                # ppo_clipped_loss requires logprobs/old_logprobs/adv/mask to
+                # all share shape, so trim every R-keyed tensor consistently.
+                mb_mask_full = response_mask[start:end]
+                R_eff = int(mb_mask_full.sum(dim=1).max().item()) if mb_mask_full.numel() else 0
+                if R_eff <= 0:
+                    R_eff = mb_mask_full.shape[1]
+                mb_resp_ids = response_ids[start:end, :R_eff]
+                mb_resp_mask = mb_mask_full[:, :R_eff]
                 with self._maybe_no_sync(self.model, enabled=not will_step):
                     new_logprobs = self._forward_policy_logprobs(
                         tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
-                        response_ids[start:end], response_mask[start:end],
+                        mb_resp_ids, mb_resp_mask,
                     )
                     if epoch == 0:
                         # Freeze π_old from this microbatch's forward. At
@@ -1622,7 +1800,10 @@ class CASPOTrainer:
                         # construction ``ratio = exp(new - old) == 1``
                         # exactly here — the PPO clip term reduces to
                         # ``-A`` (unclipped surrogate). Subsequent epochs
-                        # read this slice unmodified.
+                        # read this slice unmodified. Cached at R_eff; the
+                        # trim is deterministic from response_mask which is
+                        # frozen across epochs, so R_eff is identical
+                        # epoch-to-epoch and the cached shape stays valid.
                         old_lp = new_logprobs.detach()
                         old_logprobs_chunks[micro_idx] = old_lp
                     else:
@@ -1632,17 +1813,16 @@ class CASPOTrainer:
                             f"{micro_idx} at epoch {epoch}"
                         )
                         old_lp = cached
-                    adv = token_advantage[start:end]
-                    mask = response_mask[start:end]
+                    adv = token_advantage[start:end, :R_eff]
 
                     ref_lp = (
-                        ref_logprobs_full[start:end]
+                        ref_logprobs_full[start:end, :R_eff]
                         if ref_logprobs_full is not None else None
                     )
 
                     loss, stats = ppo_clipped_loss(
                         logprobs=new_logprobs, old_logprobs=old_lp, advantage=adv,
-                        response_mask=mask,
+                        response_mask=mb_resp_mask,
                         clip_eps_low=cfg.clip_eps_low, clip_eps_high=cfg.clip_eps_high,
                         ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
                         kl_estimator=cfg.kl_estimator,

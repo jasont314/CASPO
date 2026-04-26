@@ -65,6 +65,11 @@ CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-$DEFAULT_A
 
 CASPO_USE_GRADIENT_CHECKPOINTING="${CASPO_USE_GRADIENT_CHECKPOINTING:-${USE_GRADIENT_CHECKPOINTING:-true}}"
 CASPO_FSDP_CPU_OFFLOAD="${CASPO_FSDP_CPU_OFFLOAD:-${FSDP_CPU_OFFLOAD:-false}}"
+# Hybrid-shard (HSDP) is the better default for 7B at world>=4: shards
+# within a 2-rank pair and replicates across, ~33% fewer AG/RS hops vs
+# full_shard. Override via CASPO_FSDP_SHARDING_STRATEGY=full_shard if you
+# need the legacy fully-sharded layout (e.g. tight-VRAM single-node runs).
+CASPO_FSDP_SHARDING_STRATEGY="${CASPO_FSDP_SHARDING_STRATEGY:-${FSDP_SHARDING_STRATEGY:-hybrid_shard}}"
 CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
 # Logprob micro-batch for the no-grad rescore + ref-logprob passes.
 # Default 8: bigger than mb=2 (the trainable forward) because there's no
@@ -76,6 +81,7 @@ PROMPTS_PER_STEP_VAL="${PROMPTS_PER_STEP:-64}"
 unset VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_NUM_SEQS
 unset MICRO_BATCH_SIZE GRAD_ACCUM_STEPS USE_GRADIENT_CHECKPOINTING
 unset FSDP_CPU_OFFLOAD REWARD_WORKERS PROMPTS_PER_STEP LOGPROB_MICRO_BATCH_SIZE
+unset FSDP_SHARDING_STRATEGY
 
 OVERRIDES=(
     --override "method=${METHOD}"
@@ -85,7 +91,7 @@ OVERRIDES=(
     --override "vllm_enforce_eager=${CASPO_VLLM_ENFORCE_EAGER}"
     --override "vllm_max_num_seqs=${CASPO_VLLM_MAX_NUM_SEQS}"
     --override distributed_backend=fsdp
-    --override fsdp_sharding_strategy=full_shard
+    --override "fsdp_sharding_strategy=${CASPO_FSDP_SHARDING_STRATEGY}"
     --override fsdp_use_orig_params=true
     --override fsdp_auto_wrap=true
     --override "fsdp_cpu_offload=${CASPO_FSDP_CPU_OFFLOAD}"
@@ -111,7 +117,7 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
 echo "[7b-fsdp] ${RUN_METHOD_TAG} method=${METHOD} gpus=${GPUS[*]} (world=${NRANK}) out=${OUTDIR}"
 echo "[7b-fsdp] mb=${CASPO_MICRO_BATCH_SIZE} accum=${CASPO_GRAD_ACCUM_STEPS} grad_ckpt=${CASPO_USE_GRADIENT_CHECKPOINTING} prompts/step=${PROMPTS_PER_STEP_VAL}"
-echo "[7b-fsdp] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} fsdp_cpu_offload=${CASPO_FSDP_CPU_OFFLOAD}"
+echo "[7b-fsdp] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} fsdp_cpu_offload=${CASPO_FSDP_CPU_OFFLOAD} fsdp_shard=${CASPO_FSDP_SHARDING_STRATEGY}"
 echo "[7b-fsdp] rdzv=${MASTER_ADDR}:${MASTER_PORT}"
 
 PIDS=()

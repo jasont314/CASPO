@@ -56,8 +56,11 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "kl_estimator": ("k1", "k3"),
     "wandb_mode": ("online", "offline", "disabled"),
     "distributed_backend": ("none", "fsdp", "ddp"),
-    "fsdp_sharding_strategy": ("full_shard", "shard_grad_op", "no_shard"),
+    "fsdp_sharding_strategy": (
+        "full_shard", "shard_grad_op", "no_shard", "hybrid_shard",
+    ),
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
+    "activation_checkpointing_mode": ("off", "full", "selective"),
     "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
     "vllm_weight_sync_backend": ("checkpoint", "ipc"),
     # vllm_kv_cache_dtype is Optional — None means "auto" (vLLM default).
@@ -300,6 +303,19 @@ class CASPOConfig:
     # effect. Kept for YAML compat.
     compile: bool = False
     use_gradient_checkpointing: bool = False
+    # Activation-checkpoint policy refinement. ``"off"`` matches
+    # ``use_gradient_checkpointing=False`` (no AC); ``"full"`` matches
+    # ``use_gradient_checkpointing=True`` (HF .gradient_checkpointing_enable
+    # path: every transformer block recomputes its forward on backward);
+    # ``"selective"`` wraps only attention submodules with PyTorch's
+    # apply_activation_checkpointing — recomputes attention (the FLOPS-cheap
+    # but memory-heavy op) and keeps MLP activations live, matching the
+    # Megatron/recompute_granularity="selective" pattern. When this field is
+    # set to anything other than ``"off"``, it OVERRIDES
+    # ``use_gradient_checkpointing``. Kept default ``"off"`` so existing
+    # configs keep their current behaviour driven by
+    # ``use_gradient_checkpointing``.
+    activation_checkpointing_mode: Literal["off", "full", "selective"] = "off"
     # ---- distributed full-model training ----
     # ``fsdp`` is the sharded full-finetune path for memory-bound jobs.
     # ``ddp`` is the replicated full-finetune path for Rho-scale jobs where
@@ -308,7 +324,7 @@ class CASPOConfig:
     dist_backend: str = "nccl"
     dist_timeout_s: int = 1800
     fsdp_sharding_strategy: Literal[
-        "full_shard", "shard_grad_op", "no_shard"
+        "full_shard", "shard_grad_op", "no_shard", "hybrid_shard"
     ] = "full_shard"
     fsdp_auto_wrap: bool = True
     fsdp_use_orig_params: bool = True
@@ -318,6 +334,11 @@ class CASPOConfig:
     fsdp_backward_prefetch: Literal[
         "backward_pre", "backward_post", "none"
     ] = "backward_pre"
+    # Override FSDP MixedPrecision reduce_dtype. ``None`` (default) means
+    # "match cfg.torch_dtype" — without this, FSDP reduces grads in fp32 even
+    # under bf16 params, doubling reduce-scatter wire bytes for no accuracy
+    # win at LLM scale.
+    fsdp_reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     # ---- profiling ----
     # Opt-in torch.profiler trace dump. When > 0, the trainer wraps its main
     # loop with torch.profiler.profile(...) using schedule(warmup=2,
@@ -502,6 +523,15 @@ class CASPOConfig:
                     "vllm_tensor_parallel_size=1 so trainer and vLLM share one "
                     "physical GPU."
                 )
+        # Optional Literal["bfloat16", "float16", "float32"] — None passthrough
+        # means "match torch_dtype". Anything else is rejected.
+        if self.fsdp_reduce_dtype is not None and self.fsdp_reduce_dtype not in (
+            "bfloat16", "float16", "float32",
+        ):
+            raise ValueError(
+                "fsdp_reduce_dtype must be one of None, 'bfloat16', 'float16', "
+                f"'float32'; got {self.fsdp_reduce_dtype!r}"
+            )
         if self.profile_steps < 0:
             raise ValueError(
                 f"profile_steps must be >= 0 (0 disables profiling), got {self.profile_steps}"

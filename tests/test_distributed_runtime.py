@@ -95,3 +95,42 @@ def test_ddp_requires_rank_local_vllm_rollout():
 def test_vineppo_requires_vllm_rollout_backend():
     with pytest.raises(ValueError, match="rollout_backend='vllm'"):
         CASPOConfig(method="vineppo", rollout_backend="hf")
+
+
+def test_hybrid_shard_is_a_legal_fsdp_strategy():
+    """``hybrid_shard`` (HSDP) is a first-class fsdp_sharding_strategy value.
+
+    Constructing a config with the literal must succeed; pre-patch this
+    raised because the Literal only listed full_shard / shard_grad_op /
+    no_shard. The runtime device_mesh build is gated to world_size>=4 and
+    is exercised in real FSDP smoke runs.
+    """
+    cfg = CASPOConfig(
+        distributed_backend="fsdp",
+        rollout_backend="vllm",
+        vllm_tensor_parallel_size=1,
+        fsdp_sharding_strategy="hybrid_shard",
+    )
+    assert cfg.fsdp_sharding_strategy == "hybrid_shard"
+
+
+def test_fsdp_reduce_dtype_optional_passthrough():
+    cfg = CASPOConfig()
+    assert cfg.fsdp_reduce_dtype is None  # default = match torch_dtype
+
+    cfg = CASPOConfig(fsdp_reduce_dtype="bfloat16")
+    assert cfg.fsdp_reduce_dtype == "bfloat16"
+
+    with pytest.raises(ValueError, match="fsdp_reduce_dtype"):
+        CASPOConfig(fsdp_reduce_dtype="int8")
+
+
+def test_activation_checkpointing_mode_literal():
+    cfg = CASPOConfig()
+    assert cfg.activation_checkpointing_mode == "off"
+
+    cfg = CASPOConfig(activation_checkpointing_mode="selective")
+    assert cfg.activation_checkpointing_mode == "selective"
+
+    with pytest.raises(ValueError, match="activation_checkpointing_mode"):
+        CASPOConfig(activation_checkpointing_mode="bogus")
