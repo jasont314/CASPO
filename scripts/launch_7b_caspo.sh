@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # 4-GPU FSDP CASPO with online IPVRM updates on DeepSeekMath-7B-MATH.
 # Requires a trained 7B value model at cfg.prefix_value_path.
 #

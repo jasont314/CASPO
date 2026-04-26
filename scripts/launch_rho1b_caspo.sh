@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # Standard one-GPU Rho-1B MATH CASPO run with online IPVRM updates.
 #
 # Default 8-GPU-suite placement: GPU 4.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # 4-GPU FSDP PPO (terminal-reward, sequence-level advantages) on DeepSeekMath-7B-MATH.
 METHOD=ppo
 RUN_METHOD_TAG="${RUN_METHOD_TAG:-ppo}"

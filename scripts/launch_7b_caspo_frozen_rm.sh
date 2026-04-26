@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # 4-GPU FSDP CASPO with FROZEN reward model on DeepSeekMath-7B-MATH.
 # Same as launch_7b_caspo.sh but disables online value updates.
 METHOD=caspo

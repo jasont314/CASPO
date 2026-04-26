@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # 8-GPU FSDP VinePPO K=9 on DeepSeekMath-7B-MATH. K=9 MC continuations per
 # step boundary on a 7B model is the heaviest method — 8 GPUs default.
 # Override GPU_LIST to 4 GPUs if you want to compare throughput-per-GPU.

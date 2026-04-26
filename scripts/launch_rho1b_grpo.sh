@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # Standard one-GPU Rho-1B MATH GRPO run.
 #
 # Default 8-GPU-suite placement: GPU 0.

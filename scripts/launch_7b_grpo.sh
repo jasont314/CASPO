@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # 4-GPU FSDP GRPO on DeepSeekMath-7B-MATH.
 METHOD=grpo
 RUN_METHOD_TAG="${RUN_METHOD_TAG:-grpo}"

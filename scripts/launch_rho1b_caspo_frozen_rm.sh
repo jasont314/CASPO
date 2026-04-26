@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # Standard one-GPU Rho-1B MATH CASPO frozen-RM ablation.
 #
 # This keeps CASPO's IPVRM prefix-value scoring, but disables online value-model

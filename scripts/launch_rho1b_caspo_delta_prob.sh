@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 # Standard one-GPU Rho-1B MATH CASPO delta-probability ablation.
 #
 # This computes CASPO step TD on sigmoid(V) before step-advantage normalization.
