@@ -14,143 +14,265 @@
 \newcommand{\ppo}{PPO}
 \newcommand{\grpo}{GRPO}
 \newcommand{\ipvrm}{IPVRM}
+\newcommand{\vineppo}{VinePPO}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This draft describes \caspo{}, a reinforcement learning approach for mathematical and structured reasoning tasks that replaces VinePPO-style Monte Carlo rollouts between intermediate reasoning steps with a learned prefix, reward, and value model. The goal is to reduce rollout cost while retaining step-level credit assignment for long-chain reasoning. The method is inspired by the IPVRM formulation of process-aware value/reward modeling, but the exact implementation details, model sizes, datasets, and empirical results remain TODOs. This manuscript is a starting point and intentionally avoids claiming measured gains until experiments are complete.
+This draft describes the current \caspo{} codebase and experimental stack.
+\caspo{} is a full-model reinforcement learning method for mathematical
+reasoning that replaces \vineppo{}'s Monte Carlo prefix rollouts with a learned
+\ipvrm{} prefix value model. The repository now supports four methods in a
+common trainer: terminal-reward \ppo{}, grouped-relative \grpo{}, \vineppo{}
+with $K=9$ prefix rollouts, and \caspo{} with offline plus online prefix value
+learning. The current paper-faithful target is Rho-1B on MATH with 512
+responses per PPO outer step, vLLM rollout generation, CUDA-IPC weight sync,
+and one H100 per method. This manuscript intentionally reports infrastructure
+and speed-probe measurements only; accuracy results should be added after the
+full training and evaluation runs complete.
 \end{abstract}
 
 \section{Introduction}
-Large language models increasingly solve mathematical and programmatic tasks by producing long chains of intermediate reasoning. Reinforcement learning can improve these behaviors, but sparse final-answer rewards make credit assignment difficult. Stepwise reinforcement learning methods such as VinePPO address this by sampling continuations from intermediate prefixes and using rollout-derived estimates to train policies. This can improve the learning signal, but repeated Monte Carlo rollouts between reasoning steps are expensive.
+Sparse final-answer rewards make reinforcement learning for long mathematical
+reasoning difficult. \vineppo{} addresses this by branching from intermediate
+reasoning prefixes and sampling Monte Carlo continuations, yielding better
+credit assignment at the cost of many extra generations \citep{vineppo2024}.
+\caspo{} keeps the same stepwise PPO structure but replaces those online prefix
+rollouts with a learned prefix value model inspired by \ipvrm{}
+\citep{ipvrm2026}.
 
-\caspo{} is intended as a lower-cost alternative. Rather than repeatedly expanding many suffixes from each reasoning prefix, \caspo{} learns a prefix-conditioned model that predicts reward and value signals for partially completed reasoning traces. The working hypothesis is that learned prefix evaluation can approximate the information supplied by VinePPO-style rollouts while reducing inference overhead during training.
+The intended comparison is not only algorithmic but also systems-oriented:
+given the same policy, data, verifier, rollout budget, and PPO update shape,
+how much step-level signal can be recovered without \vineppo{}'s repeated
+suffix expansion? The current repository therefore implements \ppo{}, \grpo{},
+\vineppo{}, and \caspo{} in one stack so wall-clock and accuracy can be
+measured under the same vLLM and trainer infrastructure.
 
-This paper draft makes three contributions to be validated:
-\begin{enumerate}
-    \item a formulation of \caspo{} as PPO-style policy optimization with learned prefix reward/value estimates;
-    \item an engineering stack for training and inference that separates policy generation, prefix scoring, and rollout orchestration;
-    \item an evaluation plan for measuring accuracy, sample efficiency, wall-clock cost, and stability on mathematical reasoning benchmarks.
-\end{enumerate}
-
-\section{Background and Prior Work}
+\section{Related Work}
 \paragraph{PPO.}
-Proximal Policy Optimization (\ppo{}) optimizes a clipped surrogate objective that limits destructive policy updates while using advantage estimates from sampled trajectories \citep{schulman2017ppo}. In language-model reinforcement learning, the action space is token generation and trajectories are generated responses, often regularized against a reference policy. \caspo{} retains the PPO-style update structure but changes how intermediate reasoning prefixes are valued.
+\ppo{} optimizes a clipped policy-gradient surrogate to prevent excessively
+large policy updates \citep{schulman2017ppo}. In this codebase, \ppo{} uses
+terminal verifier rewards and broadcasts a sequence-level advantage over
+response tokens before applying the clipped language-model PPO objective with a
+KL penalty to a frozen reference policy.
 
 \paragraph{VinePPO.}
-VinePPO proposes using intermediate reasoning states as branch points for additional Monte Carlo continuations \citep{vineppo2024}. These rollouts can estimate whether a partial chain of thought is likely to lead to a correct final answer. The main practical concern for this project is cost: each prefix may require multiple suffix generations and reward evaluations, which can dominate training time for long responses.
+\vineppo{} estimates values at intermediate reasoning states by sampling
+continuations from each prefix and grading the completed trajectories
+\citep{vineppo2024}. The method avoids relying on a learned critic for complex
+reasoning credit assignment, but its cost scales with the number of prefixes,
+continuations, and reward evaluations.
 
 \paragraph{IPVRM.}
-The IPVRM paper motivates learning process-aware reward and value models over intermediate prefixes \citep{ipvrm2026}. \caspo{} is inspired by this direction: it treats prefixes as first-class objects to score, rather than relying entirely on terminal rewards or repeated online suffix rollouts. The exact mapping from IPVRM terminology to this codebase should be verified against the paper and implementation notes before submission.
+\ipvrm{} learns prefix-conditioned values from trajectory-level outcome labels,
+then uses temporal-difference differences between adjacent prefix values as
+process-level signals \citep{ipvrm2026}. The \caspo{} implementation uses this
+prefix-value view as the replacement for \vineppo{}'s Monte Carlo prefix value
+estimator. Unlike the IPVRM paper's LoRA setting, the current code performs
+full-model value updates, so the online value learning rate is set
+conservatively to $10^{-6}$.
 
-\paragraph{GRPO and math RL.}
-Group Relative Policy Optimization (\grpo{}) and related DeepSeekMath-style training recipes use grouped samples and relative rewards to train mathematical reasoning models without a separate learned critic in some configurations \citep{deepseekmath2024}. \caspo{} can be presented alongside GRPO as another way to improve signal quality for math RL, but its central distinction is prefix-level learned value/reward estimation. This paragraph should be revised once the intended baseline set is finalized.
+\paragraph{GRPO.}
+\grpo{} was introduced in DeepSeekMath as a PPO variant that uses grouped
+samples and relative rewards while avoiding a learned value network
+\citep{deepseekmath2024}. In this repository, \grpo{} is implemented as a
+terminal-reward baseline: for each prompt, the $G=8$ sampled responses are
+normalized relative to their group and then trained with the same clipped PPO
+loss as the other methods.
 
-\paragraph{Inference engines.}
-High-throughput serving systems such as vLLM support efficient batched generation and paged attention \citep{kwon2023vllm}. If \caspo{} uses vLLM or a similar backend for policy sampling, the final paper should describe batching, prefix caching, and scheduling details that affect throughput. TODO: confirm the actual inference backend and version used in experiments.
+\paragraph{vLLM.}
+The stack uses vLLM for high-throughput generation and prefix-cache reuse
+\citep{kwon2023vllm}. The current Rho-1B setup uses vLLM's CUDA-IPC
+weight-transfer path for trainer-to-vLLM synchronization, avoiding
+checkpoint-to-disk reloads after every policy update.
 
 \section{Method}
-\subsection{Problem Setup}
-Let $x$ denote a problem prompt and $y = (y_1,\ldots,y_T)$ denote a generated reasoning trace and answer. A policy $\pi_\theta(y_t \mid x, y_{<t})$ generates tokens autoregressively. A verifier or task reward $R(x,y)$ evaluates the final answer, often producing a sparse scalar reward. For stepwise reasoning, we also consider a sequence of prefixes $p_k = (x, y_{\leq t_k})$ at selected reasoning boundaries, such as sentence, line, or delimiter positions.
+\subsection{Step Segmentation}
+Each generated response is segmented into reasoning steps. The current MATH
+configuration uses the LaTeX-aware splitter ported from \vineppo{} rather than
+a simple newline delimiter. Let $s_t$ denote the prefix at the start of step
+$t$ and let $R(x,y) \in \{0,1\}$ be the final verifier reward.
 
-\subsection{VinePPO-Style Rollout Estimation}
-In a VinePPO-style estimator, a prefix $p_k$ is expanded with $M$ sampled continuations $\tilde{y}^{(1)},\ldots,\tilde{y}^{(M)}$. The prefix value can be estimated as
+\subsection{CASPO Prefix Values}
+\caspo{} uses an \ipvrm{}-style prefix value model initialized from the same
+SFT checkpoint family as the policy. Given response tokens $y_i$, the code
+constructs prefix values from cumulative log-ratios:
 \begin{equation}
-    \hat{V}_{\mathrm{MC}}(p_k) = \frac{1}{M} \sum_{m=1}^{M} R(x, p_k \oplus \tilde{y}^{(m)}).
+    V_\phi(s_t) =
+    \beta \sum_{i < t}
+    \log \frac{\pi_\phi(y_i \mid x, y_{<i})}
+              {\pi_{\mathrm{ref}}(y_i \mid x, y_{<i})}.
 \end{equation}
-This estimate can provide useful credit assignment, but the cost scales with the number of prefixes, continuations, and reward evaluations.
+The value model is first trained offline with terminal correctness labels and
+then updated online during policy training with ADB/DLW enabled. The current
+Rho-1B MATH value checkpoint lives at:
+\begin{center}
+\path{/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final}.
+\end{center}
+Its training summary reports 5960 train rollouts, 664 validation rollouts,
+three epochs, best validation loss 0.8037, and last validation accuracy 0.9484.
 
-\subsection{\caspo{} Prefix Modeling}
-\caspo{} replaces most or all of these online Monte Carlo suffix rollouts with a learned prefix evaluator. Given a prefix $p_k$, the evaluator predicts:
-\begin{align}
-    \hat{r}_\phi(p_k) &\approx \text{local or process reward}, \\
-    \hat{V}_\phi(p_k) &\approx \mathbb{E}_{y_{>t_k} \sim \pi_\theta}[R(x,y) \mid p_k].
-\end{align}
-The evaluator may be trained from terminal rewards, offline rollout labels, human or verifier process annotations, or bootstrapped targets. TODO: specify which targets CASPO currently uses and whether the prefix model shares weights with the policy.
-
-\subsection{Policy Objective}
-For generated trajectories, \caspo{} computes advantages using a combination of terminal rewards and learned prefix values. A representative PPO objective is:
+\subsection{Step TD Advantage}
+\caspo{} and \vineppo{} both use step-level temporal-difference advantages:
 \begin{equation}
-    \mathcal{L}_{\mathrm{PPO}}(\theta) =
-    \mathbb{E}_t \left[
-        \min \left(
-            \rho_t(\theta) \hat{A}_t,
-            \mathrm{clip}(\rho_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t
+    A_t = r_t + \gamma V(s_{t+1}) - V(s_t),
+\end{equation}
+where $\gamma=1$ and $r_t$ is zero except on the terminal reasoning step, where
+$r_T = R(x,y)$. \caspo{} obtains $V$ from the learned prefix value model;
+\vineppo{} obtains $V$ by sampling $K=9$ continuations from nonterminal
+prefixes and averaging their verifier rewards.
+
+The current \caspo{} configuration standardizes valid step advantages over the
+whole rollout batch:
+\begin{center}
+\texttt{standardize\_step\_advantage=true},
+\quad
+\texttt{standardize\_advantage\_scope=batch}.
+\end{center}
+Thus, for the Rho-1B MATH run, advantages are whitened across all valid steps
+from all 512 responses in the outer PPO step, not separately per prompt group.
+
+\subsection{PPO Objective}
+All four methods ultimately use the same clipped PPO token objective:
+\begin{equation}
+    \mathcal{L}_{\mathrm{clip}}(\theta) =
+    -\mathbb{E}_t
+    \left[
+        \min\left(
+            \rho_t(\theta) A_t,
+            \mathrm{clip}(\rho_t(\theta), 1-\epsilon, 1+\epsilon) A_t
         \right)
     \right],
 \end{equation}
-where $\rho_t(\theta) = \pi_\theta(y_t \mid x,y_{<t}) / \pi_{\theta_{\mathrm{old}}}(y_t \mid x,y_{<t})$. In practice, the loss should also include KL regularization to a reference model, entropy or length controls if used, and value/reward model losses. TODO: match this objective to the exact implementation.
+where $\rho_t(\theta)$ is the token probability ratio between the current
+policy and the rollout policy. The implementation also applies a KL penalty to
+the frozen reference policy using the $k3$ estimator with coefficient $10^{-4}$.
 
-\subsection{Training Loop}
-A conservative training loop is:
-\begin{enumerate}
-    \item sample prompts from the training distribution;
-    \item generate policy responses and identify reasoning prefixes;
-    \item score final answers with the task verifier;
-    \item score prefixes with the learned prefix reward/value model;
-    \item compute token- or segment-level advantages;
-    \item update the policy with PPO-style clipped optimization;
-    \item update the prefix model using verified terminal outcomes and any available rollout or process labels.
-\end{enumerate}
-The final manuscript should clarify whether prefix labels are produced online, cached from a warm-start stage, or periodically refreshed.
-
-\section{Training and Inference Stack}
-\caspo{} should be described as a system with separable components:
-\begin{itemize}
-    \item \textbf{Policy model:} TODO: exact base model, tokenizer, context length, precision, and parameter count.
-    \item \textbf{Reference model:} TODO: whether KL is computed against the initial policy or a separate frozen model.
-    \item \textbf{Prefix evaluator:} TODO: architecture, initialization, scoring granularity, and whether it predicts reward, value, or both.
-    \item \textbf{Verifier:} TODO: exact-answer checker, symbolic checker, unit-test harness, or learned judge.
-    \item \textbf{Generation backend:} TODO: confirm whether vLLM, Hugging Face generation, or another runtime is used.
-    \item \textbf{Distributed training:} TODO: data parallelism, tensor/pipeline parallelism, rollout workers, and scheduling.
-\end{itemize}
-The paper should report both training-token throughput and end-to-end wall-clock cost, because replacing online rollouts is primarily a systems and sample-efficiency claim.
-
-\section{Experiments and Evaluation Plan}
-This draft does not include empirical results. The following plan identifies measurements needed before making claims.
-
-\subsection{Benchmarks}
-Candidate benchmarks include GSM8K, MATH, AIME-style held-out problems, and project-specific math or reasoning tasks. TODO: confirm which datasets are licensed, available, and used in the actual runs.
-
-\subsection{Baselines}
-Recommended baselines are:
-\begin{itemize}
-    \item supervised fine-tuning only;
-    \item standard PPO with terminal reward;
-    \item VinePPO-style Monte Carlo prefix rollouts;
-    \item GRPO or another grouped relative reward method, if implemented in the same stack;
-    \item \caspo{} with learned prefix values and ablations.
-\end{itemize}
-
-\subsection{Metrics}
-Report final-answer accuracy, pass@k where appropriate, verifier reward, response length, invalid-answer rate, KL to reference model, training instability events, wall-clock time, generated tokens, and reward-model calibration. For prefix models, calibration plots and prefix-level error against held-out rollout estimates would be useful.
-
-\subsection{Ablations}
-Useful ablations include removing prefix rewards, removing prefix values, varying prefix boundary definitions, varying the amount of offline rollout data used to train the evaluator, and comparing online versus cached prefix scores.
+\section{Current Experimental Configuration}
+The main experiment uses \texttt{configs/caspo\_rho1b\_math.yaml}. Table
+\ref{tab:config} summarizes the current paper-faithful Rho-1B MATH settings.
 
 \begin{table}[t]
 \centering
-\caption{Placeholder experiment table. Do not fill with unverified numbers.}
-\begin{tabular}{lcccc}
+\caption{Current Rho-1B MATH configuration.}
+\label{tab:config}
+\begin{tabular}{ll}
 \toprule
-Method & Accuracy & Tokens Generated & Wall-Clock & Notes \\
+Field & Value \\
 \midrule
-SFT & TODO & TODO & TODO & TODO \\
-PPO & TODO & TODO & TODO & terminal reward \\
-VinePPO & TODO & TODO & TODO & MC prefix rollouts \\
-\caspo{} & TODO & TODO & TODO & learned prefix evaluator \\
+Base policy & \texttt{realtreetune/rho-1b-sft-MATH} \\
+Train data & \texttt{DigitalLearningGmbH/MATH-lighteval}, train split \\
+Eval data & \texttt{HuggingFaceH4/MATH-500}, test split \\
+Prompt template & VinePPO MATH task template \\
+Max response length & 1024 tokens \\
+Group size & 8 responses per prompt \\
+Prompts per outer step & 64 \\
+Responses per outer step & 512 \\
+PPO minibatch & 64 responses \\
+PPO epochs per rollout & 2 \\
+Policy LR & $10^{-6}$ \\
+Online value LR & $10^{-6}$ \\
+PPO clip & 0.2 \\
+KL coefficient & $10^{-4}$ \\
+Rollout sampling & temperature 0.6, top-p 0.9 \\
+Training length & 1000 outer steps \\
+Checkpoints & \texttt{step\_250}, \texttt{step\_500}, \texttt{step\_750}, \texttt{final} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\section{Limitations}
-\caspo{} depends on the quality and calibration of the learned prefix evaluator. If the evaluator assigns high value to superficially plausible but incorrect reasoning, PPO updates may reinforce flawed trajectories. Distribution shift is also likely: as the policy improves or changes style, prefixes encountered during training may drift away from those used to train the evaluator. Additional concerns include reward hacking, verifier brittleness, length bias, and the cost of generating or refreshing prefix-model supervision.
+\section{Training and Inference Stack}
+The production Rho-1B run uses the \texttt{scalable} conda environment and
+writes data, logs, checkpoints, and Hugging Face caches under
+\path{/mnt/nvme_tmp/jason_caspo}. The launch command is:
+\begin{verbatim}
+RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_parallel.sh
+\end{verbatim}
+Each method gets one H100: PPO, CASPO, GRPO, and VinePPO are mapped to the four
+listed GPUs in that order.
 
-The method should therefore be evaluated with held-out tasks, adversarial or style-shifted prompts when possible, and direct comparisons to rollout-based estimates. Any final claims should separate algorithmic gains from engineering improvements such as batching, caching, or faster inference backends.
+The vLLM rollout backend is enabled for all methods. For Rho-1B, the code uses
+CUDA-IPC weight synchronization:
+\begin{center}
+\texttt{vllm\_weight\_sync\_backend=ipc}.
+\end{center}
+Recent IPC probes show sync around 0.3--0.4 seconds per step, so the current
+bottleneck is policy/value computation rather than weight transfer.
+
+The embedded vLLM path also primes the AsyncLLM output handler on the
+repository's persistent event loop. This is required for the current vLLM V1
+runtime, where constructing AsyncLLM outside a running event loop can otherwise
+stall on EngineCore metadata responses.
+
+\section{Speed Probe}
+Table \ref{tab:speed} reports the latest three-step paper-faithful speed probe.
+These are systems measurements, not final accuracy results. The probe used one
+H100 80GB per method, 512 responses per outer step, \texttt{save\_every=0}, and
+vLLM IPC sync.
+
+\begin{table}[t]
+\centering
+\caption{Rho-1B MATH speed probe with paper-faithful 512-response outer steps.}
+\label{tab:speed}
+\begin{tabular}{lrrrr}
+\toprule
+Method & Step time & Rollout & Value/MC & Policy \\
+\midrule
+PPO & 90 s & 4 s & 0 s & 74 s \\
+GRPO & 92 s & 4 s & 0 s & 76 s \\
+CASPO & 141 s & 4 s & 55 s & 69 s \\
+VinePPO $K=9$ & 237 s & 4 s & 152 s & 69 s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+PPO uses terminal rewards, GRPO uses grouped terminal rewards, CASPO adds a
+learned value forward/update phase, and \vineppo{}'s value column is dominated
+by MC prefix continuation scoring.
+
+The implied 1000-step wall-clock estimates are approximately 25 hours for PPO,
+26 hours for GRPO, 39 hours for CASPO, and 66 hours for \vineppo{} $K=9$.
+Running all four methods in parallel on GPUs 4--7 is gated by \vineppo{}, so
+the full sweep should take roughly 66--72 hours before optional evaluation
+overhead.
+
+\section{Evaluation Plan}
+Periodic evaluation should be a cheap sample eval, not the full benchmark
+suite. The launcher supports evaluating a saved checkpoint with:
+\begin{verbatim}
+RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 \
+EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 \
+EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+\end{verbatim}
+Recommended periodic checkpoints are \texttt{step\_250}, \texttt{step\_500},
+\texttt{step\_750}, and \texttt{final}. Full evaluation should be run only on
+\texttt{final} unless intermediate curves become necessary for analysis.
+
+\section{Limitations and Open Engineering Questions}
+\caspo{} depends on the quality and calibration of the learned prefix value
+model. Online updates mitigate distribution shift but can also drift if the
+learning rate is too high; the current full-model setting therefore uses a
+conservative online value learning rate. The current Rho-1B setup is optimized
+for one H100 per method. Scaling to 7B full fine-tuning likely requires FSDP and
+currently falls back to checkpoint-based vLLM sync until an exact-runtime NCCL
+or in-memory sync path is implemented.
+
+The latest speed probe indicates that rollout generation and trainer-to-vLLM
+sync are no longer the main bottlenecks. PPO/GRPO are dominated by policy
+forward/backward time, CASPO adds a stable value-model phase, and \vineppo{} is
+dominated by Monte Carlo prefix evaluation. Further speedups would require
+changing the experimental contract: fewer PPO epochs, LoRA/PEFT instead of
+full-model updates, fewer \vineppo{} rollouts, capped MC continuation lengths,
+or multi-GPU training per method.
 
 \section{Conclusion}
-\caspo{} is a proposed stepwise reinforcement learning method for reasoning models that uses learned prefix reward/value estimates in place of expensive VinePPO-style Monte Carlo rollouts between reasoning steps. The intended benefit is cheaper credit assignment for long mathematical reasoning traces. The core empirical questions are whether learned prefix estimates are accurate enough to guide PPO updates, whether they reduce training cost at equal or better accuracy, and how robust they remain as the policy distribution changes.
+The current \caspo{} repository is ready to run a four-method, paper-faithful
+Rho-1B MATH comparison using a shared full-model RL stack. The key experimental
+question remains empirical: whether learned IPVRM prefix values can match or
+exceed \vineppo{}'s rollout-derived credit assignment at lower wall-clock cost,
+without introducing reward-model drift or unstable policy updates.
 
 \bibliographystyle{plainnat}
 \bibliography{references}

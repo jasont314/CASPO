@@ -1,146 +1,195 @@
-# Reproducing CASPO vs. VinePPO baselines
+# Reproducing Current CASPO Runs
 
-This is the playbook for running CASPO and the VinePPO/PPO baselines on the
-**same setup** (Rho-1B / DeepSeekMath-7B SFT init, MATH or GSM8K, identical
-sample budget) so the headline table is apples-to-apples.
+This runbook tracks the current repository setup for the Rho-1B MATH
+comparison. It is intentionally narrower than the older cross-repo playbook:
+the active production target is one shared trainer/inference stack that can run
+PPO, GRPO, CASPO, and VinePPO under the same config.
 
----
+## Environment
 
-## Prereqs
-
-- VinePPO repo cloned alongside CASPO at `/home/jason/experiment/VinePPO/` (already done).
-- CASPO env: `source /opt/conda/etc/profile.d/conda.sh && conda activate /home/jason/experiment/.conda/envs/llm-research`
-- VinePPO env: their README's instructions (separate conda env recommended — they pin DeepSpeed and vLLM).
-
-## Models / data
-
-VinePPO hosts their SFT checkpoints publicly. Just point the config at them.
-
-| Setup | Policy SFT init | Train data | Eval | n |
-|---|---|---|---|---|
-| MATH (small) | `realtreetune/rho-1b-sft-MATH` | `lighteval/MATH` train | `HuggingFaceH4/MATH-500` | 500 |
-| MATH (large) | `realtreetune/deepseekmath-7b-sft-MATH` | `lighteval/MATH` train | `HuggingFaceH4/MATH-500` | 500 |
-| GSM8K (small) | `realtreetune/rho-1b-sft-GSM8K` | `openai/gsm8k` train | `openai/gsm8k` test | 1319 |
-| GSM8K (large) | `realtreetune/deepseekmath-7b-sft-GSM8K` | `openai/gsm8k` train | `openai/gsm8k` test | 1319 |
-
-Prompt format (verbatim from VinePPO's `MATH_step_by_step_sft.jsonnet`):
-```
-[MATH_TASK] Problem:
-{query}
-
-Solution:
-```
-
-This is wired into `caspo/config.py:prompt_template` and used in `caspo/data/math_data.py:format_prompt`.
-
-## CASPO runs (this repo)
-
-For each setup, run all three phases:
+Use the scalable environment for all current scripts:
 
 ```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate scalable
 cd /home/jason/experiment/CASPO
-
-# Phase 1a: collect (prompt, response, outcome) data with the SFT model.
-# Override --num-prompts to control scale (3K is a reasonable floor; paper used ~480K).
-python -m scripts.collect_value_data \
-    --config configs/caspo_rho1b_math.yaml \
-    --num-prompts 3000
-
-# Phase 1b: train V_phi via IPVRM BCE-with-margin (Eq. 9). β=10, m=5, lr=5e-7.
-# Trains for value_max_epochs=3 epochs over the filtered data with held-out
-# per-prompt val split (10%); early-stops on val loss (patience=5 evals);
-# saves the best-val-loss checkpoint as final/.
-python -m scripts.train_value \
-    --config configs/caspo_rho1b_math.yaml
-
-# Phase 2: CASPO policy training. Online IPVRM (Eq. 15 with ADB+DLW) is on by default.
-python -m scripts.train_caspo \
-    --config configs/caspo_rho1b_math.yaml
-
-# Eval
-python -m scripts.eval \
-    --config configs/caspo_rho1b_math.yaml \
-    --override model_name_or_path=out/caspo_rho1b_math/final \
-    --benchmarks math500 \
-    --k 4
 ```
 
-For DeepSeekMath-7B, GSM8K, etc. swap the config name. Memory: 7B + value-7B
-+ ref-7B + (optional) policy-ref-7B → ~3-4× a single 7B forward.
-Use `update_value_during_policy=false` to free V_φ optimizer state if memory-bound.
+Launchers set Hugging Face caches and outputs under:
 
-## VinePPO / PPO baseline runs (their repo)
+```text
+/mnt/nvme_tmp/jason_caspo
+```
 
-VinePPO uses jsonnet configs and DeepSpeed. Their README has the exact
-launch invocation.
+All production launchers source `scripts/perf_env.sh` for CUDA allocator,
+NCCL, tokenizer, vLLM, and CPU-thread settings.
+
+## Main Config
+
+Current paper-faithful Rho-1B MATH config:
+
+```text
+configs/caspo_rho1b_math.yaml
+```
+
+Matched settings:
+
+- Base model: `realtreetune/rho-1b-sft-MATH`
+- Train data: `DigitalLearningGmbH/MATH-lighteval`
+- Eval data: `HuggingFaceH4/MATH-500`
+- Prompt: VinePPO MATH task template
+- Rollout shape: `64 prompts x 8 responses = 512 responses` per outer step
+- PPO minibatch: 64 responses
+- PPO epochs per rollout: 2
+- Policy LR: `1e-6`
+- Warmup: 480 optimizer updates
+- KL coefficient: `1e-4`
+- Sampling: temperature `0.6`, top-p `0.9`, max response length 1024
+- Training length: 1000 outer steps
+
+The YAML still contains the original `save_every: 40`, but the production
+launcher overrides it to `250`, giving `step_250`, `step_500`, `step_750`, and
+`final`.
+
+## Value Model
+
+CASPO reuses the trained IPVRM-style prefix value checkpoint:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
+```
+
+The current summary for that checkpoint is:
+
+```text
+n_train_rollouts = 5960
+n_val_rollouts   = 664
+value_max_epochs = 3
+best_val_loss    = 0.8037
+val_acc_at_last  = 0.9484
+```
+
+Retrain this value model only if the base model, prompt, dataset, verifier,
+segmentation, or rollout sampling changes materially.
+
+CASPO online value learning is enabled with ADB/DLW:
+
+```yaml
+update_value_during_policy: true
+online_value_lr: 1.0e-6
+use_adb: true
+use_dlw: true
+```
+
+## Four-Method Training Run
+
+Run all methods in parallel on GPUs 4-7:
 
 ```bash
-cd /home/jason/experiment/VinePPO
-# their setup; see their README for env activation and exact command
-APP_DIRECTORY=runs/ppo_rho1b_math \
-APP_SEED=0 \
-deepspeed --no_local_rank --num_gpus=8 src/treetune/main.py \
-    --configs configs/polIter_rho1bSft2_ppo_MATH.jsonnet \
-    run_iteration_loop
-
-# VinePPO baseline
-APP_DIRECTORY=runs/vineppo_rho1b_math \
-APP_SEED=0 \
-deepspeed --no_local_rank --num_gpus=8 src/treetune/main.py \
-    --configs configs/polIter_rho1bSft2_vineppo_MATH.jsonnet \
-    run_iteration_loop
+RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_parallel.sh
 ```
 
-## What's matched, what's not
+Default mapping:
 
-**Matched** (verbatim from VinePPO configs):
-- SFT init checkpoints
-- Dataset + prompt format
-- group_size = 8, temperature = 0.6, top_p = 0.9, max_tokens = 1024 (MATH) / 512 (GSM8K)
-- Rho-1B MATH rollout shape = 512 episodes/iteration = 64 prompts × 8 rollouts
-- LR = 1e-6, weight_decay = 0, warmup ~ 0.03, max_grad_norm = 1.0
-- target_train_batch_size = 64 (mapped to 64-response PPO minibatches)
-- num_epochs_per_iteration = 2, total_num_iterations = 1000
-- KL: init_kl_coef = 1e-4 (control_variate KL ≈ k3 estimator)
-- γ = 1.0, λ = 1.0 (VinePPO match), PPO clip ε = 0.2
+| Method | GPU | Notes |
+|---|---:|---|
+| PPO | 4 | terminal-reward PPO |
+| CASPO | 5 | IPVRM prefix value model, online updates |
+| GRPO | 6 | grouped terminal-reward advantages |
+| VinePPO | 7 | `vineppo_mc_rollouts=9` |
 
-**Documented deviations** (call these out in the writeup):
-1. **Value model**: VinePPO uses K=9 MC rollouts at every step boundary;
-   CASPO uses an IPVRM prefix value model trained offline + online (Eq. 15).
-   This is the actual contribution; not a deviation.
-2. **Step segmentation**: matched. We ported VinePPO's
-   ``math_extract_steps_inplace.py`` verbatim into
-   ``caspo/segmentation/latex_splitter.py`` (only change: ``md5_hash``
-   inlined). The LaTeX-aware splitter is wired in via
-   ``segmentation_mode: latex_aware`` (default in the four reproduction
-   configs). Token-level mapping uses per-token decode spans
-   (``segment_responses_batch_latex_aware``) — equivalent to VinePPO's
-   ``return_offsets_mapping`` pipeline for the BPE tokenizers we care about.
-3. **No-ops** (numerically equivalent): CASPO's PPO loss uses the k3 KL
-   estimator; VinePPO uses ``control_variate`` KL — both from Schulman 2020,
-   same form modulo clipping bounds.
+With `RUN_TAG=paper512_seed0`, outputs land at:
 
-## Suggested table layout
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_ppo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_grpo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_vineppo_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_paper512_seed0/logs
+```
 
-| Method | Rho-1B MATH-500 | DSMath-7B MATH-500 | Rho-1B GSM8K | DSMath-7B GSM8K | Compute (avg gen / step) |
-|---|---|---|---|---|---|
-| SFT | (eval their ckpt) | (eval their ckpt) | … | … | 0 |
-| PPO (their config) | from their numbers | from their numbers | … | … | 1× |
-| VinePPO (their config) | from their numbers | from their numbers | … | … | ~10× |
-| **CASPO (ours)** | run | run | run | run | ~1.1× |
-
-If CASPO matches or beats VinePPO at ~1× compute, that's the headline.
-
-## Smoke before the real run
+Useful overrides:
 
 ```bash
-# Tiny SmolLM smoke to verify the pipeline still works after the new prompt
-# template + Rho config additions:
-python -m pytest tests/ -q
-python -m scripts.collect_value_data --config configs/value_smoke.yaml --num-prompts 4
-python -m scripts.train_value --config configs/value_smoke.yaml
-python -m scripts.train_caspo --config configs/caspo_smoke.yaml \
-    --override update_value_during_policy=true \
-    --override use_adb=true \
-    --override use_dlw=true
+MAX_STEPS=20 RUN_TAG=smoke ./scripts/launch_rho1b_parallel.sh
+SAVE_EVERY=100 RUN_TAG=short ./scripts/launch_rho1b_parallel.sh
+WANDB_MODE=offline RUN_TAG=paper512_seed1 ./scripts/launch_rho1b_parallel.sh
 ```
+
+## Evaluation
+
+Use cheap sample evals at intermediate checkpoints:
+
+```bash
+RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 \
+EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 \
+EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+```
+
+Run full eval at final:
+
+```bash
+RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
+```
+
+Eval defaults:
+
+- Methods: CASPO, GRPO, VinePPO, PPO
+- Benchmarks: `math500,math,collegemath,olympiadbench`
+- `EVAL_K=16`
+- temperature `0.35`
+- top-p `0.9`
+- max new tokens `1024`
+
+## Current Speed Probe
+
+Latest paper-faithful probe: Rho-1B MATH, one H100 80GB per method, 512
+responses per outer step, vLLM IPC sync, `save_every=0`, `max_steps=3`.
+
+| Method | Mean step time | Rollout | Value/MC phase | Policy phase |
+|---|---:|---:|---:|---:|
+| PPO | ~90s | ~4s | 0s | ~74s |
+| GRPO | ~92s | ~4s | 0s | ~76s |
+| CASPO | ~141s | ~4s | ~55s | ~69s |
+| VinePPO K=9 | ~237s | ~4s | ~152s | ~69s |
+
+Approximate 1000-step ETAs:
+
+- PPO: ~25 hours
+- GRPO: ~26 hours
+- CASPO: ~39 hours
+- VinePPO K=9: ~66 hours
+
+If the four methods run in parallel on GPUs 4-7, wall-clock is gated by
+VinePPO: roughly 66-72 hours plus checkpoint and eval overhead.
+
+## Validation
+
+Config sanity:
+
+```bash
+/opt/conda/envs/scalable/bin/python scripts/validate_configs.py --diff
+```
+
+Targeted trainer/vLLM tests:
+
+```bash
+/opt/conda/envs/scalable/bin/python -m pytest -q \
+  tests/test_vllm_engine.py \
+  tests/test_trainer_integration.py \
+  tests/test_method_dispatch.py
+```
+
+Paper build:
+
+```bash
+make -C paper
+```
+
+## 7B Note
+
+The 7B configs remain available, but they are not the current single-node
+four-method production target. Full-model 7B training should use FSDP, and the
+current 7B vLLM sync path is still checkpoint-based until an exact-runtime
+NCCL/in-memory sync path is implemented.
