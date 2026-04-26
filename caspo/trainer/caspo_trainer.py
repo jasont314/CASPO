@@ -2086,6 +2086,35 @@ class CASPOTrainer:
     def _next_examples(self, n: int) -> List[dict]:
         return [next(self._train_iter) for _ in range(n)]
 
+    def _prompts_per_rank(self) -> int:
+        """Resolve cfg.prompts_per_step (a *global* count, paper-faithful) into
+        a per-rank prompt count.
+
+        cfg.prompts_per_step is the number of unique prompts that participate
+        in one outer PPO step *globally* — i.e. the count that, multiplied by
+        ``group_size``, yields the global episodes-per-step the paper reports
+        ("64 prompts × G=8 = 512 episodes"; see configs/*.yaml comments and
+        VinePPO Table 2).
+
+        Each rank holds an independent ``[rank::world_size]`` shard of the
+        dataset, so to roll out N prompts globally, each rank pulls
+        ``ceil(N / world_size)`` from its own shard. We round up so the
+        global count is *at least* the requested N (avoids dropping prompts
+        when N is not divisible by world_size).
+
+        Returns the per-rank prompt count.
+        """
+        cfg = self.cfg
+        world = max(1, int(self.dist.world_size))
+        # ceil-divide so total >= cfg.prompts_per_step. The trainer used
+        # to call _next_examples(cfg.prompts_per_step) directly, which made
+        # the *per-rank* count = global count and silently inflated the
+        # actual global count by world_size. That changed the effective
+        # episodes-per-step (and thus optimizer step count) by world_size,
+        # making 4-GPU runs do 4x the work the paper specifies.
+        per_rank = (int(cfg.prompts_per_step) + world - 1) // world
+        return max(1, per_rank)
+
     def train(self) -> None:
         cfg = self.cfg
         t0 = time.time()
@@ -2116,7 +2145,7 @@ class CASPOTrainer:
                 with_stack=False,
             ) as prof:
                 while self.global_step < cfg.max_steps:
-                    examples = self._next_examples(cfg.prompts_per_step)
+                    examples = self._next_examples(self._prompts_per_rank())
                     is_final_step = (self.global_step + 1) >= int(cfg.max_steps)
                     stats = self.step(examples, sync_vllm=not is_final_step)
                     self.global_step += 1
@@ -2131,7 +2160,7 @@ class CASPOTrainer:
                     prof.step()
         else:
             while self.global_step < cfg.max_steps:
-                examples = self._next_examples(cfg.prompts_per_step)
+                examples = self._next_examples(self._prompts_per_rank())
                 is_final_step = (self.global_step + 1) >= int(cfg.max_steps)
                 stats = self.step(examples, sync_vllm=not is_final_step)
                 self.global_step += 1
