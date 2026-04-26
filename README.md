@@ -953,6 +953,7 @@ vLLM's EngineCore distributed init.
 | CASPO frozen-RM | 4 (FSDP) | 0.30 | ~35 s |
 | CASPO online | 4 (FSDP) | **0.20** | ~45 s |
 | VinePPO K=9 | 8 (FSDP) | 0.30 | ~570 s |
+| VinePPO K=9 (u=0.45) | 8 (FSDP) | 0.45 | ~310 s (step 2) — ~33% per-MC-sample throughput gain |
 
 CASPO online needs the lower vLLM util because it carries a full
 trainable phi (params + Adam fp32 m+v ≈ 70 GB / 4 ranks = ~17 GB

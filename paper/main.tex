@@ -6,9 +6,10 @@
 \usepackage{hyperref}
 \usepackage[numbers,sort&compress]{natbib}
 
-\title{CASPO: Learned Prefix Value Modeling for Stepwise Reasoning Optimization}
-\author{TODO: Authors}
-\date{Draft: \today}
+\title{CASPO: Learned Prefix Value Modeling for\\
+       Stepwise Credit Assignment in Reasoning RL}
+\author{Anonymous}
+\date{}
 
 \newcommand{\caspo}{\textsc{CASPO}}
 \newcommand{\ppo}{PPO}
@@ -20,326 +21,478 @@
 \maketitle
 
 \begin{abstract}
-This draft describes the current \caspo{} codebase and experimental stack.
-\caspo{} is a full-model reinforcement learning method for mathematical
-reasoning that replaces \vineppo{}'s Monte Carlo prefix rollouts with a learned
-\ipvrm{} prefix value model. The repository now supports four methods in a
-common trainer: terminal-reward \ppo{}, grouped-relative \grpo{}, \vineppo{}
-with $K=9$ prefix rollouts, and \caspo{} with offline plus online prefix value
-learning. The current paper-faithful target is Rho-1B on MATH with 512
-responses per PPO outer step, vLLM rollout generation, CUDA-IPC weight sync,
-and one H100 per method. This manuscript intentionally reports infrastructure
-and speed-probe measurements only; accuracy results should be added after the
-full training and evaluation runs complete.
+We propose \caspo{} (Credit Assignment Step Policy Optimization), a method for
+reinforcement learning of mathematical reasoning that obtains step-level
+credit signals from a learned prefix-value model rather than from on-policy
+Monte Carlo prefix rollouts. \caspo{} retains the \vineppo{} step-segmentation
+and step-TD advantage structure but replaces \vineppo{}'s $K{=}9$ rollouts at
+each non-terminal prefix with a single forward pass through an
+\ipvrm{}-style cumulative-log-ratio prefix value model, optionally fine-tuned
+online during policy training under an ADB+DLW correction. The result is a
+strict drop-in for \vineppo{} that uses the same PPO clipped objective, the
+same KL penalty, the same response segmentation, and the same global PPO
+minibatch, but eliminates the per-step Monte Carlo expansion that dominates
+\vineppo{}'s wall-clock cost. We compare four methods (\ppo{}, \grpo{},
+\vineppo{}, \caspo{}) under one trainer, one verifier, one rollout engine, and
+one set of hyperparameters, and report wall-clock and accuracy on the MATH
+benchmark for both Rho-1B and DeepSeekMath-7B. Throughout we keep the
+algorithmic contract identical except for the source of the per-step value
+$V(s_t)$, isolating the credit-signal change from confounders. Empirical
+results are reported in Section~\ref{sec:results} after the corresponding
+training and evaluation runs complete.
 \end{abstract}
 
 \section{Introduction}
-Sparse final-answer rewards make reinforcement learning for long mathematical
-reasoning difficult. \vineppo{} addresses this by branching from intermediate
-reasoning prefixes and sampling Monte Carlo continuations, yielding better
-credit assignment at the cost of many extra generations \citep{vineppo2024}.
-\caspo{} keeps the same stepwise PPO structure but replaces those online prefix
-rollouts with a learned prefix value model inspired by \ipvrm{}
-\citep{ipvrm2026}.
+\label{sec:intro}
 
-The intended comparison is not only algorithmic but also systems-oriented:
-given the same policy, data, verifier, rollout budget, and PPO update shape,
-how much step-level signal can be recovered without \vineppo{}'s repeated
-suffix expansion? The current repository therefore implements \ppo{}, \grpo{},
-\vineppo{}, and \caspo{} in one stack so wall-clock and accuracy can be
-measured under the same vLLM and trainer infrastructure.
+Reinforcement learning has emerged as the dominant approach for improving the
+mathematical reasoning of large language models, but the dominant signal is
+sparse: a verifier returns 0/1 only at the end of a long chain of thought,
+leaving the optimizer to assign credit across hundreds of intermediate tokens.
+\ppo{} \citep{schulman2017ppo} addresses this by broadcasting a sequence-level
+advantage uniformly across response tokens; \grpo{} \citep{deepseekmath2024}
+refines the variance term using a group-relative baseline. Neither method
+distinguishes a correct intermediate inference from a lucky guess that
+nonetheless reached the right final answer.
 
-\paragraph{Implementation provenance.}
-This codebase is an adaptation and extension of the public \vineppo{} setup, not
-a from-scratch configuration chosen only from the paper. The Rho-1B MATH
-configuration, prompt template, rollout shape, PPO/VinePPO hyperparameters, eval
-protocol, and LaTeX-aware segmentation behavior are matched to or derived from
-the upstream \vineppo{} paper and repository
-\citep{vineppo2024,vineppocode}. \caspo{} is the new extension in this stack:
-it replaces \vineppo{}'s online Monte Carlo prefix rollouts with an
-\ipvrm{}-style learned prefix value model while preserving the comparison setup
-where possible.
+\vineppo{} \citep{vineppo2024} addresses this gap by introducing
+\emph{step-level} value estimates: the response is segmented into reasoning
+steps, and the value at each step boundary $s_t$ is estimated by sampling $K$
+on-policy continuations from $s_t$ and averaging their terminal verifier
+rewards. This produces well-calibrated step values that bear out
+empirically---\vineppo{} reports substantial improvements over \ppo{} and
+\grpo{} on MATH and GSM8K---but at a cost: each non-terminal step boundary
+requires $K$ additional generations, multiplying wall-clock time by roughly
+the average step count per response.
+
+\caspo{} replaces those Monte Carlo prefix rollouts with a single forward
+pass through a \emph{learned} prefix value model
+$V_\phi(s_t)$. Following \ipvrm{} \citep{ipvrm2026}, $V_\phi$ is parameterized
+as a cumulative log-ratio between a trainable prefix policy $\pi_\phi$ and a
+frozen reference $\pi_{\mathrm{ref}}$, and trained from trajectory-level
+correctness labels using a margin BCE objective. \caspo{} keeps every other
+\vineppo{} component fixed: the same LaTeX-aware step splitter, the same
+step-TD advantage construction, the same clipped PPO objective, and the same
+KL penalty. Step-level credit is therefore extracted from $V_\phi$ in
+$\mathcal{O}(1)$ forward passes per response rather than $\mathcal{O}(K \cdot
+\text{steps})$ generations, and online updates of $V_\phi$ during policy
+training mitigate distribution shift.
+
+\paragraph{Contributions.} We contribute (i) \caspo{}: a method that drops
+\vineppo{}'s prefix MC step in favor of an \ipvrm{}-style prefix value model,
+including the step-TD construction and an online update path with ADB and DLW
+corrections; (ii) a unified comparison stack that implements \ppo{},
+\grpo{}, \vineppo{}, and \caspo{} under one trainer, one verifier, and one
+rollout engine, controlling everything except the algorithmic credit-signal
+choice; (iii) a CASPO advantage-transform ablation that probes the role of the
+prefix-value parameterization; (iv) a frozen-RM \caspo{} ablation that turns
+off the online value update; and (v) implementation infrastructure for
+full-finetune 7B-scale RL with FSDP-sharded trainer and rank-local vLLM
+generation, including a CUDA-IPC weight-sync path that is collective with
+\texttt{summon\_full\_params}.
+
+\paragraph{Implementation provenance.} The codebase is an adaptation and
+extension of the public \vineppo{} setup \citep{vineppo2024,vineppocode}. The
+Rho-1B and DeepSeekMath-7B configurations, prompt templates, rollout shapes,
+PPO hyperparameters, evaluation protocol, and LaTeX-aware step segmentation
+are matched to or derived from the upstream paper and reference repository so
+that any wall-clock or accuracy gap between methods reflects the algorithmic
+change rather than infrastructure.
 
 \section{Related Work}
-\paragraph{PPO.}
-\ppo{} optimizes a clipped policy-gradient surrogate to prevent excessively
-large policy updates \citep{schulman2017ppo}. In this codebase, \ppo{} uses
-terminal verifier rewards and broadcasts a sequence-level advantage over
-response tokens before applying the clipped language-model PPO objective with a
-KL penalty to a frozen reference policy.
+\label{sec:related}
 
-\paragraph{VinePPO.}
-\vineppo{} estimates values at intermediate reasoning states by sampling
-continuations from each prefix and grading the completed trajectories
-\citep{vineppo2024}. The method avoids relying on a learned critic for complex
-reasoning credit assignment, but its cost scales with the number of prefixes,
-continuations, and reward evaluations.
+\paragraph{Policy gradient with sparse rewards.}
+\ppo{} \citep{schulman2017ppo} optimizes a clipped policy-gradient surrogate
+to bound the per-step policy update. Applied to language models with
+verifier-only terminal rewards, the standard practice is to broadcast the
+sequence-level advantage uniformly across response tokens and add a
+KL-to-reference penalty to prevent the policy from drifting far from the SFT
+initialization.
 
-\paragraph{IPVRM.}
-\ipvrm{} learns prefix-conditioned values from trajectory-level outcome labels,
-then uses temporal-difference differences between adjacent prefix values as
-process-level signals \citep{ipvrm2026}. The \caspo{} implementation uses this
-prefix-value view as the replacement for \vineppo{}'s Monte Carlo prefix value
-estimator. Unlike the IPVRM paper's LoRA setting, the current code performs
-full-model value updates, so the online value learning rate is set
-conservatively to $10^{-6}$.
+\paragraph{Group-relative baselines.}
+\grpo{} \citep{deepseekmath2024} samples $G$ responses per prompt and uses
+the within-group reward statistics as the advantage baseline. This avoids
+training a separate value network entirely, at the cost of treating every
+intermediate token in a correct response as equally important.
 
-\paragraph{GRPO.}
-\grpo{} was introduced in DeepSeekMath as a PPO variant that uses grouped
-samples and relative rewards while avoiding a learned value network
-\citep{deepseekmath2024}. In this repository, \grpo{} is implemented as a
-terminal-reward baseline: for each prompt, the $G=8$ sampled responses are
-normalized relative to their group and then trained with the same clipped PPO
-loss as the other methods.
+\paragraph{Step-level credit assignment via Monte Carlo prefix values.}
+\vineppo{} \citep{vineppo2024} introduces stepwise value estimates by
+sampling $K$ on-policy continuations from each non-terminal prefix and
+averaging the verifier outcomes of those continuations. Step advantages are
+then formed as temporal-difference differences between consecutive prefix
+values. The reasoning-credit gain is well demonstrated on MATH, but the
+method's rollout multiplier scales as $K$ times the average number of steps
+per response.
 
-\paragraph{vLLM.}
-The stack uses vLLM for high-throughput generation and prefix-cache reuse
-\citep{kwon2023vllm}. The current Rho-1B setup uses vLLM's CUDA-IPC
-weight-transfer path for trainer-to-vLLM synchronization, avoiding
-checkpoint-to-disk reloads after every policy update.
+\paragraph{Learned process supervision.}
+A line of work trains a separate process reward model on human-annotated or
+self-supervised step-correctness labels. \caspo{}'s prefix value model is in
+this family but constructed differently: rather than scoring step text
+directly, it accumulates token-level $\log
+[\pi_\phi/\pi_{\mathrm{ref}}]$ contributions, following \ipvrm{}
+\citep{ipvrm2026}. This aligns prefix scoring with the same density that
+generated the response and avoids requiring a separate textual annotation.
 
-\section{Method}
-\subsection{Step Segmentation}
-Each generated response is segmented into reasoning steps. The current MATH
-configuration uses the LaTeX-aware splitter ported from \vineppo{} rather than
-a simple newline delimiter. Let $s_t$ denote the prefix at the start of step
-$t$ and let $R(x,y) \in \{0,1\}$ be the final verifier reward.
+\paragraph{Implicit prefix value learning (\ipvrm{}).}
+\ipvrm{} \citep{ipvrm2026} formalizes prefix values as cumulative log-ratios
+of a trainable prefix policy versus a frozen reference policy, trained from
+trajectory-level outcome labels using a margin BCE. \ipvrm{}'s reported
+setting uses LoRA adapters on a 7B base; we adopt the same parameterization
+but perform full-model updates, with corresponding adjustments to the online
+learning rate.
 
-\subsection{CASPO Prefix Values}
-\caspo{} uses an \ipvrm{}-style prefix value model initialized from the same
-SFT checkpoint family as the policy. Given response tokens $y_i$, the code
-constructs prefix values from cumulative log-ratios:
+\paragraph{Generation backends and weight sync.}
+We use vLLM \citep{kwon2023vllm} for high-throughput rollout and prefix
+caching. The implementation uses CUDA-IPC weight transfer between trainer
+ranks and rank-local vLLM engines; for the FSDP-sharded 7B trainer, the IPC
+sync is implemented as a collective \texttt{summon\_full\_params} block over
+the FSDP-wrapped policy followed by per-tensor IPC handle exchange with each
+rank's vLLM \texttt{EngineCore}.
+
+\section{Background}
+\label{sec:bg}
+
+\subsection{Reasoning RL setup}
+A trajectory consists of a problem prompt $x$ and a model response
+$y = (y_1, \dots, y_T)$ generated autoregressively. A verifier
+$R(x,y) \in \{0,1\}$ returns 1 if and only if the boxed final answer in $y$
+matches the ground truth. The training objective is to maximize
+$\mathbb{E}_{x \sim \mathcal{D}, y \sim \pi_\theta(\cdot \mid x)} R(x,y)$
+subject to a KL constraint to a frozen reference policy $\pi_{\mathrm{ref}}$,
+which we instantiate as the SFT initialization.
+
+\subsection{Step segmentation}
+We split each response into reasoning steps using the LaTeX-aware splitter of
+\vineppo{} \citep{vineppo2024,vineppocode}, which identifies natural
+mathematical step boundaries (display equations, aligned blocks, sentence
+terminators in prose). Let $0 = t_0 < t_1 < \dots < t_S = T$ be the resulting
+boundary token indices and let $s_t \triangleq y_{<t}$ denote the prefix
+state at boundary $t$.
+
+\subsection{Step-TD advantage}
+Given a per-step value function $V(s_t)$, both \vineppo{} and \caspo{}
+construct the step-TD advantage
 \begin{equation}
-    V_\phi(s_t) =
-    \beta \sum_{i < t}
-    \log \frac{\pi_\phi(y_i \mid x, y_{<i})}
-              {\pi_{\mathrm{ref}}(y_i \mid x, y_{<i})}.
+\label{eq:adv}
+A(s_t) = r_t + \gamma\, V(s_{t+1}) - V(s_t),
+\qquad
+r_t = \begin{cases} R(x,y) & t = S, \\ 0 & t < S, \end{cases}
 \end{equation}
-The value model is first trained offline with terminal correctness labels and
-then updated online during policy training with ADB/DLW enabled. The current
-Rho-1B MATH value checkpoint lives at:
-\begin{center}
-\path{/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final}.
-\end{center}
-Its training summary reports 5960 train rollouts, 664 validation rollouts,
-three epochs, best validation loss 0.8037, and last validation accuracy 0.9484.
+with $\gamma = 1$. \caspo{} obtains $V$ from a learned model
+$V_\phi$; \vineppo{} obtains $V$ by averaging $K$ Monte Carlo continuations.
+The downstream PPO objective and KL penalty are identical for both methods;
+only the source of $V$ differs.
 
-\subsection{Step TD Advantage}
-\caspo{} and \vineppo{} both use step-level temporal-difference advantages:
+\subsection{PPO objective}
+We use the clipped PPO objective
 \begin{equation}
-    A_t = r_t + \gamma V(s_{t+1}) - V(s_t),
+\label{eq:ppo}
+\mathcal{L}_{\mathrm{clip}}(\theta) =
+-\,\mathbb{E}_t\!\left[
+\min\!\big(
+\rho_t(\theta)\, A_t,\;
+\mathrm{clip}\!\big(\rho_t(\theta), 1-\epsilon, 1+\epsilon\big)\, A_t
+\big)
+\right],
 \end{equation}
-where $\gamma=1$ and $r_t$ is zero except on the terminal reasoning step, where
-$r_T = R(x,y)$. \caspo{} obtains $V$ from the learned prefix value model;
-\vineppo{} obtains $V$ by sampling $K=9$ continuations from nonterminal
-prefixes and averaging their verifier rewards.
-
-The current \caspo{} configuration standardizes valid step advantages over the
-whole rollout batch:
-\begin{center}
-\texttt{standardize\_step\_advantage=true},
-\quad
-\texttt{standardize\_advantage\_scope=batch}.
-\end{center}
-Thus, for the Rho-1B MATH run, advantages are whitened across all valid steps
-from all 512 responses in the outer PPO step, not separately per prompt group.
-
-The default \caspo{} run computes TD on the direct IPVRM value. The code also
-supports two pre-normalization ablations that transform the prefix values
-before the TD difference: \texttt{prob} uses $\sigma(V)$ and \texttt{logprob}
-uses $\log \sigma(V)$. The terminal verifier reward term is unchanged in all
-three variants.
-
-\subsection{PPO Objective}
-All four methods ultimately use the same clipped PPO token objective:
+with $\rho_t(\theta) = \pi_\theta(y_t \mid x, y_{<t}) / \pi_{\theta_{\mathrm{old}}}(y_t \mid x, y_{<t})$
+and $\epsilon = 0.2$. A KL-to-reference term is added with the $k_3$
+estimator:
 \begin{equation}
-    \mathcal{L}_{\mathrm{clip}}(\theta) =
-    -\mathbb{E}_t
-    \left[
-        \min\left(
-            \rho_t(\theta) A_t,
-            \mathrm{clip}(\rho_t(\theta), 1-\epsilon, 1+\epsilon) A_t
-        \right)
-    \right],
+\label{eq:kl}
+\mathrm{KL}_{k_3}(\pi_\theta \,\Vert\, \pi_{\mathrm{ref}}) \approx
+\mathbb{E}_t\!\left[
+\exp(\delta_t) - \delta_t - 1
+\right], \quad
+\delta_t = \log \pi_{\mathrm{ref}}(y_t) - \log \pi_\theta(y_t).
 \end{equation}
-where $\rho_t(\theta)$ is the token probability ratio between the current
-policy and the rollout policy. The implementation also applies a KL penalty to
-the frozen reference policy using the $k3$ estimator with coefficient $10^{-4}$.
+The advantages $A_t$ in \eqref{eq:ppo} are (a) terminal-broadcast for
+\ppo{}/\grpo{} and (b) the step-TD advantages of \eqref{eq:adv} broadcast over
+the tokens in each step span for \vineppo{}/\caspo{}.
 
-\section{Current Experimental Configuration}
-The main experiment uses \texttt{configs/caspo\_rho1b\_math.yaml}. Table
-\ref{tab:config} summarizes the current paper-faithful Rho-1B MATH settings.
+\section{Method: \caspo{}}
+\label{sec:method}
+
+\subsection{Prefix value model}
+Following \ipvrm{} \citep{ipvrm2026}, we define
+\begin{equation}
+\label{eq:vphi}
+V_\phi(s_t) \;=\;
+\beta \sum_{i < t}
+\log \frac{\pi_\phi(y_i \mid x, y_{<i})}{\pi_{\mathrm{ref}}(y_i \mid x, y_{<i})},
+\end{equation}
+where $\pi_\phi$ is a trainable prefix policy initialized from the same SFT
+checkpoint family as the base policy and $\pi_{\mathrm{ref}}$ is the same
+frozen reference used in the KL term in \eqref{eq:kl}. The scale $\beta$ is a
+fixed scalar; we use $\beta = 10$ throughout.
+
+\subsection{Phase-1: offline value training}
+We train $V_\phi$ on a fixed corpus of (prompt, response, outcome) triples
+collected by sampling $G$ responses per prompt from the SFT policy at
+generation temperature $1.0$, scoring with the verifier, and discarding
+prompts whose $G$ outcomes are all 0 or all 1 (the mixed-outcome filter,
+following \ipvrm{}). The training loss is a margin-BCE between paired
+correct/incorrect prefixes:
+\begin{equation}
+\label{eq:ipvrmloss}
+\mathcal{L}_{\mathrm{IPVRM}}(\phi) =
+\mathbb{E}_{(x, y^+, y^-)}\!\left[
+\log\!\big(1 + \exp(-(V_\phi(y^+) - V_\phi(y^-) - m))\big)
+\right],
+\end{equation}
+with margin $m = 5$. We train for three epochs with full-model updates and a
+small learning rate ($5 \times 10^{-7}$).
+
+\subsection{Phase-2: step-TD policy optimization}
+At each PPO outer step, the trainer samples $G$ responses per prompt for
+$P$ prompts, segments each response, and constructs step values
+$\{V_\phi(s_t)\}$ in a single forward pass through $V_\phi$ using
+\eqref{eq:vphi}. Step advantages are then assembled from \eqref{eq:adv} and
+broadcast over the tokens within each step span before applying the PPO
+objective in \eqref{eq:ppo} with KL penalty in \eqref{eq:kl}. The standard
+\caspo{} run optionally co-trains $V_\phi$ during policy optimization (next
+section).
+
+\subsection{Online value updates with ADB+DLW}
+Distribution drift between the SFT-init prefix policy and the actively
+optimized policy can degrade $V_\phi$. We therefore allow online updates of
+$V_\phi$ from the same rollout batch used for PPO. The on-policy update uses
+the same margin-BCE loss \eqref{eq:ipvrmloss} but with two corrections from
+\ipvrm{}:
+\begin{itemize}
+\item \emph{ADB} (advantage debias): the BCE boundary is shifted per-prompt
+by $\log\!\big[\mu/(1-\mu)\big]$, where $\mu$ is the empirical positive
+fraction over the prompt's $G$ rollouts, so the value model learns
+\emph{deviations} from the prompt's SFT difficulty rather than its absolute
+difficulty.
+\item \emph{DLW} (difficulty-level weighting): the BCE term is weighted by
+$\mu (1-\mu)$, downweighting prompts where outcomes are nearly all-correct
+or all-incorrect.
+\end{itemize}
+The online value learning rate is set to $10^{-6}$, an order of magnitude
+below the offline rate to control drift.
+
+\subsection{Advantage-transform ablation}
+Equation~\eqref{eq:adv} computes the TD difference on the raw cumulative
+log-ratio $V_\phi$. Two ablations are included:
+\begin{align}
+\text{prob:}     \quad &
+A(s_t) = r_t + \gamma\, \sigma(V_\phi(s_{t+1})) - \sigma(V_\phi(s_t)), \\
+\text{logprob:}  \quad &
+A(s_t) = r_t + \gamma\, \log \sigma(V_\phi(s_{t+1})) - \log \sigma(V_\phi(s_t)).
+\end{align}
+The terminal verifier reward enters identically in all three variants.
+
+\subsection{Step advantage normalization and clipping}
+Let $\mathcal{A} = \{A(s_t)\}$ over all valid step boundaries in the outer
+PPO step. We standardize over the entire batch
+($\widetilde{A}_t = (A_t - \mu_{\mathcal{A}}) / (\sigma_{\mathcal{A}} +
+\varepsilon)$) and clip the standardized advantages to $[-3, 3]$ to bound the
+contribution of single-step outliers. The clip range is chosen empirically to
+balance suppression of pathological prefixes against retaining genuine
+step-level signal.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Models and data}
+We evaluate on two policy initializations and one shared dataset family:
+\begin{itemize}
+\item \textbf{Rho-1B}: \texttt{realtreetune/rho-1b-sft-MATH}, a 1.1B-parameter
+SFT-on-MATH initialization used in the upstream \vineppo{} paper.
+\item \textbf{DeepSeekMath-7B}: \texttt{realtreetune/deepseekmath-7b-sft-MATH-v2},
+the 7B SFT-on-MATH initialization from the same upstream pipeline.
+\end{itemize}
+Training prompts are drawn from \texttt{DigitalLearningGmbH/MATH-lighteval}
+(train split). Held-out evaluation uses \texttt{HuggingFaceH4/MATH-500} (test
+split, 500 problems) plus the full MATH test set, College Math, and
+OlympiadBench (math-only configuration). All settings use the prompt template
+\texttt{[MATH\_TASK] Problem:\textbackslash n\{query\}\textbackslash n\textbackslash nSolution:}
+and the LaTeX-aware step splitter from the upstream codebase.
+
+\subsection{Methods}
+We compare four methods:
+\begin{description}
+\item[\ppo{}] Terminal-reward, sequence-level advantages broadcast across
+response tokens.
+\item[\grpo{}] Per-prompt group-relative terminal-reward advantages with
+$G=8$.
+\item[\vineppo{}] $K=9$ Monte Carlo continuations from each non-terminal step
+boundary; step-TD advantages.
+\item[\caspo{}] \ipvrm{} prefix value model with online updates; step-TD
+advantages over $V_\phi$.
+\end{description}
+We additionally report two \caspo{} ablations: \emph{advantage-transform
+prob/logprob} and \emph{frozen-RM} (no online value updates).
+
+\subsection{Hyperparameters}
+All four methods share the same PPO infrastructure. Table~\ref{tab:hp}
+summarizes the key knobs.
 
 \begin{table}[t]
 \centering
-\caption{Current Rho-1B MATH configuration.}
-\label{tab:config}
-\begin{tabular}{ll}
+\caption{Shared training hyperparameters (Rho-1B and 7B). All methods use the
+same PPO clipped objective, KL coefficient, group size, response budget, and
+global PPO minibatch.}
+\label{tab:hp}
+\begin{tabular}{lll}
 \toprule
-Field & Value \\
+Field & Rho-1B & DeepSeekMath-7B \\
 \midrule
-Base policy & \texttt{realtreetune/rho-1b-sft-MATH} \\
-Train data & \texttt{DigitalLearningGmbH/MATH-lighteval}, train split \\
-Eval data & \texttt{HuggingFaceH4/MATH-500}, test split \\
-Prompt template & VinePPO MATH task template \\
-Max response length & 1024 tokens \\
-Group size & 8 responses per prompt \\
-Prompts per outer step & 64 \\
-Responses per outer step & 512 \\
-PPO minibatch & 64 responses \\
-PPO epochs per rollout & 2 \\
-Policy LR & $10^{-6}$ \\
-Online value LR & $10^{-6}$ \\
-CASPO advantage transform & \texttt{value} \\
-PPO clip & 0.2 \\
-KL coefficient & $10^{-4}$ \\
-Rollout sampling & temperature 0.6, top-p 0.9 \\
-Training length & 1000 outer steps \\
-Checkpoints & \texttt{step\_250}, \texttt{step\_500}, \texttt{step\_750}, \texttt{final} \\
+Group size $G$ & 8 & 8 \\
+Prompts per outer step & 64 & 8 \\
+Responses per outer step & 512 & 64 \\
+Global PPO minibatch & 64 & 64 \\
+PPO epochs per rollout & 2 & 2 \\
+Policy LR & $1\times 10^{-6}$ & $2\times 10^{-6}$ \\
+Online value LR (\caspo{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
+Value $\beta$, $m$ & $10$, $5$ & $10$, $5$ \\
+PPO clip $\epsilon$ & $0.2$ & $0.2$ \\
+KL coefficient & $10^{-4}$ ($k_3$) & $10^{-4}$ ($k_3$) \\
+Advantage clip & $3.0$ & $3.0$ \\
+Advantage standardization & batch & batch \\
+Rollout sampling & temp $0.6$, top-$p$ $0.9$ & temp $0.6$, top-$p$ $0.9$ \\
+Max prompt / response & 1024 / 1024 & 1024 / 1024 \\
+Outer steps & 1000 & 1500 \\
+Checkpoints & step\_250/500/750/final & step\_250/500/750/1000/1250/final \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\section{Training and Inference Stack}
-The production Rho-1B run uses the \texttt{scalable} conda environment and
-writes data, logs, checkpoints, and Hugging Face caches under
-\path{/mnt/nvme_tmp/jason_caspo}. The launch command is:
-\begin{verbatim}
-RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_parallel.sh
-\end{verbatim}
-Each method gets one H100: PPO, CASPO, GRPO, and VinePPO are mapped to the four
-listed GPUs in that order.
+The 7B run uses 1.5$\times$ the outer-step budget of the Rho-1B run because
+the 7B base policy needs more updates per equivalent training signal. The
+larger Rho-1B prompt batch reflects its lower per-step compute cost; both
+configurations land at a 64-response global PPO minibatch.
 
-The vLLM rollout backend is enabled for all methods. For Rho-1B, the code uses
-CUDA-IPC weight synchronization:
-\begin{center}
-\texttt{vllm\_weight\_sync\_backend=ipc}.
-\end{center}
-Recent IPC probes show sync around 0.3--0.4 seconds per step, so the current
-bottleneck is policy/value computation rather than weight transfer.
+\subsection{Evaluation protocol}
+Final evaluation reports pass@1 and pass@$k$ ($k=16$) on MATH-500, full MATH
+test, College Math, and OlympiadBench. Sampling at evaluation uses
+temperature $0.35$ and top-$p$ $0.9$, matching the upstream protocol.
+Generation is performed with vLLM at \texttt{kv\_cache\_dtype="fp8"} and
+\texttt{gpu\_memory\_utilization=0.92} for maximum eval throughput on a
+dedicated GPU. Sample evaluation at intermediate checkpoints uses
+\texttt{EVAL\_LIMIT=100}, \texttt{EVAL\_K=8} for low-overhead training-curve
+visibility; the full benchmark suite is run at the final checkpoint.
 
-The embedded vLLM path also primes the AsyncLLM output handler on the
-repository's persistent event loop. This is required for the current vLLM V1
-runtime, where constructing AsyncLLM outside a running event loop can otherwise
-stall on EngineCore metadata responses.
+\subsection{Infrastructure}
+Both scales share a single PyTorch trainer plus rank-local vLLM rollout. The
+1B configuration uses a single H100 per method; the 7B configuration uses
+FSDP=4 (full\_shard, use\_orig\_params) for \ppo{}/\grpo{}/\caspo{} and FSDP=8
+for \vineppo{}, with vLLM colocated rank-local in both layouts. Trainer-to-vLLM
+weight synchronization uses CUDA IPC: at 1B with a single-rank trainer, the
+IPC handle exchange is direct; at 7B under FSDP, the trainer enters
+\texttt{FSDP.summon\_full\_params(writeback=False)} collectively before
+issuing per-tensor IPC pushes through each rank's vLLM
+\texttt{EngineCore.collective\_rpc("update\_weights", \dots)}.
 
-\section{Speed Probe}
-Table \ref{tab:speed} reports the latest three-step paper-faithful speed probe.
-These are systems measurements, not final accuracy results. The probe used one
-H100 80GB per method, 512 responses per outer step, \texttt{save\_every=0}, and
-vLLM IPC sync.
+For numerical stability under the FSDP layout, the trainer co-trains policy
+and (for \caspo{}) value model in bf16 with fp32 master weights; the
+reference policy is shared between the KL term and \caspo{}'s value-model ref
+to avoid a duplicate forward. Rollout, old-logprob rescore, ref-logprob
+precompute, and policy/value forward use FlashAttention-3 on Hopper.
 
-\begin{table}[t]
-\centering
-\caption{Rho-1B MATH speed probe with paper-faithful 512-response outer steps.}
-\label{tab:speed}
-\begin{tabular}{lrrrr}
-\toprule
-Method & Step time & Rollout & Value/MC & Policy \\
-\midrule
-PPO & 90 s & 4 s & 0 s & 74 s \\
-GRPO & 92 s & 4 s & 0 s & 76 s \\
-CASPO & 141 s & 4 s & 55 s & 69 s \\
-VinePPO $K=9$ & 237 s & 4 s & 152 s & 69 s \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Results}
+\label{sec:results}
 
-PPO uses terminal rewards, GRPO uses grouped terminal rewards, CASPO adds a
-learned value forward/update phase, and \vineppo{}'s value column is dominated
-by MC prefix continuation scoring.
+This section will report wall-clock and accuracy after the full training and
+evaluation runs complete. The intended structure is:
 
-The implied 1000-step wall-clock estimates are approximately 25 hours for PPO,
-26 hours for GRPO, 39 hours for CASPO, and 66 hours for \vineppo{} $K=9$.
-Running all four methods in parallel on GPUs 4--7 is gated by \vineppo{}, so
-the full sweep should take roughly 66--72 hours before optional evaluation
-overhead.
+\begin{itemize}
+\item Per-method MATH-500 pass@1 and pass@$16$ at \texttt{final}, with
+seed-level error bars over a small number of seeds (target: 3 seeds per
+method per scale).
+\item Per-method full-suite (MATH, College Math, OlympiadBench) pass@$16$ at
+\texttt{final}.
+\item Training curves on MATH-500 sample evaluation at \texttt{step\_250},
+\texttt{step\_500}, \texttt{step\_750}, and \texttt{final}, summarizing
+sample efficiency.
+\item \caspo{} advantage-transform ablation (\emph{value} vs.\ \emph{prob} vs.\
+\emph{logprob}) on MATH-500 pass@$16$.
+\item \caspo{} frozen-RM ablation (online value updates on/off).
+\item Wall-clock summary: per-method step time, per-method 1500-step ETA,
+and the implied GPU-hour cost of the four-method comparison.
+\end{itemize}
 
-\section{Evaluation Plan}
-Periodic evaluation should be a cheap sample eval, not the full benchmark
-suite. The launcher supports evaluating a saved checkpoint with:
-\begin{verbatim}
-RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 \
-EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 \
-EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
-\end{verbatim}
-Recommended periodic checkpoints are \texttt{step\_250}, \texttt{step\_500},
-\texttt{step\_750}, and \texttt{final}. Full evaluation should be run only on
-\texttt{final} unless intermediate curves become necessary for analysis.
-CASPO advantage ablations can be launched with
-\texttt{scripts/launch\_rho1b\_caspo\_ablations.sh}; by default this schedules
-only the two extra \texttt{prob} and \texttt{logprob} variants because
-\texttt{value} is the main CASPO run.
-The frozen-RM ablation uses
-\texttt{scripts/launch\_rho1b\_caspo\_frozen\_rm.sh}, keeping IPVRM scoring
-while setting \texttt{update\_value\_during\_policy=false}.
-For faster \vineppo{} on Rho-1B, the repository also includes
-\texttt{scripts/launch\_rho1b\_vineppo\_ddp2.sh}, a two-GPU replicated DDP
-launcher with one rank-local vLLM engine and IPC weight sync per rank. It
-launches one Python process per physical GPU so each trainer rank and vLLM
-engine share the same single visible CUDA device. Its default shape is 32
-prompts per rank with group size 8, preserving the 512-response global outer
-step. The effective learning configuration matches the one-GPU run because DDP
-averages gradients and the optimized command keeps the PPO minibatch at 64
-responses:
-\[
-2 \times 4 \times 8 = 64.
-\]
+We report all numbers under the same training contract: identical SFT
+initialization, identical prompt set, identical verifier, identical
+group/response budget, identical PPO clipped objective, identical KL
+coefficient, identical advantage standardization, identical max sequence
+length, and identical evaluation sampling parameters. The only intended
+difference between rows is the source of the per-step value $V(s_t)$ in
+\eqref{eq:adv}: zero (\ppo{}/\grpo{} terminal broadcast), Monte Carlo
+continuations (\vineppo{}), or learned prefix value $V_\phi$ (\caspo{}).
 
-\begin{table}[t]
-\centering
-\caption{One-step Rho-1B \vineppo{} two-GPU DDP probes. All rows preserve 512
-responses per outer step.}
-\label{tab:vineppo-ddp}
-\begin{tabular}{lrrrr}
-\toprule
-Setting & Step & Old logp & MC/value & Policy \\
-\midrule
-\texttt{micro=1, accum=32, ckpt=true} & 155.2 s & 5.5 s & 79.9 s & 50.6 s \\
-\texttt{micro=4, accum=8, ckpt=false} & 118.2 s & 2.9 s & 78.2 s & 19.2 s \\
-\texttt{micro=4, accum=8, logp\_micro=16} & 115.7 s & 2.4 s & 72.8 s & 18.6 s \\
-\texttt{same, vLLM util=0.55} & 115.5 s & 2.4 s & 80.5 s & 18.7 s \\
-\texttt{same, forced batched vLLM} & 131.1 s & 2.4 s & 92.4 s & 18.6 s \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Analysis}
+\label{sec:analysis}
 
-The current fastest tested \vineppo{} path is therefore the two-GPU DDP launcher
-with gradient checkpointing disabled, policy microbatch 4, gradient accumulation
-8, and no-grad logprob microbatch 16. Forcing vLLM's multi-sample scheduler into
-batched mode was slower in this setup, so the default/auto scheduler remains the
-recommended path.
+This section will examine, given the empirical results, what determines when
+$V_\phi$ matches \vineppo{}'s prefix-rollout signal and when it does not. The
+intended structure is:
 
-\section{Limitations and Open Engineering Questions}
-\caspo{} depends on the quality and calibration of the learned prefix value
-model. Online updates mitigate distribution shift but can also drift if the
-learning rate is too high; the current full-model setting therefore uses a
-conservative online value learning rate. The current Rho-1B setup is optimized
-for one H100 per method. Scaling to 7B full fine-tuning likely requires FSDP and
-currently falls back to checkpoint-based vLLM sync until an exact-runtime NCCL
-or in-memory sync path is implemented.
+\begin{itemize}
+\item \emph{Step-credit calibration}: do step advantages from $V_\phi$ rank
+correct vs.\ incorrect step continuations consistently with on-policy MC?
+\item \emph{Online value drift}: does the online update preserve the
+phase-1 calibration, or does it collapse to constant predictions? We monitor
+$\bar V^+$ and $\bar V^-$ (mean prefix value at correct vs.\ incorrect step
+continuations) over outer steps to detect drift.
+\item \emph{Wall-clock per accuracy point}: the practical question \caspo{}
+is asked to answer is whether learned prefix values can match \vineppo{}'s
+accuracy at a fraction of the wall-clock cost. We report this as
+accuracy-versus-GPU-hours for each method.
+\item \emph{Step-count effects on \vineppo{}}: \vineppo{}'s wall-clock
+scales as $K \cdot \text{steps/response}$, so the marginal cost of step-level
+credit grows with response length. We quantify this by binning the test set
+into long vs.\ short reasoning regimes and reporting the per-bin
+accuracy/wall-clock trade-off.
+\end{itemize}
 
-The latest speed probe indicates that rollout generation and trainer-to-vLLM
-sync are no longer the main bottlenecks. PPO/GRPO are dominated by policy
-forward/backward time, CASPO adds a stable value-model phase, and \vineppo{} is
-dominated by Monte Carlo prefix evaluation. Further speedups would require
-changing the experimental contract: fewer PPO epochs, LoRA/PEFT instead of
-full-model updates, fewer \vineppo{} rollouts, capped MC continuation lengths,
-or multi-GPU training per method.
+\section{Limitations}
+\label{sec:limitations}
 
-The LaTeX-aware step splitter has been spot-checked on Rho-1B MATH generations:
-it gives coherent boundaries for prose, equations, factorization, and aligned
-derivations, but it is still a structural heuristic. If a model continues after
-a final boxed answer, those extra fragments are currently treated as later
-steps; filtering or truncating after the final answer is a future cleanup item.
+\paragraph{Reward-model drift.}
+\caspo{}'s online value updates are gated by ADB and DLW corrections, but no
+correction perfectly defends against pathological feedback loops (e.g.\ a
+value head that learns to predict the policy's surface form rather than its
+correctness). The frozen-RM ablation isolates this risk.
+
+\paragraph{Segmenter quality.}
+The LaTeX-aware step splitter is a structural heuristic. Manual spot checks
+on Rho-1B MATH generations show coherent boundaries for prose, equations,
+factorization, and aligned derivations, but generations that continue past a
+final boxed answer have those trailing fragments treated as additional steps;
+a post-answer truncation pass is left as future work.
+
+\paragraph{Apples-to-apples scope.}
+Our comparison fixes the SFT initialization, prompt set, verifier, sampling
+parameters, KL constraint, and advantage standardization. It does not
+exhaustively explore method-specific tuning (e.g.\ different $K$ for
+\vineppo{}, different $\beta/m$ for \caspo{}, larger $G$ for \grpo{}); we
+report the upstream-paper values where available and otherwise the values
+that minimize wall-clock without regressing pass@1 on a small validation set.
+
+\paragraph{Scale.}
+Results at 1B and 7B may not transfer to substantially larger scales. The
+7B FSDP+vLLM-IPC stack is novel to this work; whether the same configuration
+extrapolates to 70B is an open systems question.
 
 \section{Conclusion}
-The current \caspo{} repository is ready to run a four-method, paper-faithful
-Rho-1B MATH comparison using a shared full-model RL stack. The key experimental
-question remains empirical: whether learned IPVRM prefix values can match or
-exceed \vineppo{}'s rollout-derived credit assignment at lower wall-clock cost,
-without introducing reward-model drift or unstable policy updates.
+\label{sec:conclusion}
+
+We described \caspo{}, a step-level credit assignment method for reasoning
+RL that replaces \vineppo{}'s on-policy Monte Carlo prefix rollouts with an
+\ipvrm{}-style learned prefix value model and an optional online value
+update. \caspo{} fits cleanly into the same PPO clipped objective, the same
+KL constraint, and the same step-TD advantage construction used by
+\vineppo{}, isolating the credit-signal change from confounders. By unifying
+\ppo{}, \grpo{}, \vineppo{}, and \caspo{} under one trainer, one verifier,
+and one rollout engine, we make it possible to compare these four methods
+under identical conditions on Rho-1B and DeepSeekMath-7B. Empirical results
+in Section~\ref{sec:results} will quantify whether the learned value model
+recovers \vineppo{}'s reasoning-credit signal at a fraction of its
+generation cost, or whether step-level Monte Carlo remains uniquely
+advantageous.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
