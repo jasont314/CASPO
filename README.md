@@ -105,9 +105,9 @@ source "$(dirname "$0")/perf_env.sh"   # if launcher lives in scripts/
 source ./scripts/perf_env.sh           # if launcher cd's to repo root first
 ```
 
-Already wired into `scripts/launch_eval_all.sh`. The in-flight launchers
-(`chain_caspo_phases.sh`, `launch_rho1b_parallel.sh`) are NOT modified
-mid-run — apply this between runs only.
+Already wired into the project launchers. `launch_rho1b_parallel.sh` and
+`launch_eval_all.sh` default to GPUs 4-7 and can be redirected with
+`GPU_LIST="4 5 6 7"` / `EVAL_GPU_LIST="4 5 6 7"`.
 
 ## Optimized Full-Model RL
 
@@ -131,6 +131,8 @@ This enables:
 - `vllm_multi_sample_mode=auto`: use vLLM `SamplingParams(n=K)` when the
   installed runtime returns all completions, otherwise fall back to the safe
   expanded request path.
+- `vllm_weight_sync_backend=checkpoint`: FSDP still uses checkpoint reload
+  until NCCL trainer-to-vLLM sync is implemented.
 
 `prompts_per_step` is interpreted per rank in this mode, so the global prompt
 batch is `prompts_per_step * NUM_GPUS`.
@@ -139,9 +141,20 @@ The project launchers default to `/opt/conda/envs/scalable/bin/python` (and
 `/opt/conda/envs/scalable/bin/torchrun` for FSDP). Override `PYTHON_BIN` or
 `TORCHRUN_BIN` only when intentionally testing another environment.
 
-For 1B single-GPU H100 runs, leave `vllm_enforce_eager=false` unless CUDA graph
-memory becomes a problem. Recent speed probes show rollout generation is not
-the bottleneck; per-step trainer-to-vLLM weight sync is.
+For 1B single-GPU H100 runs, the Rho configs use
+`vllm_weight_sync_backend=ipc`. This uses vLLM's CUDA-IPC RL weight-transfer API
+and removes the checkpoint-to-disk sync bottleneck. Validate a runtime with:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 /opt/conda/envs/scalable/bin/python \
+  -m scripts.probe_vllm_ipc_sync \
+  --config configs/caspo_rho1b_math.yaml \
+  --output-dir /tmp/caspo_vllm_ipc_probe
+```
+
+Leave `vllm_enforce_eager=false` unless CUDA graph memory becomes a problem.
+Recent Rho-1B H100 probes with IPC show sync at ~0.3-0.4s/step; rollout and
+policy/value forward now dominate.
 
 VinePPO remains intrinsically slower than PPO because it samples K continuations
 at each reasoning-step prefix. The optimized path batches mixed prefix budgets
