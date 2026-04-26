@@ -9,7 +9,9 @@
 #   RUN_TAG=paper512_seed0 SAVE_EVERY=100 WANDB_MODE=offline ./scripts/launch_rho1b_parallel.sh
 #
 # Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math${RUN_SUFFIX}/logs.
-# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/final.
+# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/.
+# Default checkpoint cadence is save_every=250, yielding step_250, step_500,
+# step_750, and final for a 1000-step run.
 #
 set -eo pipefail
 # Don't use 'set -u' — conda activate scripts have unbound vars.
@@ -55,12 +57,10 @@ trap 'echo "[launch] ERR at line $LINENO (rc=$?)"' ERR
 COMMON_OVERRIDES=(
     --override vllm_gpu_memory_utilization=0.45
     --override vllm_enforce_eager=false
+    --override "save_every=${SAVE_EVERY:-250}"
     --override "wandb_mode=${WANDB_MODE:-online}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )
-if [[ -n "${SAVE_EVERY:-}" ]]; then
-    COMMON_OVERRIDES+=(--override "save_every=${SAVE_EVERY}")
-fi
 if [[ -n "${MAX_STEPS:-}" ]]; then
     COMMON_OVERRIDES+=(--override "max_steps=${MAX_STEPS}")
 fi
