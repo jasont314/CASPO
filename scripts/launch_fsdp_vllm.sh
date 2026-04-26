@@ -11,6 +11,7 @@ set -euo pipefail
 #   PREFIX_VALUE_PATH=out/value/final \
 #   NUM_GPUS=8 \
 #   scripts/launch_fsdp_vllm.sh
+# Restrict physical GPUs with GPU_LIST, e.g. GPU_LIST="4 5 6 7" NUM_GPUS=4.
 #
 # Extra train_caspo.py args can be appended after the script name.
 
@@ -20,6 +21,14 @@ source scripts/perf_env.sh
 TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/scalable/bin/torchrun}"
 CONFIG="${CONFIG:-configs/caspo_qwen25_math_7b.yaml}"
 NUM_GPUS="${NUM_GPUS:-}"
+if [[ -n "${GPU_LIST:-}" ]]; then
+    read -r -a _GPU_ARRAY <<< "${GPU_LIST}"
+    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${_GPU_ARRAY[*]}")"
+    if [[ -z "${NUM_GPUS}" ]]; then
+        NUM_GPUS="${#_GPU_ARRAY[@]}"
+    fi
+    echo "[fsdp] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NUM_GPUS=${NUM_GPUS}"
+fi
 if [[ -z "${NUM_GPUS}" ]]; then
     if command -v nvidia-smi >/dev/null 2>&1; then
         NUM_GPUS="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"

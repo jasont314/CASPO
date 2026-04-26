@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Auto-chain CASPO phases:
 #   1. wait for phase 1a (collect) to finish — signal: value_data.pt exists
-#   2. launch phase 1b (V_φ training) on GPU 0
+#   2. launch phase 1b (V_φ training) on VALUE_GPU (default 0)
 #   3. wait for phase 1b to finish — signal: final/ exists with caspo_value_meta.json
-#   4. launch CASPO RL (phase 2) on GPU 3
+#   4. launch CASPO RL (phase 2) on CASPO_GPU (default 3)
 #
 # Ignores GRPO/VinePPO which were launched separately on GPUs 1-2.
 #
@@ -19,6 +19,8 @@ cd "$(dirname "$0")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
+VALUE_GPU="${VALUE_GPU:-0}"
+CASPO_GPU="${CASPO_GPU:-3}"
 trap 'echo "[chain] ERR at line $LINENO (rc=$?)"' ERR
 
 ROOT=/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math
@@ -49,8 +51,8 @@ until [[ -f "$VALUE_DATA" ]]; do
 done
 echo "[chain] $(date) phase 1a DONE — value_data.pt ready"
 
-echo "[chain] $(date) launching phase 1b (V_φ training) on GPU 0"
-CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m scripts.train_value \
+echo "[chain] $(date) launching phase 1b (V_φ training) on GPU ${VALUE_GPU}"
+CUDA_VISIBLE_DEVICES="${VALUE_GPU}" "$PYTHON_BIN" -u -m scripts.train_value \
     --config configs/caspo_rho1b_math.yaml \
     > "$LOGDIR/phase1b_train_value.log" 2>&1
 RC=$?
@@ -72,8 +74,8 @@ if [[ ! -L "$ROOT/value_final" && ! -d "$ROOT/value_final" ]]; then
 fi
 echo "[chain] $(date) phase 1b DONE — V_φ trained ($FOUND)"
 
-echo "[chain] $(date) launching CASPO RL on GPU 3"
-CUDA_VISIBLE_DEVICES=3 nohup "$PYTHON_BIN" -u -m scripts.train_caspo \
+echo "[chain] $(date) launching CASPO RL on GPU ${CASPO_GPU}"
+CUDA_VISIBLE_DEVICES="${CASPO_GPU}" nohup "$PYTHON_BIN" -u -m scripts.train_caspo \
     --config configs/caspo_rho1b_math.yaml \
     --override method=caspo \
     --override output_dir=/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo \

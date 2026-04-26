@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Phase 4b — launch PPO + CASPO + GRPO + VinePPO baselines in parallel on Rho-1B-MATH.
-# Each method gets one GPU (trainer + vLLM share); 4 methods on GPUs 0-3.
+# Each method gets one GPU (trainer + vLLM share). Override GPU_LIST to choose
+# physical GPU IDs, e.g. GPU_LIST="4 5 6 7" ./scripts/launch_rho1b_parallel.sh
 #
 # Usage:
 #   ./scripts/launch_rho1b_parallel.sh
@@ -26,6 +27,12 @@ BASE_CONFIG=configs/caspo_rho1b_math.yaml
 LOGDIR="$ROOT/caspo_rho1b_math/logs"
 mkdir -p "$LOGDIR"
 PIDS=()
+read -r -a GPUS <<< "${GPU_LIST:-3 0 1 2}"
+if (( ${#GPUS[@]} < 4 )); then
+    echo "[launch] ERROR: GPU_LIST must contain at least 4 GPU ids; got: ${GPU_LIST:-}"
+    exit 2
+fi
+echo "[launch] using GPUs: ${GPUS[*]} (ppo caspo grpo vineppo)"
 
 cleanup() {
     local rc=$?
@@ -67,16 +74,16 @@ launch_method() {
 }
 
 # PPO — sequence-level terminal reward advantage baseline.
-launch_method ppo 3 "--override update_value_during_policy=false"
+launch_method ppo "${GPUS[0]}" "--override update_value_during_policy=false"
 
 # CASPO with online IPVRM + ADB+DLW (default)
-launch_method caspo 0 ""
+launch_method caspo "${GPUS[1]}" ""
 
 # GRPO — no V_φ; the trainer only requires prefix_value_path for method=caspo.
-launch_method grpo 1 "--override update_value_during_policy=false"
+launch_method grpo "${GPUS[2]}" "--override update_value_during_policy=false"
 
 # VinePPO — no V_φ; uses sample_with_prefix MC values at each prefix.
-launch_method vineppo 2 "--override update_value_during_policy=false --override vineppo_mc_rollouts=9"
+launch_method vineppo "${GPUS[3]}" "--override update_value_during_policy=false --override vineppo_mc_rollouts=9"
 
 echo "[launch] all ${#PIDS[@]} methods started; logs in $LOGDIR/"
 
