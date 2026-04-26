@@ -7,6 +7,7 @@ import torch
 from caspo.algo.advantages import (
     step_values_from_log_ratios,
     step_td_advantage,
+    transform_step_values_for_advantage,
     standardize_step_advantage,
     broadcast_step_advantage_to_tokens,
 )
@@ -128,6 +129,41 @@ def test_td_advantage_padding_zero():
     assert A[1, 1].item() == 0.0
     # Row 1 step 0 (terminal): r + V[1] - V[0] = 1 + 0.3 - 0 = 1.3
     assert torch.allclose(A[1, 0], torch.tensor(1.3))
+
+
+def test_transform_step_values_for_advantage_modes():
+    V = torch.tensor([[-2.0, 0.0, 2.0]], dtype=torch.float32)
+
+    direct = transform_step_values_for_advantage(V, "value")
+    prob = transform_step_values_for_advantage(V, "prob")
+    logprob = transform_step_values_for_advantage(V, "logprob")
+
+    assert direct is V
+    assert torch.allclose(prob, torch.sigmoid(V))
+    assert torch.allclose(logprob, torch.nn.functional.logsigmoid(V))
+    assert prob.min().item() > 0.0
+    assert prob.max().item() < 1.0
+    assert torch.isfinite(logprob).all()
+
+
+def test_td_advantage_transform_changes_raw_pre_normalization_signal():
+    V = torch.tensor([[0.0, 1.0, 3.0]], dtype=torch.float32)
+    r = torch.tensor([1.0])
+    sc = torch.tensor([2], dtype=torch.long)
+
+    A_direct = step_td_advantage(
+        transform_step_values_for_advantage(V, "value"), r, sc, gamma=1.0,
+    )
+    A_prob = step_td_advantage(
+        transform_step_values_for_advantage(V, "prob"), r, sc, gamma=1.0,
+    )
+    A_logprob = step_td_advantage(
+        transform_step_values_for_advantage(V, "logprob"), r, sc, gamma=1.0,
+    )
+
+    assert not torch.allclose(A_direct, A_prob)
+    assert not torch.allclose(A_direct, A_logprob)
+    assert not torch.allclose(A_prob, A_logprob)
 
 
 # ---------------------------------------------------------------------------

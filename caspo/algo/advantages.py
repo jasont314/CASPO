@@ -16,6 +16,7 @@ Implements:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def step_values_from_log_ratios(
@@ -262,6 +263,34 @@ def step_td_advantage(
     if A.dtype != dtype:
         A = A.to(dtype)
     return A
+
+
+def transform_step_values_for_advantage(
+    V_step: torch.Tensor,
+    transform: str = "value",
+) -> torch.Tensor:
+    """Apply a CASPO ablation transform before step-TD advantages.
+
+    The IPVRM value model emits an unbounded cumulative log-ratio value. For
+    CASPO ablations, TD can be computed on that direct value, its
+    success-probability interpretation, or its log-probability interpretation.
+    The terminal verifier reward in ``step_td_advantage`` is unchanged; only
+    the prefix value scale is changed here.
+    """
+    if transform == "value":
+        return V_step
+    if transform == "prob":
+        compute = V_step.float() if V_step.dtype in (torch.float16, torch.bfloat16) else V_step
+        out = torch.sigmoid(compute)
+        return out.to(V_step.dtype) if out.dtype != V_step.dtype else out
+    if transform == "logprob":
+        compute = V_step.float() if V_step.dtype in (torch.float16, torch.bfloat16) else V_step
+        out = F.logsigmoid(compute)
+        return out.to(V_step.dtype) if out.dtype != V_step.dtype else out
+    raise ValueError(
+        f"unknown CASPO advantage transform {transform!r}; "
+        "must be 'value', 'prob', or 'logprob'"
+    )
 
 
 def standardize_step_advantage(

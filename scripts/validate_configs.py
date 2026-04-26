@@ -40,6 +40,7 @@ REPORT_KEYS: tuple[str, ...] = (
     "method",
     "lr",
     "online_value_lr",
+    "caspo_advantage_transform",
     "kl_coef",
     "max_steps",
     "group_size",

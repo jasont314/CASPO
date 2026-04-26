@@ -7,7 +7,8 @@
 #   ./scripts/launch_eval_all.sh
 #   EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 #   RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
-#   RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_200 EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 ./scripts/launch_eval_all.sh
+#   RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 EVAL_BENCHMARKS=math500 EVAL_LIMIT=100 EVAL_K=8 ./scripts/launch_eval_all.sh
+#   METHODS="caspo_prob caspo_logprob" RUN_TAG=paper512_seed0 ./scripts/launch_eval_all.sh
 #
 # Each method gets one GPU; runs sequentially per method but parallel across methods.
 
@@ -67,7 +68,7 @@ if [[ -n "${EVAL_LIMIT:-}" ]]; then
 fi
 BENCH_TAG="${BENCHMARKS//,/+}"
 CKPT_TAG="${CKPT_SUBDIR//\//_}"
-METHODS=(caspo grpo vineppo ppo)
+read -r -a METHODS <<< "${METHODS:-caspo grpo vineppo ppo}"
 IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-4 5 6 7}"
 if (( ${#EVAL_GPUS[@]} < ${#METHODS[@]} )); then
     echo "[eval] EVAL_GPU_LIST must provide at least ${#METHODS[@]} GPUs; got: ${EVAL_GPU_LIST:-4 5 6 7}" >&2
@@ -111,7 +112,7 @@ for i in "${!METHODS[@]}"; do
 done
 
 echo "[eval] launched ${#PIDS[@]} job(s); logs in $LOGDIR/"
-echo "[eval] aggregate results live at $ROOT/caspo_rho1b_math_<method>/eval_results.json"
+echo "[eval] aggregate results live under $ROOT/caspo_rho1b_math_<method>${RUN_SUFFIX}/"
 
 # Wait for each child and report any non-zero exits without aborting the
 # remaining evals.

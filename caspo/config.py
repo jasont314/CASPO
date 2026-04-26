@@ -51,6 +51,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "rollout_backend": ("hf", "vllm"),
     "segmentation_mode": ("token_delimiter", "latex_aware"),
     "method": ("ppo", "caspo", "grpo", "vineppo"),
+    "caspo_advantage_transform": ("value", "prob", "logprob"),
     "standardize_advantage_scope": ("batch", "group", "off"),
     "kl_estimator": ("k1", "k3"),
     "wandb_mode": ("online", "offline", "disabled"),
@@ -187,6 +188,14 @@ class CASPOConfig:
     # the paper-faithful remaining-response budget; positive values cap each
     # prefix continuation to this many new tokens.
     vineppo_mc_max_tokens: int = 0
+    # CASPO ablation knob for the value signal used in step TD advantages.
+    # The raw prefix value V is still produced by the IPVRM log-ratio model;
+    # this transform is applied to V_step before ``r_t + gamma V_{t+1} - V_t``
+    # and before advantage normalization/clipping.
+    # * "value":   direct IPVRM value TD difference (current/default CASPO)
+    # * "prob":    sigmoid(V) TD difference
+    # * "logprob": log sigmoid(V) TD difference
+    caspo_advantage_transform: Literal["value", "prob", "logprob"] = "value"
 
     # ---- step-level TD ----
     gamma: float = 1.0                # discount; VinePPO uses 1.0

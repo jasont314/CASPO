@@ -71,6 +71,9 @@ use_adb: true
 use_dlw: true
 adb_dlw_eps: 0.05
 
+# CASPO advantage ablations: value (current), prob, logprob.
+caspo_advantage_transform: value
+
 # step TD
 gamma: 1.0
 standardize_step_advantage: true

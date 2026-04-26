@@ -44,6 +44,7 @@ Matched settings:
 - Policy LR: `1e-6`
 - Warmup: 480 optimizer updates
 - KL coefficient: `1e-4`
+- CASPO advantage transform: `value`
 - Sampling: temperature `0.6`, top-p `0.9`, max response length 1024
 - Training length: 1000 outer steps
 
@@ -117,6 +118,42 @@ SAVE_EVERY=100 RUN_TAG=short ./scripts/launch_rho1b_parallel.sh
 WANDB_MODE=offline RUN_TAG=paper512_seed1 ./scripts/launch_rho1b_parallel.sh
 ```
 
+## CASPO Advantage Ablations
+
+The default CASPO run computes step TD on the direct IPVRM value:
+
+```text
+A_t = r_t + gamma * V_{t+1} - V_t
+```
+
+Two additional ablations keep the same data, value checkpoint, online value
+updates, normalization, clipping, PPO loop, and vLLM infrastructure, but
+transform `V` before the TD difference:
+
+- `prob`: `sigmoid(V)`
+- `logprob`: `log sigmoid(V)`
+
+Launch only the two extra experiments:
+
+```bash
+RUN_TAG=paper512_seed0 GPU_LIST="4 5" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_caspo_ablations.sh
+```
+
+Outputs:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_prob_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_logprob_paper512_seed0
+```
+
+To run all three CASPO variants in one sweep:
+
+```bash
+ADV_VARIANTS="value prob logprob" GPU_LIST="4 5 6" \
+  ./scripts/launch_rho1b_caspo_ablations.sh
+```
+
 ## Evaluation
 
 Use cheap sample evals at intermediate checkpoints:
@@ -136,6 +173,7 @@ RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 Eval defaults:
 
 - Methods: CASPO, GRPO, VinePPO, PPO
+- Override with `METHODS="caspo_prob caspo_logprob"` for CASPO ablation evals
 - Benchmarks: `math500,math,collegemath,olympiadbench`
 - `EVAL_K=16`
 - temperature `0.35`

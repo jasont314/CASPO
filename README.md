@@ -109,6 +109,21 @@ standardize_advantage_scope: batch
 That means CASPO whitens step advantages across all valid steps from all 512
 responses in the outer PPO step, not separately within each prompt group.
 
+CASPO also has a pre-normalization advantage ablation knob:
+
+```yaml
+caspo_advantage_transform: value
+```
+
+Supported values:
+
+- `value`: direct IPVRM value TD difference, the current/default implementation.
+- `prob`: TD difference after transforming prefix values with `sigmoid(V)`.
+- `logprob`: TD difference after transforming prefix values with `log sigmoid(V)`.
+
+The transform is applied before step-advantage normalization and clipping.
+The terminal verifier reward term stays unchanged.
+
 ## Training/Inference Infrastructure
 
 All launchers use the `scalable` conda environment:
@@ -192,6 +207,30 @@ You can override the default cadence and run length:
 SAVE_EVERY=100 MAX_STEPS=300 RUN_TAG=debug ./scripts/launch_rho1b_parallel.sh
 ```
 
+## CASPO Advantage Ablations
+
+The direct-value CASPO variant is the normal `caspo` run above. Launch the two
+additional CASPO ablations with:
+
+```bash
+RUN_TAG=paper512_seed0 GPU_LIST="4 5" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_caspo_ablations.sh
+```
+
+Default ablation outputs:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_prob_paper512_seed0
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_logprob_paper512_seed0
+```
+
+To include the direct-value run in an ablation-only sweep:
+
+```bash
+ADV_VARIANTS="value prob logprob" GPU_LIST="4 5 6" \
+  ./scripts/launch_rho1b_caspo_ablations.sh
+```
+
 ## Evaluation
 
 Do cheap sample evals at saved checkpoints and full eval only at the end.
@@ -212,6 +251,7 @@ RUN_TAG=paper512_seed0 EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 
 The eval launcher supports:
 
+- `METHODS`: space-separated checkpoint directory tags, default `caspo grpo vineppo ppo`; use `METHODS="caspo_prob caspo_logprob"` for ablations.
 - `CKPT_SUBDIR`: checkpoint under each method output dir, e.g. `step_250` or `final`.
 - `EVAL_BENCHMARKS`: comma-separated list, default `math500,math,collegemath,olympiadbench`.
 - `EVAL_LIMIT`: optional per-benchmark problem cap for sample eval.

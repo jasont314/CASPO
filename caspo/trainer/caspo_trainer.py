@@ -47,6 +47,7 @@ from caspo.algo import (
     standardize_step_advantage,
     step_td_advantage,
     step_values_from_log_ratios,
+    transform_step_values_for_advantage,
 )
 from caspo.algo.advantages import standardize_step_advantage as _stdadv  # noqa
 from caspo.config import CASPOConfig
@@ -1189,13 +1190,22 @@ class CASPOTrainer:
                 V_step = step_values_from_log_ratios(
                     log_ratio, response_mask, seg.boundary_after, seg.step_count,
                 )
+                V_step_for_advantage = transform_step_values_for_advantage(
+                    V_step, cfg.caspo_advantage_transform,
+                )
+                value_stats["caspo_advantage_transform_id"] = {
+                    "value": 0.0,
+                    "prob": 1.0,
+                    "logprob": 2.0,
+                }[cfg.caspo_advantage_transform]
             else:  # vineppo
                 V_step = self._vineppo_mc_step_values(rollout, seg)
+                V_step_for_advantage = V_step
                 value_stats["vineppo_mc_K"] = int(cfg.vineppo_mc_rollouts)
             t_value = time.time() - t_value_start
 
             A_step = step_td_advantage(
-                V_step, rewards, seg.step_count, gamma=cfg.gamma,
+                V_step_for_advantage, rewards, seg.step_count, gamma=cfg.gamma,
             )
             if cfg.standardize_step_advantage:
                 A_step = self._standardize_step_advantage(
@@ -1520,7 +1530,8 @@ class CASPOTrainer:
             log_payload["policy/mean_kl"] = stats["mean_kl"]
         for k in ("value_loss", "value_acc", "v_bar_pos", "v_bar_neg",
                   "adb_v_x_mean", "adb_v_x_std", "dlw_w_mean", "dlw_w_std",
-                  "value_lr", "vineppo_mc_K", "t_value_forward_s",
+                  "value_lr", "vineppo_mc_K", "caspo_advantage_transform_id",
+                  "t_value_forward_s",
                   "gpu_mem_alloc_gb", "gpu_mem_peak_gb"):
             if k in stats:
                 log_payload[f"value/{k}" if k.startswith(("value", "v_bar", "adb", "dlw"))

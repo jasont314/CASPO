@@ -133,6 +133,12 @@ whole rollout batch:
 Thus, for the Rho-1B MATH run, advantages are whitened across all valid steps
 from all 512 responses in the outer PPO step, not separately per prompt group.
 
+The default \caspo{} run computes TD on the direct IPVRM value. The code also
+supports two pre-normalization ablations that transform the prefix values
+before the TD difference: \texttt{prob} uses $\sigma(V)$ and \texttt{logprob}
+uses $\log \sigma(V)$. The terminal verifier reward term is unchanged in all
+three variants.
+
 \subsection{PPO Objective}
 All four methods ultimately use the same clipped PPO token objective:
 \begin{equation}
@@ -173,6 +179,7 @@ PPO minibatch & 64 responses \\
 PPO epochs per rollout & 2 \\
 Policy LR & $10^{-6}$ \\
 Online value LR & $10^{-6}$ \\
+CASPO advantage transform & \texttt{value} \\
 PPO clip & 0.2 \\
 KL coefficient & $10^{-4}$ \\
 Rollout sampling & temperature 0.6, top-p 0.9 \\
@@ -249,6 +256,10 @@ EVAL_GPU_LIST="4 5 6 7" ./scripts/launch_eval_all.sh
 Recommended periodic checkpoints are \texttt{step\_250}, \texttt{step\_500},
 \texttt{step\_750}, and \texttt{final}. Full evaluation should be run only on
 \texttt{final} unless intermediate curves become necessary for analysis.
+CASPO advantage ablations can be launched with
+\texttt{scripts/launch\_rho1b\_caspo\_ablations.sh}; by default this schedules
+only the two extra \texttt{prob} and \texttt{logprob} variants because
+\texttt{value} is the main CASPO run.
 
 \section{Limitations and Open Engineering Questions}
 \caspo{} depends on the quality and calibration of the learned prefix value
