@@ -238,13 +238,20 @@ We train $V_\phi$ on a fixed corpus of (prompt, response, outcome) triples
 collected by sampling $G$ responses per prompt from the SFT policy at
 generation temperature $1.0$, scoring with the verifier, and discarding
 prompts whose $G$ outcomes are all 0 or all 1 (the mixed-outcome filter,
-following \ipvrm{}). The training loss is a margin-BCE between paired
-correct/incorrect prefixes:
+following \ipvrm{}). For a response of length $T$ we use the
+length-normalized prefix value
+$\bar V_\phi(s_t) := V_\phi(s_t) / t$ and minimize a per-prefix
+BCE-with-margin against the eventual binary outcome $r_o \in \{0,1\}$
+(\ipvrm{} Eq.~9):
 \begin{equation}
 \label{eq:ipvrmloss}
 \mathcal{L}_{\mathrm{IPVRM}}(\phi) =
-\mathbb{E}_{(x, y^+, y^-)}\!\left[
-\log\!\big(1 + \exp(-(V_\phi(y^+) - V_\phi(y^-) - m))\big)
+-\,\mathbb{E}_{(x, y, r_o)}\!\left[
+\frac{1}{T}\!\sum_{t=1}^{T}\!\Big(
+  r_o\,\log\sigma\!\big(\bar V_\phi(s_t) - m\big)
+\;+\;
+  (1\!-\!r_o)\,\log\!\big(1 - \sigma\!\big(\bar V_\phi(s_t) + m\big)\big)
+\Big)
 \right],
 \end{equation}
 with margin $m = 5$. We train for three epochs with full-model updates and a
