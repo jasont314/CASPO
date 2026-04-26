@@ -1099,7 +1099,16 @@ class CASPOTrainer:
             # are unmodified so IPC handles still point into FSDP's
             # summon-full storage.
             class _FsdpStrippedParamsView(torch.nn.Module):
-                _MARKERS = ("._fsdp_wrapped_module.", "_fsdp_wrapped_module.")
+                # Both FSDP auto_wrap and `apply_activation_checkpointing`
+                # inject prefixes into the qualified parameter name. We strip
+                # both. Order matters only for cosmetics — `replace` is
+                # idempotent if the marker isn't present.
+                _MARKERS = (
+                    "._fsdp_wrapped_module.",
+                    "_fsdp_wrapped_module.",
+                    "._checkpoint_wrapped_module.",
+                    "_checkpoint_wrapped_module.",
+                )
 
                 def __init__(self, src: torch.nn.Module):
                     super().__init__()
