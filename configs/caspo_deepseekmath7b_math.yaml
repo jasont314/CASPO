@@ -36,7 +36,7 @@ vllm_enforce_eager: false
 vllm_max_num_seqs: 256
 vllm_max_inflight_requests: 1024
 vllm_weight_sync_backend: ipc        # FSDP-aware IPC sync (summon_full_params + per-rank push)
-prompts_per_step: 8                  # paper-faithful: 8 × G=8 = 64 episodes / outer step
+prompts_per_step: 64                 # paper-faithful: 64 × G=8 = 512 episodes / outer step (matches VinePPO Table 2 for 7B)
 
 # FSDP — required for 7B full-finetune.
 distributed_backend: fsdp
@@ -85,17 +85,16 @@ kl_coef: 1.0e-4
 kl_estimator: k3
 
 output_dir: /mnt/nvme_tmp/jason_caspo/deepseekmath7b_math
-lr: 2.0e-6                        # was 1e-6. Conservative 2x bump (vs 3x for rho-1B): 7B model
-                                  # is more lr-sensitive and DeepSeekMath has stronger SFT prior,
-                                  # so we don't want to risk drift. Targets the same not-learning
-                                  # symptom (|ratio|≈1, |A|≈0.3) seen on rho-1B.
+lr: 1.0e-6                        # paper-faithful: VinePPO Table 2 uses lr=1e-6 for DSMath-7B
+                                  # (same as Rho-1B). Earlier 2e-6 was a guess; reverted for
+                                  # apples-to-apples comparison with the upstream baseline.
 weight_decay: 0.0
 warmup_steps: 60
 grad_clip: 1.0
 micro_batch_size: 2               # Apr 2026: mb=2 cuts step time 41s → 30s vs mb=1 (~27% faster)
 grad_accum_steps: 8               # FSDP=4: 4 ranks × 2 mb × 8 accum = 64-episode global minibatch
 epochs_per_rollout: 2
-max_steps: 1500                   # was 1000. Modest extension; 7B trains slowly per wall-clock.
+max_steps: 1000                   # paper-faithful: VinePPO uses num_iterations=1000 for both Rho-1B and 7B.
 seed: 0
 log_every: 1
 save_every: 40

@@ -436,20 +436,20 @@ summarizes the key knobs.
 
 \begin{table}[t]
 \centering
-\caption{Shared training hyperparameters (Rho-1B and 7B). All methods use the
-same PPO clipped objective, KL coefficient, group size, response budget, and
-global PPO minibatch.}
+\caption{Shared training hyperparameters (Rho-1B and DeepSeekMath-7B). All
+fields are matched to the upstream \vineppo{} configuration for the
+respective scale; the only deliberate difference is the model.}
 \label{tab:hp}
 \begin{tabular}{lll}
 \toprule
 Field & Rho-1B & DeepSeekMath-7B \\
 \midrule
 Group size $G$ & 8 & 8 \\
-Prompts per outer step & 64 & 8 \\
-Responses per outer step & 512 & 64 \\
+Prompts per outer step & 64 & 64 \\
+Responses per outer step & 512 & 512 \\
 Global PPO minibatch & 64 & 64 \\
 PPO epochs per rollout & 2 & 2 \\
-Policy LR & $1\times 10^{-6}$ & $2\times 10^{-6}$ \\
+Policy LR & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Online value LR (\caspo{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Value $\beta$, $m$ & $10$, $5$ & $10$, $5$ \\
 PPO clip $\epsilon$ & $0.2$ & $0.2$ \\
@@ -458,16 +458,18 @@ Advantage clip & $3.0$ & $3.0$ \\
 Advantage standardization & batch & batch \\
 Rollout sampling & temp $0.6$, top-$p$ $0.9$ & temp $0.6$, top-$p$ $0.9$ \\
 Max prompt / response & 1024 / 1024 & 1024 / 1024 \\
-Outer steps & 1000 & 1500 \\
-Checkpoints & step\_250/500/750/final & step\_250/500/750/1000/1250/final \\
+Outer steps & 1000 & 1000 \\
+Checkpoints & step\_250/500/750/final & step\_250/500/750/final \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The 7B run uses 1.5$\times$ the outer-step budget of the Rho-1B run because
-the 7B base policy needs more updates per equivalent training signal. The
-larger Rho-1B prompt batch reflects its lower per-step compute cost; both
-configurations land at a 64-response global PPO minibatch.
+Both configurations land at 512 responses per outer step ($64 \times G{=}8$),
+2 PPO epochs per rollout, and a 64-response global PPO minibatch, matching
+the upstream \vineppo{} hyperparameters at each scale
+\citep{vineppo2024,vineppocode}. Apart from the base policy, every entry in
+Table~\ref{tab:hp} is identical between the two scales, isolating any
+empirical difference to the model rather than to the optimization recipe.
 
 \subsection{Evaluation protocol}
 Final evaluation reports pass@1 and pass@$k$ ($k=16$) on MATH-500, full MATH
