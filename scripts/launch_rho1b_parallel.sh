@@ -53,12 +53,21 @@ cleanup() {
 trap cleanup EXIT
 trap 'echo "[launch] ERR at line $LINENO (rc=$?)"' ERR
 
-# Use 0.5 GPU memory for vLLM; trainer + V_φ + ref + optimizer takes the other half.
+# Trainer batching defaults from the Apr 2026 Pareto sweep (see README and
+# scripts/_launch_rho1b_one_gpu.sh): mb=8/accum=8/ckpt=false redistributes the
+# 64-response global PPO minibatch and runs ~45-47% faster per step than the
+# YAML defaults. vllm_gpu_memory_utilization=0.30 leaves ~3-4 GB trainer
+# headroom for CASPO's value+adam states (vLLM is not the bottleneck above
+# ~0.30 in this layout).
 COMMON_OVERRIDES=(
-    --override vllm_gpu_memory_utilization=0.45
+    --override vllm_gpu_memory_utilization=0.30
     --override vllm_enforce_eager=false
+    --override vllm_weight_sync_backend=ipc
+    --override "micro_batch_size=${MICRO_BATCH_SIZE:-8}"
+    --override "grad_accum_steps=${GRAD_ACCUM_STEPS:-8}"
+    --override "use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING:-false}"
     --override "save_every=${SAVE_EVERY:-250}"
-    --override "wandb_mode=${WANDB_MODE:-online}"
+    --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )
 if [[ -n "${MAX_STEPS:-}" ]]; then

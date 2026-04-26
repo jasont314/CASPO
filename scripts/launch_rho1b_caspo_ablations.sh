@@ -44,10 +44,14 @@ if (( ${#GPUS[@]} < ${#VARIANTS[@]} )); then
 fi
 
 COMMON_OVERRIDES=(
-    --override vllm_gpu_memory_utilization=0.45
+    --override vllm_gpu_memory_utilization=0.30
     --override vllm_enforce_eager=false
+    --override vllm_weight_sync_backend=ipc
+    --override "micro_batch_size=${MICRO_BATCH_SIZE:-8}"
+    --override "grad_accum_steps=${GRAD_ACCUM_STEPS:-8}"
+    --override "use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING:-false}"
     --override "save_every=${SAVE_EVERY:-250}"
-    --override "wandb_mode=${WANDB_MODE:-online}"
+    --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )
 if [[ -n "${MAX_STEPS:-}" ]]; then

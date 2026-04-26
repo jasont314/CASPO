@@ -428,7 +428,14 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate scalable
 /opt/conda/envs/scalable/bin/python scripts/validate_configs.py --diff
 nvidia-smi
+df -h /mnt/nvme_tmp                       # at least ~50 GB free for 7-method × 4-checkpoint suite
 ```
+
+A full 8-GPU suite writes 7 methods × 4 checkpoints × ~2.1 GB ≈ 60 GB of
+saved weights, plus per-method logs and wandb buffers. If `/mnt/nvme_tmp` is
+above ~95% full before launch, free space first — checkpoint writes that
+ENOSPC mid-run can corrupt the active save and the trainer will crash on the
+next save attempt.
 
 Confirm these paths exist or update the YAML/env vars:
 

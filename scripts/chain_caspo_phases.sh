@@ -84,8 +84,12 @@ CUDA_VISIBLE_DEVICES="${CASPO_GPU}" nohup "$PYTHON_BIN" -u -m scripts.train_casp
     --override update_value_during_policy=true \
     --override use_adb=true \
     --override use_dlw=true \
-    --override vllm_gpu_memory_utilization=0.45 \
+    --override vllm_gpu_memory_utilization=0.30 \
+    --override vllm_weight_sync_backend=ipc \
     --override vllm_enforce_eager=false \
+    --override "micro_batch_size=${MICRO_BATCH_SIZE:-8}" \
+    --override "grad_accum_steps=${GRAD_ACCUM_STEPS:-8}" \
+    --override "use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING:-false}" \
     > "$LOGDIR/phase2_caspo.log" 2>&1 &
 CASPO_PID=$!
 echo "[chain] $(date) CASPO RL launched pid=$CASPO_PID, log=$LOGDIR/phase2_caspo.log"
