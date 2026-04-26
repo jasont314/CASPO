@@ -1088,6 +1088,7 @@ class CASPOTrainer:
     def step(self, examples: List[dict], *, sync_vllm: bool = True) -> dict:
         cfg = self.cfg
         G = int(cfg.group_size)
+        t_step_start = time.time()
 
         # 1. Rollout (timed)
         t_rollout_start = time.time()
@@ -1348,6 +1349,7 @@ class CASPOTrainer:
             "t_rollout_s": t_rollout,
             "t_policy_s": t_policy,
             "t_sync_s": t_sync,
+            "t_step_s": time.time() - t_step_start,
         }
         if total_kl_seen > 0:
             result["mean_kl"] = total_kl / denom
@@ -1464,11 +1466,20 @@ class CASPOTrainer:
             msg += f" kl={stats['mean_kl']:.4f}"
         if "value_loss" in stats:
             msg += f" v_loss={stats['value_loss']:.4f} v_acc={stats['value_acc']:.3f}"
+        t_value = float(stats.get("t_value_forward_s", 0.0))
+        t_step = float(
+            stats.get(
+                "t_step_s",
+                stats["t_rollout_s"] + t_value + stats["t_policy_s"] + stats["t_sync_s"],
+            )
+        )
         msg += (
             f" t_roll={stats['t_rollout_s']:.1f}s "
+            f"t_value={t_value:.1f}s "
             f"t_pol={stats['t_policy_s']:.1f}s "
             f"t_sync={stats['t_sync_s']:.1f}s "
-            f"total={elapsed:.1f}s"
+            f"t_step={t_step:.1f}s "
+            f"elapsed={elapsed:.1f}s"
         )
         print(msg, flush=True)
 
@@ -1485,8 +1496,10 @@ class CASPOTrainer:
             "seg/mean_step_count": stats["mean_step_count"],
             "adv/abs_mean": stats["mean_step_advantage"],
             "time/rollout_s": stats["t_rollout_s"],
+            "time/value_s": float(stats.get("t_value_forward_s", 0.0)),
             "time/policy_s": stats["t_policy_s"],
             "time/sync_s": stats["t_sync_s"],
+            "time/step_s": float(stats.get("t_step_s", 0.0)),
             "time/total_elapsed_s": elapsed,
             "step/global": self.global_step,
         }
