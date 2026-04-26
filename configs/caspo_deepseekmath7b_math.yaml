@@ -33,7 +33,14 @@ rollout_backend: vllm
 vllm_gpu_memory_utilization: 0.30    # tighter than rho-1B because each rank carries 14 GB ref + 14 GB sharded opt
 vllm_tensor_parallel_size: 1
 vllm_enforce_eager: false
-vllm_max_num_seqs: 256
+vllm_max_num_seqs: 128                # exactly matches per-rank workload
+                                       # (16 prompts × G=8 = 128 seqs/rank);
+                                       # 256 was over-allocating KV slots
+                                       # never used.
+vllm_max_num_batched_tokens: 16384     # single-prefill chunk for our 16-prompt
+                                       # × ~600-token batches; default ~8192
+                                       # split into 2 prefills, costing 0.3-0.6s
+                                       # of prefill→decode fence overhead.
 vllm_max_inflight_requests: 1024
 vllm_weight_sync_backend: ipc        # FSDP-aware IPC sync (summon_full_params + per-rank push)
 prompts_per_step: 64                 # paper-faithful: 64 × G=8 = 512 episodes / outer step (matches VinePPO Table 2 for 7B)

@@ -252,10 +252,14 @@ class CASPOConfig:
     vllm_max_num_seqs: Optional[int] = None
     vllm_max_num_batched_tokens: Optional[int] = None
     # Chunked prefill: interleaves prefill chunks with decode steps so a
-    # newly-arriving long prompt does not stall in-flight decode. The vLLM
-    # engine constructor enforces this at True today; the field is kept for
-    # YAML parity with eval-time pipelines that may opt out.
-    vllm_enable_chunked_prefill: bool = True
+    # newly-arriving long prompt does not stall in-flight decode. Default
+    # OFF for the rollout engine because we verified empirically (Apr 2026)
+    # that VinePPO K=9 MC rollouts regress ~70% (191s -> 321s/step) when
+    # this is forced on — the mixed prefill-decode CUDA graphs penalize the
+    # MC pattern of many short prefixes followed by decodes. For
+    # prefill-heavy workloads (G=8 same-prompt fan-out, eval-time
+    # generation) flip to True via override.
+    vllm_enable_chunked_prefill: bool = False
     # KV-cache dtype. ``None`` (auto) picks vLLM's default (fp16/bf16 to match
     # the model dtype); ``"fp8"`` halves KV memory and is used by the eval
     # pipeline (inference-only, accuracy hit is below seed noise on avg@k).

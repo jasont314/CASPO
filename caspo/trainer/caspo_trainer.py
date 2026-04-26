@@ -562,6 +562,7 @@ class CASPOTrainer:
                 max_num_seqs=cfg.vllm_max_num_seqs,
                 max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
                 max_inflight_requests=cfg.vllm_max_inflight_requests,
+                enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
                 gpu_id=(
                     self.dist.local_rank
                     if self.dist.is_distributed
@@ -2182,7 +2183,19 @@ class CASPOTrainer:
                 ):
                     self.save_checkpoint(final=False)
 
-        self.save_checkpoint(final=True)
+        # Honor an env-level skip switch for smoke runs (each 7B final save
+        # is ~13 GB and fills the scratch disk during rapid-iteration
+        # benchmarking). Set CASPO_SKIP_FINAL_SAVE=1 in the launcher to
+        # skip the post-training save_pretrained(final=True). Default is
+        # to save (production behavior unchanged).
+        if os.environ.get("CASPO_SKIP_FINAL_SAVE", "0") not in ("1", "true", "True"):
+            self.save_checkpoint(final=True)
+        elif self.dist.is_main:
+            print(
+                "[trainer] CASPO_SKIP_FINAL_SAVE=1 → skipping final "
+                "save_checkpoint (smoke mode)",
+                flush=True,
+            )
         if self._wandb is not None:
             try:
                 self._wandb.finish()
