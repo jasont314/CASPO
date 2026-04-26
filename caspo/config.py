@@ -221,6 +221,9 @@ class CASPOConfig:
     grad_clip: float = 1.0
     prompts_per_step: int = 8
     micro_batch_size: int = 1
+    # No-grad old-policy/ref logprob passes can usually use a larger batch than
+    # PPO backward. None means reuse micro_batch_size.
+    logprob_micro_batch_size: Optional[int] = None
     grad_accum_steps: int = 1
     # Number of inner passes the trainer makes over each rollout (PPO epochs).
     # The same rollout's π_old and advantages are frozen across epochs; only
@@ -434,6 +437,14 @@ class CASPOConfig:
         if self.micro_batch_size < 1:
             raise ValueError(
                 f"micro_batch_size must be >= 1, got {self.micro_batch_size}"
+            )
+        if (
+            self.logprob_micro_batch_size is not None
+            and self.logprob_micro_batch_size < 1
+        ):
+            raise ValueError(
+                "logprob_micro_batch_size must be >= 1 when set, "
+                f"got {self.logprob_micro_batch_size}"
             )
         if self.dist_timeout_s < 1:
             raise ValueError(

@@ -105,6 +105,10 @@ def _cycle(iterable: Iterable):
             raise RuntimeError("data iterable yielded no examples")
 
 
+def _configured_logprob_micro_batch_size(cfg: CASPOConfig) -> int:
+    return max(1, int(cfg.logprob_micro_batch_size or cfg.micro_batch_size))
+
+
 def _tokenize_delimiter(tokenizer, delimiter: str) -> List[int]:
     if not delimiter:
         raise ValueError("step_delimiter must be a non-empty string")
@@ -959,7 +963,7 @@ class CASPOTrainer:
         with each PPO epoch.
         """
         cfg = self.cfg
-        mb = max(1, int(cfg.micro_batch_size))
+        mb = _configured_logprob_micro_batch_size(cfg)
         B = prompt_ids.shape[0]
         out_chunks: List[torch.Tensor] = []
         was_training = self.model.training
@@ -1014,7 +1018,7 @@ class CASPOTrainer:
         if self.ref_policy is None:
             return None
         cfg = self.cfg
-        mb = max(1, int(cfg.micro_batch_size))
+        mb = _configured_logprob_micro_batch_size(cfg)
         B = prompt_ids.shape[0]
         out_chunks: List[torch.Tensor] = []
         for start in range(0, B, mb):
@@ -1200,6 +1204,7 @@ class CASPOTrainer:
         assert rollout.response_ids.shape[0] == B
 
         # 2. Move to device + tile prompts
+        t_device_start = time.time()
         prompt_ids = rollout.prompt_ids.to(self.device, non_blocking=True)
         prompt_mask = rollout.prompt_mask.to(self.device, non_blocking=True)
         response_ids = rollout.response_ids.to(self.device, non_blocking=True)
@@ -1213,16 +1218,21 @@ class CASPOTrainer:
         prompt_index = rollout.prompt_index.to(self.device, non_blocking=True)
         tiled_prompt_ids = prompt_ids[prompt_index]
         tiled_prompt_mask = prompt_mask[prompt_index]
+        t_device = time.time() - t_device_start
         # Re-score old logprobs with trainer's forward at the pre-update weights.
+        t_old_logprobs_start = time.time()
         old_logprobs_full = self._rescore_old_logprobs(
             tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
         )
+        t_old_logprobs = time.time() - t_old_logprobs_start
 
         method = cfg.method
 
         # ---- Method-specific advantage construction ----
+        t_advantage_start = time.time()
         seg = None
         value_stats: dict = {}
+        t_value = 0.0
         V_step = None
         A_step = None
         token_advantage: torch.Tensor
@@ -1312,6 +1322,7 @@ class CASPOTrainer:
             mean_step_advantage = float(valid_A.abs().mean().item()) if valid_A.numel() else 0.0
             mean_step_count = float(seg.step_count.float().mean().item())
             value_stats["t_value_forward_s"] = t_value
+        t_advantage = time.time() - t_advantage_start - t_value
 
         # Reward stats
         rewards_grouped = rewards.view(num_prompts, G)
@@ -1342,9 +1353,11 @@ class CASPOTrainer:
         token_weight_denom = 0.0
         n_optim_steps = 0
 
+        t_ref_logprobs_start = time.time()
         ref_logprobs_full = self._precompute_ref_logprobs(
             tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
         )
+        t_ref_logprobs = time.time() - t_ref_logprobs_start
 
         # Iterate the SAME rollout n_epochs times. π_old / advantages stay
         # frozen (computed before this loop); only π_θ updates each epoch.
@@ -1458,6 +1471,10 @@ class CASPOTrainer:
             "epochs_per_rollout": n_epochs,
             "n_optim_steps": n_optim_steps,
             "t_rollout_s": t_rollout,
+            "t_device_s": t_device,
+            "t_old_logprobs_s": t_old_logprobs,
+            "t_advantage_s": t_advantage,
+            "t_ref_logprobs_s": t_ref_logprobs,
             "t_policy_s": t_policy,
             "t_sync_s": t_sync,
             "t_step_s": time.time() - t_step_start,
@@ -1586,7 +1603,9 @@ class CASPOTrainer:
         )
         msg += (
             f" t_roll={stats['t_rollout_s']:.1f}s "
+            f"t_old={float(stats.get('t_old_logprobs_s', 0.0)):.1f}s "
             f"t_value={t_value:.1f}s "
+            f"t_ref={float(stats.get('t_ref_logprobs_s', 0.0)):.1f}s "
             f"t_pol={stats['t_policy_s']:.1f}s "
             f"t_sync={stats['t_sync_s']:.1f}s "
             f"t_step={t_step:.1f}s "
@@ -1607,7 +1626,11 @@ class CASPOTrainer:
             "seg/mean_step_count": stats["mean_step_count"],
             "adv/abs_mean": stats["mean_step_advantage"],
             "time/rollout_s": stats["t_rollout_s"],
+            "time/device_s": float(stats.get("t_device_s", 0.0)),
+            "time/old_logprobs_s": float(stats.get("t_old_logprobs_s", 0.0)),
+            "time/advantage_s": float(stats.get("t_advantage_s", 0.0)),
             "time/value_s": float(stats.get("t_value_forward_s", 0.0)),
+            "time/ref_logprobs_s": float(stats.get("t_ref_logprobs_s", 0.0)),
             "time/policy_s": stats["t_policy_s"],
             "time/sync_s": stats["t_sync_s"],
             "time/step_s": float(stats.get("t_step_s", 0.0)),

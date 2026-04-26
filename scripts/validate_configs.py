@@ -46,6 +46,7 @@ REPORT_KEYS: tuple[str, ...] = (
     "group_size",
     "prompts_per_step",
     "micro_batch_size",
+    "logprob_micro_batch_size",
     "grad_accum_steps",
     "vllm_enforce_eager",
     "vllm_multi_sample_mode",

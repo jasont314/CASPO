@@ -11,6 +11,114 @@ The main current target is a paper-faithful Rho-1B MATH run that matches the
 VinePPO Rho-1B MATH setup where possible, while running all four methods in the
 same trainer and vLLM infrastructure.
 
+## Current Project State
+
+This repo is a working research codebase, not a packaged library. The current
+goal is to run controlled Rho-1B MATH RL experiments comparing terminal-reward
+PPO/GRPO, Monte-Carlo-step VinePPO, and learned-prefix-value CASPO under one
+trainer, one verifier, one dataset pipeline, and the same vLLM rollout stack.
+
+The current production target is:
+
+- Full-model RL fine-tuning, not LoRA.
+- Rho-1B SFT base policy on MATH.
+- 512 sampled responses per outer PPO step.
+- Four saved checkpoints per full run: `step_250`, `step_500`, `step_750`,
+  and `final`.
+- Periodic cheap sample evals; full eval only at final unless curves are
+  needed.
+- CASPO uses the already-trained offline Rho-1B IPVRM checkpoint and can update
+  that value model online during RL.
+- VinePPO has both a one-GPU launcher and a faster two-GPU DDP launcher.
+
+Important caveat: the Rho-1B one-GPU-per-method launchers are ready for the
+main comparison. The 7B configs exist, but the fast Rho path should not be
+blindly extrapolated to 7B because full-model 7B training needs sharding and
+vLLM sync becomes a different systems problem.
+
+## Repository Map
+
+Core package:
+
+```text
+caspo/
+  algo/                 PPO loss, step TD, advantage transforms/normalization
+  config.py             Single dataclass config contract and validation
+  data/                 MATH/GSM-style dataset loading and prompt formatting
+  reward/               Math final-answer verifier wrapper
+  rollout/
+    sampler.py          HF rollout sampler
+    vllm_engine.py      Embedded vLLM AsyncLLM rollout engine + IPC sync
+  segmentation/
+    steps.py            Token/newline and LaTeX-aware step segmentation
+    latex_splitter.py   VinePPO-derived LaTeX-aware text splitter
+  trainer/
+    caspo_trainer.py    Main phase-2 trainer for PPO/GRPO/VinePPO/CASPO
+  utils/                Distributed/runtime helpers, seeds, misc utilities
+  value/                IPVRM prefix value model, ADB/DLW, value loss
+```
+
+Configs:
+
+```text
+configs/caspo_rho1b_math.yaml          Main Rho-1B MATH config
+configs/caspo_rho1b_gsm8k.yaml         Rho-1B GSM8K variant
+configs/caspo_deepseekmath7b_*.yaml    7B configs, not current production path
+configs/caspo_smoke*.yaml              Small smoke configs
+configs/value_smoke.yaml               Tiny phase-1 value smoke
+```
+
+Launch/eval scripts:
+
+```text
+scripts/launch_rho1b_parallel.sh       PPO/CASPO/GRPO/VinePPO, one GPU each
+scripts/launch_rho1b_vineppo_ddp2.sh   Fast two-GPU VinePPO DDP path
+scripts/launch_rho1b_caspo_ablations.sh
+scripts/launch_rho1b_caspo_frozen_rm.sh
+scripts/launch_eval_all.sh
+scripts/train_value.py                 Phase-1 IPVRM training
+scripts/train_caspo.py                 Phase-2 RL entrypoint
+scripts/collect_value_data.py          Phase-1 rollout data collection
+scripts/validate_configs.py            Config sanity and batch-shape checks
+scripts/perf_env.sh                    Shared CUDA/NCCL/vLLM env settings
+scripts/kill_zombies.sh                Cleanup helper for stale vLLM processes
+```
+
+Paper draft:
+
+```text
+paper/main.tex
+paper/main.pdf
+paper/references.bib
+```
+
+Tests:
+
+```text
+tests/test_distributed_runtime.py
+tests/test_vllm_engine.py
+tests/test_method_dispatch.py
+tests/test_trainer_integration.py
+tests/test_latex_splitter.py
+...
+```
+
+## Method Summary
+
+All phase-2 methods share the same rollout engine, verifier, tokenizer, prompt
+template, PPO clipped objective, checkpointing, and eval path.
+
+| Method | Credit signal | Extra model/compute | Main purpose |
+|---|---|---|---|
+| `ppo` | Terminal reward standardized over batch/group/off | No step model | Terminal-reward baseline |
+| `grpo` | Per-prompt group-relative terminal reward | No value model | DeepSeekMath-style grouped baseline |
+| `vineppo` | Step TD from MC prefix values | K continuations per nonterminal prefix | Paper-faithful VinePPO comparison |
+| `caspo` | Step TD from learned IPVRM prefix values | Prefix value model, optional online update | Replace MC prefixes with learned value |
+
+The key experiment is whether CASPO's learned prefix values recover enough
+step-level credit assignment to be competitive with VinePPO while avoiding
+VinePPO's expensive MC continuation phase.
+
 ## Current Rho-1B MATH Setup
 
 Main config: `configs/caspo_rho1b_math.yaml`
@@ -124,6 +232,13 @@ Supported values:
 The transform is applied before step-advantage normalization and clipping.
 The terminal verifier reward term stays unchanged.
 
+Separator sanity check: manual Rho-1B generations on MATH examples produced
+coherent step boundaries for ordinary prose, equations, factorization, and
+line-by-line aligned derivations. The splitter is a structural heuristic, not a
+correctness judge. If a model keeps writing after a final boxed answer, those
+post-answer fragments are currently still segmented as later steps; this is a
+known analysis/cleanup point rather than a blocker for the current runs.
+
 ## Training/Inference Infrastructure
 
 All launchers use the `scalable` conda environment:
@@ -171,6 +286,60 @@ vllm_enforce_eager: false
 The trainer also primes vLLM's AsyncLLM frontend loop before generation. This
 avoids a vLLM V1 embedded-engine stall where metadata requests wait for
 EngineCore output before the output handler is draining it.
+
+## Teammate Run Checklist
+
+Before launching on lab GPUs:
+
+```bash
+cd /home/jason/experiment/CASPO
+source /opt/conda/etc/profile.d/conda.sh
+conda activate scalable
+/opt/conda/envs/scalable/bin/python scripts/validate_configs.py --diff
+nvidia-smi
+```
+
+Confirm these paths exist or update the YAML/env vars:
+
+```text
+/mnt/nvme_tmp/jason_caspo/hf_cache
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
+```
+
+The reward/value model path in `configs/caspo_rho1b_math.yaml` is:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
+```
+
+That path is a symlink to:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/final
+```
+
+For SCP/rsync, prefer the real directory:
+
+```bash
+rsync -a user@HOST:/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/final/ \
+  ./rho1b_math_ipvrm/
+```
+
+If a run is interrupted, check for stale trainer/vLLM processes:
+
+```bash
+pgrep -af "train_caspo|VLLM::EngineCore|vllm"
+nvidia-smi
+```
+
+Then clean only stale CASPO/vLLM jobs:
+
+```bash
+./scripts/kill_zombies.sh
+```
+
+Do not delete `/mnt/nvme_tmp/jason_caspo/hf_cache`; it avoids repeated model
+downloads and startup delays.
 
 ## Launching the Four-Method Run
 
@@ -264,6 +433,61 @@ Default DDP shape:
 2 ranks x 32 grad-accum micros x 1 response = 64-response global PPO minibatch
 ```
 
+Learning/effective-batch note: this two-GPU launcher is configured to match the
+one-GPU VinePPO global batch. The one-GPU path uses `64 prompts x G=8 = 512`
+responses per outer step; the two-GPU path uses `2 ranks x 32 prompts/rank x
+G=8 = 512`. PyTorch DDP averages gradients across ranks, so the effective
+learning rate is unchanged when `2 x micro_batch_size x grad_accum_steps = 64`.
+The run is not bit-identical because prompt sharding, generation RNG,
+all-reduce order, and vLLM scheduling differ.
+
+Recommended fastest tested Rho-1B DDP settings:
+
+```bash
+# Preserves the same 64-response global PPO minibatch:
+# 2 ranks x micro_batch_size=4 x grad_accum_steps=8 = 64 responses.
+MICRO_BATCH_SIZE=4 GRAD_ACCUM_STEPS=8 USE_GRADIENT_CHECKPOINTING=false \
+LOGPROB_MICRO_BATCH_SIZE=16 CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55 \
+RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
+  ./scripts/launch_rho1b_vineppo_ddp2.sh
+```
+
+Useful optional knobs:
+
+```bash
+# vLLM aliases use CASPO_ prefixes so they do not leak into vLLM as unknown
+# native environment variables. The older VLLM_* aliases are accepted by the
+# launcher, then unset before child processes start.
+CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55
+CASPO_VLLM_MAX_NUM_SEQS=512
+CASPO_VLLM_MAX_NUM_BATCHED_TOKENS=32768
+CASPO_VLLM_MULTI_SAMPLE_MODE=batched
+```
+
+Do not force the aggressive vLLM scheduler knobs by default. In the latest
+probe, `CASPO_VLLM_MULTI_SAMPLE_MODE=batched` with `max_num_seqs=512` and
+`max_num_batched_tokens=32768` was slower than the default/auto scheduler.
+
+The launcher prints the resolved knobs before starting rank processes and
+writes separate rank logs:
+
+```text
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<RUN_TAG>/logs/phase2_vineppo_ddp2_rank0.log
+/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<RUN_TAG>/logs/phase2_vineppo_ddp2_rank1.log
+```
+
+Rank-zero step logs include:
+
+```text
+t_roll   rollout generation time
+t_old    trainer-policy old-logprob rescore
+t_value  CASPO value or VinePPO MC prefix-value phase
+t_ref    frozen-reference logprob precompute
+t_pol    PPO forward/backward/optimizer phase
+t_sync   trainer-to-vLLM weight sync
+t_step   full outer-step wall-clock
+```
+
 Output:
 
 ```text
@@ -325,6 +549,32 @@ Approximate 1000-step ETAs:
 
 If all four methods run in parallel on GPUs 4-7, wall-clock is gated by
 VinePPO: roughly 66-72 hours plus checkpoint/eval overhead.
+
+## Latest Two-GPU VinePPO Probe
+
+Hardware: two H100 80GB GPUs, replicated DDP, one rank-local vLLM engine per
+GPU, global shape still 512 responses per outer step. Each row is a one-step
+probe, so treat small differences as noise; the large policy-path gains were
+repeatable enough to keep.
+
+| DDP setting | Step time | Old logprobs | MC/value | Ref logprobs | Policy | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| `micro=1, accum=32, grad_ckpt=true` | 155.2s | 5.5s | 79.9s | 5.2s | 50.6s | Original DDP shape |
+| `micro=2, accum=16, grad_ckpt=false` | 134.1s | 3.6s | 80.0s | 3.3s | 23.0s | Same global PPO minibatch |
+| `micro=4, accum=8, grad_ckpt=false` | 118.2s | 2.9s | 78.2s | 2.7s | 19.2s | Main policy win |
+| `micro=4, accum=8, logprob_micro=16` | 115.7s | 2.4s | 72.8s | 2.2s | 18.6s | Best conservative setting |
+| Same plus `CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55` | 115.5s | 2.4s | 80.5s | 2.1s | 18.7s | Tie within noise |
+| Same plus forced batched vLLM, `512` seqs, `32768` tokens | 131.1s | 2.4s | 92.4s | 2.2s | 18.6s | Slower; do not use by default |
+
+The current recommended two-GPU VinePPO command is the optimized
+`micro=4/accum=8/grad_ckpt=false/logprob_micro=16` launcher above. Compared
+with the earlier one-GPU VinePPO probe average of about 232.5s/step, the
+optimized two-GPU path is roughly 2x faster while preserving the same global
+outer-step batch and PPO minibatch. A 1000-step two-GPU VinePPO run is roughly
+32 hours before checkpoint/eval overhead. On a four-GPU machine, using the
+two-GPU VinePPO path means the four-method comparison should be run in waves or
+with PPO/GRPO/CASPO on other available GPUs rather than all four methods sharing
+only GPUs 4-7 at once.
 
 ## Validation Commands
 

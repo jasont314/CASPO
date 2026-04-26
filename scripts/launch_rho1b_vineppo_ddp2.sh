@@ -20,6 +20,10 @@
 #   RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
 #     ./scripts/launch_rho1b_vineppo_ddp2.sh
 #
+# vLLM tuning knobs are accepted with a CASPO_ prefix so they are not
+# mistaken for native vLLM environment variables by the child runtime.
+# The older VLLM_* aliases are still accepted by this launcher.
+#
 # Smoke:
 #   MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
 #   GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
@@ -64,8 +68,22 @@ LOG1="$LOGDIR/phase2_${METHOD_TAG}_rank1.log"
 
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-32}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-32}"
 VINEPPO_MC_ROLLOUTS="${VINEPPO_MC_ROLLOUTS:-9}"
+USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-true}"
+CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.45}}"
+CASPO_VLLM_MULTI_SAMPLE_MODE="${CASPO_VLLM_MULTI_SAMPLE_MODE:-${VLLM_MULTI_SAMPLE_MODE:-auto}}"
+CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-256}}"
+CASPO_VLLM_MAX_NUM_BATCHED_TOKENS="${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-${VLLM_MAX_NUM_BATCHED_TOKENS:-}}"
+
+# These four names are launcher aliases, not native vLLM environment variables.
+# Leaving them exported causes noisy "unknown vLLM environment variable" warnings
+# inside vLLM workers. Keep the resolved CASPO_* values above and drop aliases.
+unset VLLM_GPU_MEMORY_UTILIZATION
+unset VLLM_MULTI_SAMPLE_MODE
+unset VLLM_MAX_NUM_SEQS
+unset VLLM_MAX_NUM_BATCHED_TOKENS
 
 OVERRIDES=(
     --override method=vineppo
@@ -73,12 +91,15 @@ OVERRIDES=(
     --override rollout_backend=vllm
     --override vllm_tensor_parallel_size=1
     --override vllm_weight_sync_backend=ipc
-    --override vllm_gpu_memory_utilization=0.45
+    --override "vllm_gpu_memory_utilization=${CASPO_VLLM_GPU_MEMORY_UTILIZATION}"
     --override vllm_enforce_eager=false
+    --override "vllm_multi_sample_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE}"
+    --override "vllm_max_num_seqs=${CASPO_VLLM_MAX_NUM_SEQS}"
     --override update_value_during_policy=false
+    --override "use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING}"
     --override "prompts_per_step=${PROMPTS_PER_STEP}"
     --override "group_size=${GROUP_SIZE}"
-    --override micro_batch_size=1
+    --override "micro_batch_size=${MICRO_BATCH_SIZE}"
     --override "grad_accum_steps=${GRAD_ACCUM_STEPS}"
     --override "vineppo_mc_rollouts=${VINEPPO_MC_ROLLOUTS}"
     --override "save_every=${SAVE_EVERY:-250}"
@@ -90,10 +111,18 @@ OVERRIDES=(
 if [[ -n "${MAX_STEPS:-}" ]]; then
     OVERRIDES+=(--override "max_steps=${MAX_STEPS}")
 fi
+if [[ -n "${LOGPROB_MICRO_BATCH_SIZE:-}" ]]; then
+    OVERRIDES+=(--override "logprob_micro_batch_size=${LOGPROB_MICRO_BATCH_SIZE}")
+fi
+if [[ -n "${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    OVERRIDES+=(--override "vllm_max_num_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS}")
+fi
 
 echo "[vineppo-ddp2] GPUs=${GPUS[*]} out=${OUTDIR}"
 echo "[vineppo-ddp2] rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
-echo "[vineppo-ddp2] prompts/rank=${PROMPTS_PER_STEP} group=${GROUP_SIZE} grad_accum=${GRAD_ACCUM_STEPS} K=${VINEPPO_MC_ROLLOUTS}"
+echo "[vineppo-ddp2] prompts/rank=${PROMPTS_PER_STEP} group=${GROUP_SIZE} micro=${MICRO_BATCH_SIZE} grad_accum=${GRAD_ACCUM_STEPS} K=${VINEPPO_MC_ROLLOUTS}"
+echo "[vineppo-ddp2] grad_ckpt=${USE_GRADIENT_CHECKPOINTING} logprob_micro=${LOGPROB_MICRO_BATCH_SIZE:-auto}"
+echo "[vineppo-ddp2] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
 echo "[vineppo-ddp2] logs:"
 echo "  rank0: ${LOG0}"
 echo "  rank1: ${LOG1}"
