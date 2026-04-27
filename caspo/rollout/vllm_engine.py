@@ -314,6 +314,32 @@ class VLLMRolloutEngine:
                 engine_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
             if self._weight_sync_backend == "ipc":
                 engine_kwargs["weight_transfer_config"] = {"backend": "ipc"}
+            elif self._weight_sync_backend == "nccl":
+                # Side NCCL group rendezvous: trainer rank 0 + N vLLM
+                # workers (TP-ranks 0..N-1). World = 1 + tp. The launcher
+                # exports CASPO_WEIGHT_SYNC_MASTER_ADDR/PORT (separate
+                # from the trainer's torchrun MASTER_PORT so the two
+                # rendezvous don't collide).
+                ws_addr = os.environ.get("CASPO_WEIGHT_SYNC_MASTER_ADDR", "127.0.0.1")
+                ws_port_str = os.environ.get("CASPO_WEIGHT_SYNC_MASTER_PORT", "0")
+                if not ws_port_str or ws_port_str == "0":
+                    raise RuntimeError(
+                        "vllm_weight_sync_backend='nccl' requires the launcher "
+                        "to export CASPO_WEIGHT_SYNC_MASTER_PORT (see "
+                        "scripts/_launch_7b_disagg.sh / "
+                        "scripts/_launch_7b_tp8_colocated.sh)."
+                    )
+                init_info = {
+                    "master_address": ws_addr,
+                    "master_port": int(ws_port_str),
+                    "world_size": 1 + int(tensor_parallel_size),
+                }
+                # Stash for trainer-side init below.
+                self._nccl_weight_sync_init_info = dict(init_info)
+                engine_kwargs["weight_transfer_config"] = {
+                    "backend": "nccl",
+                    "init_info": init_info,
+                }
             engine_args = AsyncEngineArgs(**engine_kwargs)
             self.engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -331,6 +357,69 @@ class VLLMRolloutEngine:
                     pass
                 self.engine = None
                 raise
+
+            # NCCL weight-sync side group: trainer rank 0 + N vLLM
+            # workers join a separate PyNcclCommunicator. Both sides
+            # block at TCPStore rendezvous, so we must run them
+            # concurrently. Spawn a background thread on the trainer
+            # for ``trainer_init``, then trigger workers via
+            # collective_rpc; once both ends connect, the group is
+            # alive for repeated trainer_send_weights calls below.
+            self._nccl_weight_sync_group = None
+            if self._weight_sync_backend == "nccl":
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLWeightTransferEngine,
+                )
+                import threading
+
+                init_info_copy = dict(self._nccl_weight_sync_init_info)
+                holder: dict = {}
+                err: dict = {}
+
+                def _trainer_init_thread():
+                    try:
+                        holder["group"] = NCCLWeightTransferEngine.trainer_init(
+                            init_info_copy
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        err["err"] = e
+
+                t = threading.Thread(target=_trainer_init_thread, daemon=True)
+                t.start()
+                # Trigger the workers. This is synchronous; it returns
+                # only after every TP worker has called
+                # init_weight_transfer_engine, which is exactly what
+                # rendezvous needs from the receiver side.
+                try:
+                    # The vLLM RPC dispatcher passes args/kwargs through
+                    # to each worker's method. init_weight_transfer_engine
+                    # accepts the init_info dict positionally.
+                    self._loop.run_until_complete(
+                        self._collective_rpc(
+                            "init_weight_transfer_engine",
+                            args=(init_info_copy,),
+                        )
+                    )
+                except Exception:
+                    try:
+                        self.engine.shutdown()
+                    except Exception:
+                        pass
+                    raise
+                t.join(timeout=120.0)
+                if t.is_alive():
+                    raise RuntimeError(
+                        "NCCL weight-sync trainer_init thread did not finish "
+                        "within 120s after vLLM workers signalled init. "
+                        "Check master_addr/master_port reachability."
+                    )
+                if "err" in err:
+                    raise err["err"]
+                self._nccl_weight_sync_group = holder.get("group")
+                if self._nccl_weight_sync_group is None:
+                    raise RuntimeError(
+                        "NCCLWeightTransferEngine.trainer_init returned None"
+                    )
         finally:
             # Restore parent process env. (The engine subprocess already forked
             # with the override, so its CUDA_VISIBLE_DEVICES sticks.)
@@ -1051,17 +1140,25 @@ class VLLMRolloutEngine:
         return time.time() - t0
 
     def sync_weights_from_model(self, model: torch.nn.Module) -> float:
-        """Push trainer weights to vLLM through CUDA IPC.
+        """Push trainer weights to the vLLM engine.
 
-        This uses vLLM 0.19's RL weight-transfer API and avoids the
-        save_pretrained() + reload_weights() disk path. It is valid only when
-        the trainer model tensors and vLLM EngineCore are on the same physical
-        GPU, which is exactly the single-process/single-GPU topology used by
-        the Rho-1B launchers.
+        Two backends:
+
+        * ``ipc`` (rank-local trainer + rank-local TP=1 vLLM on same GPU):
+          uses CUDA IPC mem handles. No tensor data leaves the GPU; the
+          worker just opens each handle and copies into its model.
+        * ``nccl`` (disaggregated or colocated TP>1): broadcasts each
+          named parameter from trainer rank 0 to the vLLM workers via
+          a side ``PyNcclCommunicator`` group initialized in __init__.
+          Each worker materializes the full tensor briefly, then
+          ``load_weights`` slices it onto its TP-shard.
         """
+        if self._weight_sync_backend == "nccl":
+            return self._sync_weights_nccl(model)
         if self._weight_sync_backend != "ipc":
             raise RuntimeError(
-                "sync_weights_from_model requires vllm_weight_sync_backend='ipc'"
+                f"sync_weights_from_model: unsupported backend "
+                f"{self._weight_sync_backend!r}"
             )
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA IPC weight sync requires CUDA")
@@ -1135,6 +1232,101 @@ class VLLMRolloutEngine:
     async def _collective_rpc(self, method: str, args: tuple = (), kwargs: Optional[dict] = None):
         kwargs = kwargs or {}
         return await self.engine.collective_rpc(method, args=args, kwargs=kwargs)
+
+    # ------------------------------------------------------------------
+    # NCCL weight sync (used by disaggregated + colocated-TP topologies)
+    # ------------------------------------------------------------------
+    def _sync_weights_nccl(self, model: torch.nn.Module) -> float:
+        """Broadcast every named parameter from trainer rank 0 to all
+        vLLM workers via the side PyNcclCommunicator group.
+
+        Two phases run concurrently:
+        * vLLM workers receive ``update_weights`` RPC (with metadata-only
+          update_info — names/dtypes/shapes). For each (name, shape,
+          dtype) in order they allocate a CUDA buffer, call
+          ``model_update_group.broadcast(buffer, src=0)``, and pass the
+          received tensor through ``load_weights`` (which internally
+          slices it onto the worker's TP-shard).
+        * Trainer rank 0 calls ``trainer_send_weights(iter, args)``,
+          which iterates the same ordered (name, tensor) list and
+          broadcasts each tensor as src=0.
+
+        Both sides must iterate ``names`` in the SAME order; we use
+        ``model.named_parameters()`` on both ends.
+        """
+        if self._nccl_weight_sync_group is None:
+            raise RuntimeError(
+                "NCCL weight sync requested but the side group was not "
+                "initialized. Did the launcher set "
+                "CASPO_WEIGHT_SYNC_MASTER_PORT?"
+            )
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLTrainerSendWeightsArgs,
+            NCCLWeightTransferEngine,
+        )
+        from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+        import threading
+
+        t0 = time.time()
+        named = list(model.named_parameters())
+        if not named:
+            return 0.0
+        # Collect metadata in iteration order (same order vLLM workers
+        # will use — both ends consume model.named_parameters identically).
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        for name, tensor in named:
+            if not tensor.is_cuda:
+                raise RuntimeError(
+                    f"parameter {name!r} is on {tensor.device}; NCCL sync "
+                    f"expects CUDA tensors on rank 0"
+                )
+            names.append(name)
+            dtype_names.append(str(tensor.dtype).split(".")[-1])
+            shapes.append(list(tensor.shape))
+
+        update_info = {
+            "names": names,
+            "dtype_names": dtype_names,
+            "shapes": shapes,
+            "packed": False,
+        }
+        request = WeightTransferUpdateRequest(update_info=update_info)
+
+        # Trainer-side broadcast runs on a worker thread; the main
+        # thread drives the RPC's asyncio future. Both must run in
+        # parallel because each side blocks at every NCCL collective.
+        err: dict = {}
+
+        def _trainer_thread():
+            try:
+                args_obj = NCCLTrainerSendWeightsArgs(
+                    group=self._nccl_weight_sync_group,
+                    src=0,
+                    packed=False,
+                )
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iter(named), args_obj,
+                )
+            except Exception as e:  # noqa: BLE001
+                err["err"] = e
+
+        t = threading.Thread(target=_trainer_thread, daemon=True)
+        t.start()
+        try:
+            self._run(self.engine.update_weights(request))
+        finally:
+            t.join(timeout=300.0)
+        if t.is_alive():
+            raise RuntimeError(
+                "NCCL weight-sync trainer thread did not finish within 300 s"
+            )
+        if "err" in err:
+            raise err["err"]
+
+        self._reset_prefix_cache_after_weight_update()
+        return time.time() - t0
 
     # ------------------------------------------------------------------
     # Lifecycle
