@@ -80,13 +80,27 @@ class CriticModel(nn.Module):
         # architectures) we get just the final hidden state without
         # the per-layer retention.
         encoder = getattr(self.backbone, "model", self.backbone)
+        # Pre-embed and force requires_grad on the embeddings. The
+        # ``enable_input_require_grads`` hook registered in
+        # ``from_pretrained`` is dropped by FSDP's auto_wrap (the
+        # embed_tokens module gets wrapped/replaced, losing its
+        # forward hook). Without this, integer ``input_ids`` →
+        # no-grad embed output → use_reentrant=False checkpoint
+        # silently severs autograd → ``v_loss`` has no grad_fn.
+        # Pre-embedding here puts the require-grad point inside our
+        # own module, where FSDP wrapping cannot strip it.
+        embed = encoder.get_input_embeddings()
+        inputs_embeds = embed(input_ids)
+        if self.training:
+            inputs_embeds.requires_grad_(True)
         out = encoder(
-            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
             **{k: v for k, v in kwargs.items()
-               if k not in ("output_hidden_states", "use_cache", "return_dict")},
+               if k not in ("input_ids", "inputs_embeds",
+                            "output_hidden_states", "use_cache", "return_dict")},
         )
         # ``out.last_hidden_state`` is [B, S, H] in the backbone's
         # compute dtype.
@@ -155,6 +169,16 @@ class CriticModel(nn.Module):
                     backbone.gradient_checkpointing_enable()
                 except AttributeError:
                     pass
+            # HF only auto-calls ``enable_input_require_grads`` when PEFT is
+            # loaded. Without it, integer ``input_ids`` produce no-grad embed
+            # outputs → use_reentrant=False checkpoints emit non-grad-requiring
+            # tensors → the entire encoder chain silently breaks autograd, and
+            # the trainable critic forward returns a leaf tensor (RuntimeError
+            # "element 0 of tensors does not require grad" at v_loss.backward).
+            try:
+                backbone.enable_input_require_grads()
+            except AttributeError:
+                pass
         hidden_size = int(getattr(hf_cfg, "hidden_size", 0))
         if hidden_size <= 0:
             raise RuntimeError(

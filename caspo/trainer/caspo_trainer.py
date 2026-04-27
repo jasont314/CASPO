@@ -745,11 +745,22 @@ class CASPOTrainer:
     # ------------------------------------------------------------------ helpers
 
     def _infer_fsdp_layer_classes(self, module: torch.nn.Module) -> set[type]:
-        """Infer transformer block classes for FSDP auto-wrapping."""
+        """Infer transformer block classes for FSDP auto-wrapping.
 
-        names = set(getattr(module, "_no_split_modules", None) or [])
-        config = getattr(module, "config", None)
-        names.update(getattr(config, "_no_split_modules", None) or [])
+        For wrappers like ``CriticModel(backbone=LlamaForCausalLM)`` the
+        ``_no_split_modules`` attribute lives on the inner backbone, not
+        on the top-level module. Walk the module tree until we find one
+        that exposes it (or its ``config``). Without this, the critic
+        would FSDP-wrap as a single flat 7B param with no compute/comm
+        overlap and full unsharded peak on every rank.
+        """
+        names: set[str] = set()
+        for m in [module, *module.modules()]:
+            names.update(getattr(m, "_no_split_modules", None) or [])
+            cfg = getattr(m, "config", None)
+            names.update(getattr(cfg, "_no_split_modules", None) or [])
+            if names:
+                break
         if not names:
             return set()
         return {
@@ -1183,7 +1194,6 @@ class CASPOTrainer:
         except Exception as e:
             warnings.warn(f"wandb.log failed: {e}")
 
-    @torch.no_grad()
     def _ppo_critic_train_critic(
         self,
         tiled_prompt_ids: torch.Tensor,
@@ -1906,6 +1916,14 @@ class CASPOTrainer:
         G = int(cfg.group_size)
         t_step_start = time.time()
 
+        # Release reserved-but-unallocated blocks from the prior step's
+        # vLLM sync before this step grows its forward activations. Without
+        # this, the allocator carries 200–500 MB of reserved fragments into
+        # step 2's policy forward, OOMing at mb=4 colocated by ~80 MB even
+        # after the end-of-step empty_cache (which fires *before* sync, so
+        # vLLM's KV-cache grow re-fragments the pool).
+        torch.cuda.empty_cache()
+
         # 1. Rollout (timed)
         t_rollout_start = time.time()
         rollout: RolloutBatch = self.sampler.sample(examples)
@@ -2370,10 +2388,30 @@ class CASPOTrainer:
                 n_epochs=int(cfg.epochs_per_rollout),
             )
             t_value = t_value + t_value_extra
-            value_stats = {"v_loss": v_loss_avg}
+            value_stats = {"v_loss": v_loss_avg, "t_value_forward_s": t_value}
             # Drop the stashed tensors so they don't leak across steps.
             self._ppo_critic_old_values = None
             self._ppo_critic_returns = None
+
+        # Free fragmented allocations from the policy mb loop and decoupled
+        # critic backward before vLLM sync. ``summon_full_params`` inside
+        # ``_sync_vllm_weights_fsdp`` materializes ~14 GB of unsharded bf16
+        # params; without first releasing the now-unused stat tensors and
+        # ref/old logprob caches, the allocator pool is fragmented and the
+        # weight sync OOMs colocated vLLM. Saves 200–800 MB / rank in our
+        # measurements (caspo trainer wave 4, 2026-04-27).
+        del loss_terms, pg_terms, logp_terms, clip_terms, ratio_terms, kl_terms
+        # ref_logprobs_full / old_logprobs_chunks may not exist on every
+        # branch (no-ref-policy GRPO, first-epoch caspo). Use locals()
+        # rather than dir() — dir() in a method returns instance attrs,
+        # not the function's locals.
+        _locals = locals()
+        if "old_logprobs_chunks" in _locals:
+            del old_logprobs_chunks
+        if "ref_logprobs_full" in _locals:
+            del ref_logprobs_full
+        del _locals
+        torch.cuda.empty_cache()
 
         # Sync vLLM weights for the next rollout (if applicable). The train
         # loop passes ``sync_vllm=False`` for its final step because no later
