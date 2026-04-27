@@ -86,7 +86,7 @@ CASPO_REWARD_WORKERS="${CASPO_REWARD_WORKERS:-${REWARD_WORKERS:-4}}"
 # Default 8: bigger than mb=2 (the trainable forward) because there's no
 # autograd graph to keep, so larger forwards amortize python/launch
 # overhead. Verified at rho-1B DDP-2 (=16 there). Override via env.
-CASPO_LOGPROB_MICRO_BATCH_SIZE="${CASPO_LOGPROB_MICRO_BATCH_SIZE:-${LOGPROB_MICRO_BATCH_SIZE:-8}}"
+CASPO_LOGPROB_MICRO_BATCH_SIZE="${CASPO_LOGPROB_MICRO_BATCH_SIZE:-${LOGPROB_MICRO_BATCH_SIZE:-4}}"
 PROMPTS_PER_STEP_VAL="${PROMPTS_PER_STEP:-64}"
 
 unset VLLM_GPU_MEMORY_UTILIZATION VLLM_MAX_NUM_SEQS

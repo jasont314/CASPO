@@ -12,8 +12,14 @@
 
 # CUDA caching allocator: expandable_segments dramatically reduces
 # fragmentation in long PPO runs that grow/shrink activations across
-# rollout / forward / backward phases.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# rollout / forward / backward phases. ``garbage_collection_threshold``
+# triggers proactive GC at >60% pool fill (vs default reactive-on-OOM
+# only) — critical when colocated vLLM + trainer share a tight 80 GB
+# ceiling. ``max_split_size_mb=512`` prevents the allocator from
+# splitting blocks >512 MB so FSDP all-gather buffers (~440 MB
+# payload at group_size=1) and ``summon_full_params`` materializations
+# don't fragment into unusable shards.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6,max_split_size_mb:512
 
 # NCCL: surface hangs as actionable errors instead of silent stalls, and
 # extend the collective timeout (default 30s is far too short for slow
