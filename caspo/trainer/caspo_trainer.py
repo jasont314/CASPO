@@ -602,7 +602,46 @@ class CASPOTrainer:
                     )
                 else:
                     inner = None
-                self.sampler = DisaggregatedSamplerProxy(inner, self.dist)
+                # Phase F: when ``vllm_disaggregated=True`` AND
+                # ``vllm_weight_sync_backend=='ipc'``, every trainer rank
+                # is expected to colocate with its same-index vLLM
+                # worker on the same physical GPU. The proxy uses the
+                # multirank-IPC sync path (gather per-rank IPC handles
+                # → merge → submit). Sanity-check the topology
+                # invariants the launcher promises.
+                multirank_ipc = (
+                    cfg.vllm_weight_sync_backend == "ipc"
+                    and cfg.vllm_disaggregated
+                )
+                if multirank_ipc:
+                    # Every trainer rank must occupy the corresponding
+                    # rollout-GPU slot. Specifically: the launcher must
+                    # set the trainer's world_size == rollout-GPU count
+                    # and CUDA_VISIBLE_DEVICES so trainer rank N pins
+                    # to physical GPU N. The trainer-side
+                    # ``CASPO_ROLLOUT_GPU_PHYSICAL_IDS`` env var
+                    # already lists those physical GPUs in launch
+                    # order (set by _launch_7b_tp8_ipc.sh).
+                    rollout_ids_env = os.environ.get(
+                        "CASPO_ROLLOUT_GPU_PHYSICAL_IDS", ""
+                    ).strip()
+                    if rollout_ids_env:
+                        n_rollout = len(
+                            [s for s in rollout_ids_env.split(",") if s.strip()]
+                        )
+                        if n_rollout != int(self.dist.world_size):
+                            raise RuntimeError(
+                                "multirank-IPC sync (vllm_disaggregated=True + "
+                                "vllm_weight_sync_backend=ipc) requires the "
+                                "trainer world_size to equal the rollout-GPU "
+                                f"count, but world_size={self.dist.world_size} "
+                                f"and len(CASPO_ROLLOUT_GPU_PHYSICAL_IDS)={n_rollout}. "
+                                "Use scripts/_launch_7b_tp8_ipc.sh which sets up "
+                                "the colocated topology correctly."
+                            )
+                self.sampler = DisaggregatedSamplerProxy(
+                    inner, self.dist, multirank_ipc=multirank_ipc,
+                )
             else:
                 engine_kwargs = dict(
                     gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,

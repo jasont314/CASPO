@@ -552,13 +552,14 @@ class CASPOConfig:
                     "vllm_tensor_parallel_size=1 so trainer and vLLM share one "
                     "physical GPU."
                 )
-            if self.vllm_disaggregated:
-                raise ValueError(
-                    "vllm_weight_sync_backend='ipc' cannot be combined with "
-                    "vllm_disaggregated=True; IPC handles cannot span the "
-                    "physical-GPU boundary between trainer ranks and the "
-                    "dedicated rollout GPUs. Use 'nccl' or 'checkpoint'."
-                )
+            # Note: ``vllm_disaggregated=True`` + ``vllm_weight_sync_backend=ipc``
+            # is the colocated-TP path (Phase F). That mode requires every
+            # trainer rank N to share GPU N with vLLM Worker_TP_N (so each
+            # rank's local IPC handle is openable by its same-GPU worker).
+            # We can't fully verify the GPU-sharing invariant from the cfg
+            # alone (it's a launcher topology fact), so the trainer asserts
+            # at runtime that LOCAL_RANK / world_size matches
+            # vllm_disaggregated_tp before building the multirank-IPC proxy.
         # Disaggregated topology validations
         if self.vllm_disaggregated:
             if self.vllm_disaggregated_tp < 1:
@@ -576,13 +577,21 @@ class CASPOConfig:
                     f"distributed_backend='fsdp', got "
                     f"{self.distributed_backend!r}"
                 )
-            if self.vllm_weight_sync_backend not in ("nccl", "checkpoint"):
+            if self.vllm_weight_sync_backend not in ("nccl", "checkpoint", "ipc"):
                 raise ValueError(
                     f"vllm_disaggregated=True requires "
-                    f"vllm_weight_sync_backend in {{'nccl','checkpoint'}}, "
-                    f"got {self.vllm_weight_sync_backend!r} (IPC cannot span "
-                    f"physical GPUs)."
+                    f"vllm_weight_sync_backend in {{'nccl','checkpoint','ipc'}}, "
+                    f"got {self.vllm_weight_sync_backend!r}."
                 )
+            # ``ipc`` under disaggregated is the Phase F colocated-TP path:
+            # every trainer rank shares its physical GPU with the matching
+            # vLLM TP-worker, so per-rank IPC handles can be opened by the
+            # same-GPU worker. The trainer's
+            # ``DisaggregatedSamplerProxy._sync_weights_multirank_ipc`` does
+            # the cross-rank gather + per-param multi-UUID merge before
+            # submitting one ``AsyncLLM.update_weights``. The launcher must
+            # set CUDA_VISIBLE_DEVICES so trainer rank N pins to the same
+            # physical GPU as vLLM Worker_TP_N.
             # vllm_tensor_parallel_size on the trainer-side cfg is ignored
             # under disaggregation — TP belongs to the rollout engine and is
             # carried by vllm_disaggregated_tp instead. Reject the redundant

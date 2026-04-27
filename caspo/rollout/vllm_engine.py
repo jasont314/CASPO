@@ -1218,6 +1218,68 @@ class VLLMRolloutEngine:
         self._reset_prefix_cache_after_weight_update()
         return time.time() - t0
 
+    def _sync_weights_from_aggregated_ipc(
+        self,
+        *,
+        names: list[str],
+        dtype_names: list[str],
+        shapes: list[list[int]],
+        aggregated_handles: list[dict[str, Any]],
+    ) -> float:
+        """Submit pre-aggregated multi-GPU IPC handles to vLLM.
+
+        Used by ``DisaggregatedSamplerProxy._sync_weights_multirank_ipc``
+        for the Phase F colocated-TP=N path. The proxy gathers per-rank
+        handles ({uuid_N: handle_N}) into per-param multi-UUID dicts
+        ({uuid_0: h0, ..., uuid_{N-1}: h_{N-1}}) before calling here;
+        we just pickle them and dispatch via ``update_weights``.
+
+        Each vLLM TP-worker on GPU N looks up its own UUID in the
+        dict, opens its same-GPU IPC handle, and ``load_weights``
+        slices the full tensor onto its TP-shard. Verified against
+        vllm/distributed/weight_transfer/ipc_engine.py:172-191
+        (current_device_index → physical UUID → handle lookup).
+
+        The caller is responsible for keeping all source-side tensors
+        alive (via Python refs on every trainer rank) until this call
+        returns. Only rank 0 reaches this code; the caller arranges a
+        ``dist.barrier()`` afterward so non-rank-0 keepalive persists
+        until vLLM is done copying.
+        """
+        if self._weight_sync_backend != "ipc":
+            raise RuntimeError(
+                f"_sync_weights_from_aggregated_ipc requires "
+                f"vllm_weight_sync_backend='ipc', got "
+                f"{self._weight_sync_backend!r}"
+            )
+        import pickle
+
+        import pybase64 as base64
+        from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+
+        if not (len(names) == len(dtype_names) == len(shapes) == len(aggregated_handles)):
+            raise ValueError(
+                f"length mismatch: names={len(names)} dtypes={len(dtype_names)} "
+                f"shapes={len(shapes)} handles={len(aggregated_handles)}"
+            )
+        pickled_handles = base64.b64encode(
+            pickle.dumps(aggregated_handles)
+        ).decode("utf-8")
+        request = WeightTransferUpdateRequest(
+            update_info={
+                "names": list(names),
+                "dtype_names": list(dtype_names),
+                "shapes": list(shapes),
+                "ipc_handles_pickled": pickled_handles,
+                "is_checkpoint_format": True,
+            }
+        )
+        # Note: we don't keepalive here — the proxy holds keepalive on
+        # every rank around our call (synchronized via dist.barrier()).
+        self._run(self.engine.update_weights(request))
+        self._reset_prefix_cache_after_weight_update()
+        return 0.0
+
     def _reset_prefix_cache_after_weight_update(self) -> None:
         # reset_prefix_cache is async on V1 engine — drive it on our event loop.
         # Strictly AFTER the weight update so cached KV from old weights cannot

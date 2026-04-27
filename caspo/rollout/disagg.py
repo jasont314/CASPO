@@ -105,9 +105,24 @@ class DisaggregatedSamplerProxy:
     side joins the side group, which lives separately from FSDP's PG).
     """
 
-    def __init__(self, inner: Optional[Any], dist_info: Any) -> None:
+    def __init__(
+        self,
+        inner: Optional[Any],
+        dist_info: Any,
+        *,
+        multirank_ipc: bool = False,
+    ) -> None:
         self.inner = inner
         self.dist = dist_info
+        # When True, ``sync_weights_from_model`` runs the per-GPU IPC
+        # aggregation path (Phase F): every trainer rank produces an
+        # IPC handle for tensors on its OWN GPU, gathers to rank 0,
+        # rank 0 merges into a multi-UUID dict and submits a single
+        # AsyncLLM.update_weights. Used for colocated TP=N where the
+        # NCCL side-group can't form (NCCL forbids two ranks of one
+        # comm group on the same physical device, and trainer rank N
+        # + Worker_TP_N share GPU N in the colocated topology).
+        self._multirank_ipc = bool(multirank_ipc)
         if dist_info.is_main and inner is None:
             raise RuntimeError(
                 "DisaggregatedSamplerProxy on rank 0 requires a real inner sampler"
@@ -221,14 +236,106 @@ class DisaggregatedSamplerProxy:
         return self._scatter_objects(per_rank if self.dist.is_main else None)
 
     # ------------------------------------------------------------------
-    # Weight sync — only rank 0's inner engine has a real path.
+    # Weight sync — two paths, depending on topology.
+    #
+    # Default path (disagg / NCCL, rank-local TP=1):
+    #   only rank 0's inner engine produces handles + drives the sync.
+    #
+    # Multirank-IPC path (colocated TP=N, all ranks share GPU set):
+    #   every trainer rank N produces an IPC handle for its same-GPU
+    #   tensors, gathers to rank 0, rank 0 merges into a multi-UUID
+    #   dict per param and submits one ``AsyncLLM.update_weights``.
     # ------------------------------------------------------------------
     def sync_weights_from_model(self, model: Any) -> Any:
+        if self._multirank_ipc:
+            return self._sync_weights_multirank_ipc(model)
         if self.dist.is_main:
             return self.inner.sync_weights_from_model(model)
         # On other ranks the side NCCL weight-sync group is initialized
         # but only rank 0 is the producer. Other ranks return 0.0 wall.
         return 0.0
+
+    # ------------------------------------------------------------------
+    def _sync_weights_multirank_ipc(self, model: Any) -> Any:
+        """Phase F sync: each trainer rank produces an IPC handle for
+        its own-GPU tensors; rank 0 merges per-param dicts and submits.
+
+        Caller (the trainer) must enter this from inside FSDP
+        ``summon_full_params`` so every rank has the FULL model on its
+        own GPU. The keepalive list on each rank holds a Python ref to
+        each contiguous tensor until rank 0's update_weights RPC
+        returns; we ``dist.barrier()`` after the RPC so non-rank-0
+        ranks block until vLLM has finished opening every IPC handle.
+        Without that barrier, non-rank-0 keepalive could be released
+        while vLLM Worker_TP_N is still mid-copy from GPU N's IPC
+        view, racing against CUDA's IPC handle lifetime.
+        """
+        import time
+        import torch
+        import torch.distributed as dist
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        t0 = time.time()
+        device_index = torch.cuda.current_device()
+        my_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+
+        # Build local IPC handles for THIS rank's same-GPU tensors.
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        local_handles: list[dict[str, Any]] = []
+        keepalive: list[Any] = []
+        for name, tensor in model.named_parameters():
+            if not tensor.is_cuda:
+                raise RuntimeError(
+                    f"parameter {name!r} is on {tensor.device}; multirank-IPC "
+                    f"sync expects every trainer rank to have CUDA tensors"
+                )
+            weight = tensor.detach().contiguous()
+            keepalive.append(weight)
+            names.append(name)
+            dtype_names.append(str(weight.dtype).split(".")[-1])
+            shapes.append(list(weight.shape))
+            local_handles.append({my_uuid: reduce_tensor(weight)})
+
+        # Gather per-rank handle lists onto rank 0. Names/dtype/shape
+        # are identical across ranks (FSDP gathered the same params)
+        # so we only need handles. Sanity-checked on rank 0 below.
+        gathered_handles: Optional[list[list[dict[str, Any]]]] = (
+            [None] * self.dist.world_size if self.dist.is_main else None
+        )
+        dist.gather_object(local_handles, gathered_handles, dst=0)
+
+        # On rank 0, merge per-param dicts into multi-UUID handle.
+        if self.dist.is_main:
+            assert gathered_handles is not None
+            n_params = len(names)
+            for r, sub in enumerate(gathered_handles):
+                if len(sub) != n_params:
+                    raise RuntimeError(
+                        f"rank {r} contributed {len(sub)} handles but rank 0 "
+                        f"has {n_params}; named_parameters order/length must "
+                        f"match across ranks (FSDP guarantees this)"
+                    )
+            merged: list[dict[str, Any]] = []
+            for i in range(n_params):
+                handle_dict: dict[str, Any] = {}
+                for sub in gathered_handles:
+                    handle_dict.update(sub[i])
+                merged.append(handle_dict)
+            self.inner._sync_weights_from_aggregated_ipc(
+                names=names,
+                dtype_names=dtype_names,
+                shapes=shapes,
+                aggregated_handles=merged,
+            )
+
+        # Synchronize: every rank holds keepalive until rank 0's RPC
+        # returns. Otherwise rank N>0's contiguous tensor could be
+        # garbage-collected mid-copy from Worker_TP_N's IPC view.
+        dist.barrier()
+        # keepalive auto-releases here as the function returns.
+        return time.time() - t0
 
     def sync_weights_from_path(self, path: str) -> Any:
         if self.dist.is_main:
