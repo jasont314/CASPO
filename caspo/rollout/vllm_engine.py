@@ -973,12 +973,14 @@ class VLLMRolloutEngine:
         flat_logprobs: List[List[float]] = []
         flat_responses: List[str] = []
         flat_lengths: List[int] = []
+        flat_finish_reasons: List[str] = []
         for comp in comps_flat:
             gen = self._extract_completion(comp)
             flat_token_ids.append(gen.token_ids)
             flat_logprobs.append(gen.sampling_logprobs)
             flat_responses.append(gen.text)
             flat_lengths.append(len(gen.token_ids))
+            flat_finish_reasons.append(gen.finish_reason)
 
         B = num_prompts * G
 
@@ -1000,8 +1002,17 @@ class VLLMRolloutEngine:
         sampling_logprobs = sampling_logprobs * response_mask.to(sampling_logprobs.dtype)
 
         # Reward (decoded text + ground truth tiled to per-response).
+        # VinePPO-strict: zero out reward for any response whose generation
+        # was halted by ``max_tokens`` (``finish_reason == "length"``)
+        # regardless of whether ``\boxed{...}`` happens to appear in the
+        # truncated text. Matches MathEpisodeGenerator's
+        # ``unfinished_response_penalty=0`` post-processing in upstream.
         tiled_gt = [ground_truths[i // G] for i in range(B)]
-        rewards = torch.tensor(self.reward_fn(flat_responses, tiled_gt), dtype=torch.float32)
+        graded = list(self.reward_fn(flat_responses, tiled_gt))
+        for i, fr in enumerate(flat_finish_reasons):
+            if fr == "length":
+                graded[i] = 0.0
+        rewards = torch.tensor(graded, dtype=torch.float32)
 
         prompt_index = torch.arange(num_prompts).repeat_interleave(G).to(torch.long)
 
