@@ -7,8 +7,8 @@ small and dataclass-only lets agents and scripts share the same contract.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, asdict, fields
-from typing import Optional, Literal
+from dataclasses import dataclass, asdict, field, fields
+from typing import List, Optional, Literal
 
 import yaml
 
@@ -115,6 +115,11 @@ class CASPOConfig:
     prompt_template: Optional[str] = None
     max_prompt_len: int = 1024
     max_response_len: int = 4096
+    # VinePPO ``max_sequence_length=2048`` unfinished-response penalty.
+    # When prompt+response token total exceeds this, the rollout is treated
+    # as unfinished and reward is zeroed (matches MathEpisodeGenerator's
+    # post-hoc seq_len penalty in treetune episode_generator). 0 disables.
+    max_sequence_len: int = 2048
 
     # ---- rollout ----
     group_size: int = 8
@@ -216,11 +221,11 @@ class CASPOConfig:
     gamma: float = 1.0                # discount; VinePPO uses 1.0
     standardize_step_advantage: bool = True  # whiten advantages within batch
     standardize_advantage_scope: Literal["batch", "group", "off"] = "batch"
-    # Clip standardized advantages to ±N sigma to prevent rare-event spikes
-    # from blowing up the policy gradient (e.g., when V_φ produces a few large
-    # values among many zeros, the std normalization can map them to ±10+
-    # sigma). 3.0 = mild guardrail; 0 = disable.
-    advantage_clip: float = 3.0
+    # Clip standardized advantages to ±N sigma. VinePPO upstream and
+    # standard PPO impls do NOT clip; truncating ±3 silently nukes terminal-
+    # success advantages (the strongest learning signal) after whitening.
+    # 0 = disable (paper-faithful default). Kept as a knob for ablation.
+    advantage_clip: float = 0.0
 
     # ---- PPO ----
     clip_eps_low: float = 0.20
@@ -338,6 +343,15 @@ class CASPOConfig:
     # "auto": try batched once, then fall back to expanded if this runtime has
     # the vLLM V1 n>1 regression.
     vllm_multi_sample_mode: Literal["auto", "expanded", "batched"] = "auto"
+    # Textual stop strings passed to vLLM SamplingParams. VinePPO uses
+    # "\n\n\nProblem:" so the model can't auto-regressively start a NEW
+    # MATH problem after finishing the current one (which the
+    # `[MATH_TASK] Problem: ...` template invites). Without this, otherwise-
+    # correct rollouts run to length cap and get reward 0 under the
+    # finish_reason=='length' rule. Empty list disables.
+    vllm_extra_stop_strings: List[str] = field(
+        default_factory=lambda: ["\n\n\nProblem:"]
+    )
     # Trainer recomputes π_old logprobs with the policy model before PPO, so
     # vLLM logprobs are optional diagnostics. Keeping them off trims rollout
     # payload size and decode-side logprob work.
@@ -429,11 +443,27 @@ class CASPOConfig:
     # NVLink BW utilization (target step-time win 10-18%). Default 1 keeps
     # the existing per-block wrap behaviour byte-for-byte.
     fsdp_wrap_block_group_size: int = 1
-    # Override FSDP MixedPrecision reduce_dtype. ``None`` (default) means
-    # "match cfg.torch_dtype" — without this, FSDP reduces grads in fp32 even
-    # under bf16 params, doubling reduce-scatter wire bytes for no accuracy
-    # win at LLM scale.
-    fsdp_reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
+    # FSDP MixedPrecision reduce_dtype. fp32 reduce matches DeepSpeed
+    # BF16_Optimizer's fp32 grad accumulator behavior used by VinePPO
+    # upstream — at PPO's lr=1e-6 with grad_accum_steps=8, accumulating
+    # 8× bf16 reductions into a bf16 .grad buffer puts the effective
+    # update inside the bf16 noise floor and the run drifts back toward
+    # init. fp32 reduce + FSDP no_sync() during inner micros (so only
+    # the LAST mb's reduction is paid in fp32) restores update fidelity
+    # at minor wire-byte cost (2× bytes on accum-boundary mb only).
+    # Set to "bfloat16" or "float16" to revert to the older lower-precision
+    # path if memory or wire-bytes are tight.
+    fsdp_reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = "float32"
+    # When True, load policy weights in fp32 and rely on FSDP MixedPrecision
+    # ``param_dtype=bf16`` to cast at compute time. This preserves an fp32
+    # master copy on the shard so AdamW's ``exp_avg``/``exp_avg_sq`` and the
+    # ``param.add_(lr * m_hat / (sqrt(v_hat)+eps))`` update happen in fp32.
+    # Without this, the optimizer state and update both live in bf16 (7-bit
+    # mantissa) and at lr=1e-6 the per-step delta rounds to zero — the same
+    # symptom DeepSpeed's BF16_Optimizer was built to fix. Cost: ~2× param
+    # memory per shard, ~2× optimizer-state memory. Disable for tight
+    # 7B/4-GPU configs and pay the regression risk.
+    fp32_master_weights: bool = True
     # ---- profiling ----
     # Opt-in torch.profiler trace dump. When > 0, the trainer wraps its main
     # loop with torch.profiler.profile(...) using schedule(warmup=2,

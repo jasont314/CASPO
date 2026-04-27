@@ -117,6 +117,13 @@ class VLLMRolloutEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.eos_token_id = int(self.tokenizer.eos_token_id)
         self.pad_token_id = int(self.tokenizer.pad_token_id)
+        # SFT models in this codebase (Rho-1B-SFT-MATH, DeepSeekMath-7B) were
+        # trained with BOS auto-prepended. We tokenize prompts with
+        # add_special_tokens=False (and pass token-ids to vLLM, which doesn't
+        # re-tokenize), so we must prepend BOS manually to keep RL rollouts /
+        # training on the same distribution as SFT init / eval.
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        self.bos_token_id: Optional[int] = int(bos_id) if bos_id is not None else None
         # Some chat-tuned models (Qwen2 with <|im_end|>, Llama-3 with both
         # <|end_of_text|> and <|eot_id|>) expose multiple stop tokens. The
         # canonical one is tokenizer.eos_token_id, but the model's
@@ -834,6 +841,8 @@ class VLLMRolloutEngine:
             return ids
         enc = self.tokenizer(prompt, add_special_tokens=False)
         ids = list(enc["input_ids"])
+        if self.bos_token_id is not None and (not ids or ids[0] != self.bos_token_id):
+            ids = [self.bos_token_id] + ids
         cache = self._prompt_token_cache
         if len(cache) >= self._prompt_token_cache_max:
             # Evict oldest entry (FIFO). dict insertion order is preserved.
@@ -884,6 +893,10 @@ class VLLMRolloutEngine:
             enc = self.tokenizer(miss_prompts, add_special_tokens=False)
             for j, ids in zip(miss_indices, enc["input_ids"]):
                 ids_list = list(ids)
+                if self.bos_token_id is not None and (
+                    not ids_list or ids_list[0] != self.bos_token_id
+                ):
+                    ids_list = [self.bos_token_id] + ids_list
                 # Populate cache with the FULL (un-truncated) tokenization;
                 # truncation happens just below and is a cheap slice.
                 cache = self._prompt_token_cache
@@ -896,10 +909,20 @@ class VLLMRolloutEngine:
                 cache[prompts[j]] = ids_list
                 prompt_token_ids[j] = ids_list
         # Apply per-call left-truncation; never mutate cached lists in place.
+        # Preserve BOS at position 0 across left-truncation: drop interior
+        # tokens, not the leading BOS that SFT was trained to expect.
         if max_p:
             for i, ids in enumerate(prompt_token_ids):
                 if len(ids) > max_p:
-                    prompt_token_ids[i] = list(ids[-max_p:])
+                    if (
+                        self.bos_token_id is not None
+                        and ids
+                        and ids[0] == self.bos_token_id
+                        and max_p >= 2
+                    ):
+                        prompt_token_ids[i] = [self.bos_token_id] + list(ids[-(max_p - 1):])
+                    else:
+                        prompt_token_ids[i] = list(ids[-max_p:])
                 else:
                     prompt_token_ids[i] = list(ids)
         else:
@@ -1007,11 +1030,23 @@ class VLLMRolloutEngine:
         # regardless of whether ``\boxed{...}`` happens to appear in the
         # truncated text. Matches MathEpisodeGenerator's
         # ``unfinished_response_penalty=0`` post-processing in upstream.
+        # Additionally apply VinePPO's max_sequence_length=2048 unfinished
+        # penalty: when prompt+response total tokens exceed the threshold,
+        # treat the trajectory as unfinished and zero the reward.
+        max_seq_len = int(getattr(self.cfg, "max_sequence_len", 0)) or 0
         tiled_gt = [ground_truths[i // G] for i in range(B)]
         graded = list(self.reward_fn(flat_responses, tiled_gt))
+        prompt_len_per_row = [
+            len(prompt_token_ids[i // G]) for i in range(B)
+        ]
         for i, fr in enumerate(flat_finish_reasons):
             if fr == "length":
                 graded[i] = 0.0
+                continue
+            if max_seq_len > 0:
+                total_len = prompt_len_per_row[i] + flat_lengths[i]
+                if total_len > max_seq_len:
+                    graded[i] = 0.0
         rewards = torch.tensor(graded, dtype=torch.float32)
 
         prompt_index = torch.arange(num_prompts).repeat_interleave(G).to(torch.long)

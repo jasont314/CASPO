@@ -95,6 +95,7 @@ def ppo_clipped_loss(
     ref_logprobs: Optional[torch.Tensor] = None,
     kl_coef: float = 0.0,
     kl_estimator: str = "k3",
+    ratio_threshold: Optional[float] = 10.0,
 ) -> tuple[torch.Tensor, dict]:
     """PPO clipped surrogate, token-mean reduction.
 
@@ -194,6 +195,18 @@ def ppo_clipped_loss(
     # gradient (otherwise nan logprobs at padding could poison the grad).
     pg_loss = (per_token_loss * fmask).sum() / denom
 
+    # PPO ratio safety net (matches VinePPO ratio_threshold=10.0,
+    # treetune/trainers/ppo_trainer.py:927-934). When the masked-mean
+    # ratio across this microbatch exceeds the threshold, the policy has
+    # drifted catastrophically — zero out the policy gradient on this mb
+    # rather than taking a destabilizing step. KL term still contributes.
+    is_skipped = torch.zeros((), device=logprobs.device, dtype=logprobs.dtype)
+    if ratio_threshold is not None and ratio_threshold > 0.0:
+        mean_ratio_for_skip = (ratio.detach() * fmask).sum() / denom
+        skip_flag = (mean_ratio_for_skip > float(ratio_threshold)).to(logprobs.dtype)
+        pg_loss = pg_loss * (1.0 - skip_flag)
+        is_skipped = skip_flag
+
     loss = pg_loss
     mean_kl_val = None
     kl_term_val = None
@@ -225,6 +238,13 @@ def ppo_clipped_loss(
             raise ValueError(
                 f"unknown kl_estimator {kl_estimator!r}; must be 'k1' or 'k3'"
             )
+        # Per-token KL clamp [0, 10]. Matches VinePPO's
+        # ``kl_penalty_loss_clip_min=0, kl_penalty_loss_clip_max=10`` in
+        # ``configs/trainers/klLoss.jsonnet``. Without this, a single
+        # high-drift token (log-ratio ~3 → k3 KL ~10; clamp boundary at
+        # ±20 → k3 ~5e8) can dominate the per-sequence sum and inject a
+        # gradient spike disproportionate to the policy update.
+        kl = kl.clamp(min=0.0, max=10.0)
         # KL reduction: per-sequence sum, then batch mean. Matches VinePPO
         # upstream's ``ref_kl.sum(dim=1).mean()`` (treetune ppo_trainer.py:920).
         # The earlier per-token mean (``(kl * fmask).sum() / denom``) made the
@@ -264,6 +284,7 @@ def ppo_clipped_loss(
         "clip_frac": clip_frac,
         "mean_advantage": mean_adv,
         "mean_logp": mean_logp,
+        "ratio_skip": is_skipped.detach(),
     }
     if mean_kl_val is not None:
         stats["mean_kl"] = mean_kl_val

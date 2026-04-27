@@ -400,8 +400,29 @@ class CASPOTrainer:
 
         # ---- policy model (π_θ, trainable) ----
         torch_dtype = _resolve_dtype(cfg.torch_dtype)
+        # fp32 master-weights path: load fp32, FSDP MixedPrecision casts
+        # to bf16 at compute time. Only valid when the policy will be
+        # FSDP-wrapped — without FSDP MixedPrecision the params stay fp32
+        # at forward time and FlashAttention rejects fp32 inputs. Fall
+        # back to bf16 load (and emit a one-line warning) for non-FSDP
+        # configs (single-GPU, DDP) so the run still works; the user
+        # sees they're not getting fp32-master fidelity for that config.
+        want_fp32_master = (
+            cfg.fp32_master_weights and torch_dtype != torch.float32
+        )
+        will_fsdp_wrap = bool(cfg.distributed_backend == "fsdp")
+        if want_fp32_master and not will_fsdp_wrap:
+            rank0_print(
+                self.dist,
+                "[trainer] fp32_master_weights=True ignored: requires "
+                "distributed_backend='fsdp' so MixedPrecision can cast bf16 "
+                "at forward time. Falling back to bf16 load (no fp32 master).",
+                flush=True,
+            )
+            want_fp32_master = False
+        load_dtype = torch.float32 if want_fp32_master else torch_dtype
         model_kwargs = dict(
-            torch_dtype=torch_dtype,
+            torch_dtype=load_dtype,
             trust_remote_code=cfg.trust_remote_code,
         )
         if cfg.attn_implementation:
@@ -473,8 +494,12 @@ class CASPOTrainer:
         # ---- reference policy for PPO KL term (optional) ----
         self.ref_policy = None
         if cfg.kl_coef and cfg.kl_coef > 0:
+            # Ref is frozen (no optimizer state), so the fp32-master argument
+            # doesn't apply — load directly in compute dtype to save memory.
+            ref_kwargs = dict(model_kwargs)
+            ref_kwargs["torch_dtype"] = torch_dtype
             self.ref_policy = AutoModelForCausalLM.from_pretrained(
-                cfg.model_name_or_path, **model_kwargs,
+                cfg.model_name_or_path, **ref_kwargs,
             )
             # Mirror policy: never cache KV (we always run a fresh
             # full-sequence forward) and never train (frozen reference).
@@ -667,6 +692,7 @@ class CASPOTrainer:
                         max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
                         max_inflight_requests=cfg.vllm_max_inflight_requests,
                         enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
+                        extra_stop_strings=tuple(cfg.vllm_extra_stop_strings or ()),
                         # Tell the engine: bind to these PHYSICAL GPU IDs as
                         # a contiguous TP group. The engine handles the
                         # CUDA_VISIBLE_DEVICES gymnastics so that AsyncLLM
@@ -728,6 +754,7 @@ class CASPOTrainer:
                     max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
                     max_inflight_requests=cfg.vllm_max_inflight_requests,
                     enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
+                    extra_stop_strings=tuple(cfg.vllm_extra_stop_strings or ()),
                     gpu_id=(
                         self.dist.local_rank
                         if self.dist.is_distributed
@@ -1083,9 +1110,71 @@ class CASPOTrainer:
 
     @staticmethod
     def _maybe_no_sync(module: torch.nn.Module, enabled: bool):
-        if enabled and _is_ddp_module(module):
-            return module.no_sync()
+        # Suppress cross-rank gradient reduction during the inner accumulation
+        # microbatches; only the FINAL micro of each accumulation group does
+        # the reduce-scatter (FSDP) / all-reduce (DDP). This matters for
+        # numerical fidelity to VinePPO/DeepSpeed: with reduce in bf16 every
+        # mb, an 8-step accumulation eats ~8× the bf16 quantization noise on
+        # the gradient before it reaches the optimizer. PyTorch FSDP's
+        # ``no_sync()`` accumulates local grads in the original dtype until
+        # the next sync boundary, so we skip 7 of 8 lossy reductions.
+        if not enabled:
+            return contextlib.nullcontext()
+        if _is_ddp_module(module) or _is_fsdp_module(module):
+            no_sync_fn = getattr(module, "no_sync", None)
+            if callable(no_sync_fn):
+                return no_sync_fn()
         return contextlib.nullcontext()
+
+    def _whiten_mb_advantage(
+        self,
+        adv: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Per-microbatch masked whitening over the (mb × world_size) slice.
+
+        Matches VinePPO's ``masked_whiten(distributed=True,
+        unbiased_variance=True)`` called inside the PPO inner training loop
+        every microbatch every epoch (treetune ppo_trainer.py:746-752 for
+        precomputed-MC; :1143-1149 for GAE). Without this, advantages
+        whitened once per rollout and reused across epochs / microbatches
+        produce inflated magnitudes (smaller per-rollout std → larger token
+        advantages → bigger PPO steps) and lose the implicit per-epoch
+        decorrelation upstream gets for free.
+        """
+        if adv.numel() == 0:
+            return adv
+        compute_dtype = torch.float32 if adv.dtype in (
+            torch.bfloat16, torch.float16,
+        ) else adv.dtype
+        a = adv.to(compute_dtype)
+        m = mask.to(compute_dtype)
+        masked = a * m
+        masked_sum = masked.sum()
+        valid_n = m.sum()
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            torch.distributed.all_reduce(masked_sum, op=dist.ReduceOp.SUM)
+            torch.distributed.all_reduce(valid_n, op=dist.ReduceOp.SUM)
+        denom = valid_n.clamp(min=1.0)
+        mean = masked_sum / denom
+        centered = (a - mean) * m
+        sq_sum = (centered * centered).sum()
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            torch.distributed.all_reduce(sq_sum, op=dist.ReduceOp.SUM)
+        var_denom = (valid_n - 1.0).clamp(min=1.0)
+        var = sq_sum / var_denom
+        std = var.clamp(min=0.0).sqrt()
+        if (std <= eps).item():
+            return adv
+        out = (a - mean) / std * m
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return out.to(adv.dtype) if out.dtype != adv.dtype else out
 
     def _sequence_reward_advantage(
         self,
@@ -1395,15 +1484,14 @@ class CASPOTrainer:
             n_micro_in_epoch = 0
             for micro_idx, (start, end) in enumerate(micro_ranges):
                 group_idx = micro_idx // accum
-                global_group_tokens = (
-                    global_group_token_counts[group_idx]
-                    if global_group_token_counts else 0.0
-                )
+                # Patch F (critic side): uniform per-mb weighting matching
+                # VinePPO/DeepSpeed default. ``coef`` is the value-loss
+                # coefficient applied to the loss before the per-mb mean.
+                _group_start = group_idx * accum
+                _group_end = min(_group_start + accum, n_micros_total)
+                _group_count = max(1, _group_end - _group_start)
+                grad_weight = coef / _group_count
                 micro_tokens = micro_token_counts[micro_idx]
-                grad_weight = (
-                    coef * micro_tokens * world_size / global_group_tokens
-                    if global_group_tokens > 0.0 else 0.0
-                )
                 will_step = (
                     ((n_micro_in_epoch + 1) % accum == 0)
                     or (micro_idx == n_micros_total - 1)
@@ -2397,50 +2485,72 @@ class CASPOTrainer:
 
         # Iterate the SAME rollout n_epochs times. π_old / advantages stay
         # frozen (computed before this loop); only π_θ updates each epoch.
-        # This is standard PPO behavior — the importance ratio drifts away
-        # from 1 over epochs, and the clipped surrogate guards against it.
-        # ppo_clipped_loss returns a valid-token mean for each microbatch.
-        # Weight each micro by its token count inside the accumulation group
-        # so the optimizer sees the same objective as one large token-mean
-        # batch. Equal averaging of micro means overweights short responses.
+        # The importance ratio drifts away from 1 across epochs and the
+        # clipped surrogate guards against it (with the safety-skip in
+        # ppo_loss as a hard backstop).
         micro_ranges = [(start, min(start + mb, B)) for start in range(0, B, mb)]
         n_micros_total = len(micro_ranges)
+        # Per-mb token counts retained for stat reporting (token-weighted mean
+        # of pg_loss/ratio/clip across the rollout for logging readability).
+        # Gradient weighting is uniform per Patch F (see the inner loop).
         row_token_counts = response_mask.sum(dim=1).detach().cpu()
         micro_token_counts = [
             float(row_token_counts[start:end].sum().item())
             for start, end in micro_ranges
         ]
-        group_token_counts = [
-            sum(micro_token_counts[i : min(i + accum, n_micros_total)])
-            for i in range(0, n_micros_total, accum)
-        ]
-        global_group_token_counts = list(group_token_counts)
-        world_size = max(1, int(self.dist.world_size))
-        if self.dist.is_distributed:
-            import torch.distributed as dist
-
-            group_tokens_t = torch.tensor(
-                global_group_token_counts, device=self.device, dtype=torch.float32,
-            )
-            dist.all_reduce(group_tokens_t, op=dist.ReduceOp.SUM)
-            global_group_token_counts = [
-                float(x) for x in group_tokens_t.detach().cpu().tolist()
-            ]
         for epoch in range(n_epochs):
+            # Per-epoch row shuffle (Patch G): VinePPO upstream re-creates
+            # the dataloader iterator each epoch, which yields a fresh random
+            # mb composition. With static ranges, the same group_size mates
+            # land in the same mb in every epoch, removing implicit
+            # decorrelation. Same seed across DP ranks → each rank shuffles
+            # its own rank-local rollouts in lockstep (rows are rank-local
+            # to begin with, so the permutation pattern matching is fine).
+            if epoch == 0 or B == 0:
+                epoch_perm = torch.arange(B, device=self.device, dtype=torch.long)
+            else:
+                _gen = torch.Generator(device="cpu")
+                _gen.manual_seed(
+                    int(cfg.seed) + int(self.global_step) * 1009 + int(epoch)
+                )
+                epoch_perm = torch.randperm(B, generator=_gen).to(self.device)
+            e_tiled_prompt_ids = tiled_prompt_ids.index_select(0, epoch_perm)
+            e_tiled_prompt_mask = tiled_prompt_mask.index_select(0, epoch_perm)
+            e_response_ids = response_ids.index_select(0, epoch_perm)
+            e_response_mask = response_mask.index_select(0, epoch_perm)
+            e_old_logprobs_full = old_logprobs_full.index_select(0, epoch_perm)
+            e_token_advantage = token_advantage.index_select(0, epoch_perm)
+            e_ref_logprobs_full = (
+                ref_logprobs_full.index_select(0, epoch_perm)
+                if ref_logprobs_full is not None else None
+            )
+            # Per-mb token counts under the new row order (stat reporting only).
+            if epoch == 0:
+                e_micro_token_counts = micro_token_counts
+            else:
+                e_row_counts = e_response_mask.sum(dim=1).detach().cpu()
+                e_micro_token_counts = [
+                    float(e_row_counts[s:e].sum().item())
+                    for s, e in micro_ranges
+                ]
+
             # Reset accumulator counter so the optimizer step boundary
             # ``n_micro_in_epoch % accum == 0`` is computed within the epoch.
             n_micro_in_epoch = 0
             for micro_idx, (start, end) in enumerate(micro_ranges):
                 group_idx = micro_idx // accum
-                global_group_tokens = (
-                    global_group_token_counts[group_idx]
-                    if global_group_token_counts else 0.0
-                )
-                micro_tokens = micro_token_counts[micro_idx]
-                grad_weight = (
-                    micro_tokens * world_size / global_group_tokens
-                    if global_group_tokens > 0.0 else 0.0
-                )
+                # Patch F: uniform per-microbatch weighting matches VinePPO /
+                # DeepSpeed BF16_Optimizer / TRL default (each mb contributes
+                # 1/accum_count to the accumulation group's gradient). Tail
+                # groups at end-of-epoch get 1/actual_count so the partial
+                # group still averages cleanly. ``world_size`` scaling is
+                # unnecessary because DDP/FSDP's gradient reduction is
+                # already AVG across ranks.
+                _group_start = group_idx * accum
+                _group_end = min(_group_start + accum, n_micros_total)
+                _group_count = max(1, _group_end - _group_start)
+                grad_weight = 1.0 / _group_count
+                micro_tokens = e_micro_token_counts[micro_idx]
                 will_step = ((n_micro_in_epoch + 1) % accum == 0) or (end == B)
                 # Per-microbatch padding trim: MATH responses average ~600
                 # tokens but max_response_len pads to 1024+. Slice the R-axis
@@ -2449,23 +2559,27 @@ class CASPOTrainer:
                 # logits for padding it'll just multiply out of the loss.
                 # ppo_clipped_loss requires logprobs/old_logprobs/adv/mask to
                 # all share shape, so trim every R-keyed tensor consistently.
-                mb_mask_full = response_mask[start:end]
+                mb_mask_full = e_response_mask[start:end]
                 R_eff = int(mb_mask_full.sum(dim=1).max().item()) if mb_mask_full.numel() else 0
                 if R_eff <= 0:
                     R_eff = mb_mask_full.shape[1]
-                mb_resp_ids = response_ids[start:end, :R_eff]
+                mb_resp_ids = e_response_ids[start:end, :R_eff]
                 mb_resp_mask = mb_mask_full[:, :R_eff]
                 with self._maybe_no_sync(self.model, enabled=not will_step):
                     new_logprobs = self._forward_policy_logprobs(
-                        tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
+                        e_tiled_prompt_ids[start:end], e_tiled_prompt_mask[start:end],
                         mb_resp_ids, mb_resp_mask,
                     )
-                    old_lp = old_logprobs_full[start:end, :R_eff]
-                    adv = token_advantage[start:end, :R_eff]
+                    old_lp = e_old_logprobs_full[start:end, :R_eff]
+                    adv = e_token_advantage[start:end, :R_eff]
+                    # Patch B: per-microbatch masked whitening, distributed
+                    # across DP ranks with Bessel-corrected unbiased variance.
+                    # Matches VinePPO's masked_whiten in the inner loop.
+                    adv = self._whiten_mb_advantage(adv, mb_resp_mask)
 
                     ref_lp = (
-                        ref_logprobs_full[start:end, :R_eff]
-                        if ref_logprobs_full is not None else None
+                        e_ref_logprobs_full[start:end, :R_eff]
+                        if e_ref_logprobs_full is not None else None
                     )
 
                     loss, stats = ppo_clipped_loss(
