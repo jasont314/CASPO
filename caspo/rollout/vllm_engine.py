@@ -335,9 +335,15 @@ class VLLMRolloutEngine:
                         "scripts/_launch_7b_disagg.sh / "
                         "scripts/_launch_7b_tp8_colocated.sh)."
                     )
+                # NCCLWeightTransferInitInfo requires rank_offset: vLLM
+                # workers compute their NCCL rank as
+                # ``worker_rank + rank_offset``. Trainer is rank 0, workers
+                # are ranks 1..N → rank_offset=1 shifts the worker block
+                # past the trainer.
                 self._nccl_weight_sync_init_info = {
                     "master_address": ws_addr,
                     "master_port": int(ws_port_str),
+                    "rank_offset": 1,
                     "world_size": 1 + int(tensor_parallel_size),
                 }
                 engine_kwargs["weight_transfer_config"] = {"backend": "nccl"}
