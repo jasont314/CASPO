@@ -1189,8 +1189,12 @@ class CASPOTrainer:
         """Save the current policy and push it to the vLLM engine. Returns wall time."""
         if self._sync_dir is None or not hasattr(self.sampler, "sync_weights_from_path"):
             return 0.0
+        # Both 'ipc' and 'nccl' backends push weights through
+        # ``sync_weights_from_model``; the engine's own dispatch
+        # picks the right transport. The file-based fallback below
+        # is only for the legacy 'checkpoint' backend.
         if (
-            self.cfg.vllm_weight_sync_backend == "ipc"
+            self.cfg.vllm_weight_sync_backend in ("ipc", "nccl")
             and hasattr(self.sampler, "sync_weights_from_model")
         ):
             if _is_fsdp_module(self.model):
