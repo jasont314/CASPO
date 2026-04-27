@@ -45,9 +45,18 @@ class CriticModel(nn.Module):
             # replace with an identity-equivalent.
             self.backbone.lm_head = nn.Identity()
         # Value head: small-init linear so early predictions are ~0.
+        # CRITICAL: cast to the backbone's parameter dtype before
+        # constructing. FSDP refuses to flatten mixed-dtype params
+        # ("Must flatten tensors with uniform dtype"); without this
+        # the value head defaults to fp32 while the backbone is bf16
+        # and the wrap fails. We do the float→target-dtype cast on
+        # the parameters AFTER init so the random weights still come
+        # from a fp32-precision generator.
+        backbone_dtype = next(self.backbone.parameters()).dtype
         self.value_head = nn.Linear(hidden_size, 1, bias=True)
         nn.init.normal_(self.value_head.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.value_head.bias)
+        self.value_head = self.value_head.to(dtype=backbone_dtype)
 
     def forward(
         self,
