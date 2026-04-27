@@ -172,15 +172,56 @@ breaks rank-local IPC compatibility *and* the FSDP world ÷ mb ÷
 accum = 64 paper-faithful math (would need world=8 + mb=2 + accum=4).
 Out of scope; documenting as a known ceiling.
 
-### Phase 4b plan (NCCL weight sync, next commit)
+### Phase 4b result (NCCL weight sync, packed=True)
 
-Replace file-based ``sync_weights_from_path`` with
-``NCCLWeightTransferEngine.trainer_send_weights`` (vLLM ships this in
-``vllm/distributed/weight_transfer/nccl_engine.py``). Trainer rank 0
-joins a side ``PyNcclCommunicator`` group with the 4 vLLM workers
-(world_size = 1 + tp). Per-step sync wall time should drop from ~28
-s (save_pretrained 14 GB + reload) to ~1-2 s (NVLink bcast). Saves
-~7 hours over a 1000-step run.
+Implemented and measured. Steady-state numbers:
+
+| Step | t_step | t_value | t_sync | notes |
+|---:|---:|---:|---:|---|
+| 1 | 416.0s | 318.6s | 0.2s | cold-start CUDA graphs, prefix cache warm-up |
+| 2 | 276.7s | 228.2s | 0.3s | **steady-state** |
+| 3 | 322.1s | 256.7s | 0.0s | final step → sync_vllm=False |
+
+**t_sync collapsed from ~28 s (file-based) and ~26 s (packed=False
+NCCL) → 0.2 s (packed=True NCCL).** That's the 130× win I hoped for.
+
+Final step-time table (all VinePPO 7B, K=9):
+
+| Topology | Sync backend | Steady t_step | vs colocated TP=1 |
+|---|---|---:|---:|
+| Colocated TP=1 (8-GPU) | ipc | 338s | 1.00× (baseline) |
+| Disagg FSDP=4 + TP=4 | checkpoint | ~298s | 0.88× (12% faster) |
+| **Disagg FSDP=4 + TP=4** | **nccl packed** | **~277s** | **0.82× (18% faster)** |
+
+Wall-clock for full 1000-step run:
+* colocated TP=1: ~94 h
+* disagg+nccl: ~77 h (saves **~17 hours**).
+
+Implementation gotchas surfaced + fixed during the wired-in iterations:
+
+* ``WeightTransferConfig`` pydantic schema only accepts ``backend``;
+  ``init_info`` goes through the ``init_weight_transfer_engine``
+  collective RPC, not the engine kwargs.
+* ``NCCLWeightTransferInitInfo`` is a dataclass requiring ``rank_offset``
+  (workers compute their NCCL rank as ``worker_rank + rank_offset``;
+  trainer is rank 0, workers are 1..N → rank_offset=1).
+* ``packed=False`` issues ~290 small NCCL broadcasts; launch overhead
+  dominates → 26 s. ``packed=True`` (with matching update_info on the
+  worker side) batches into fixed-size buffers → 0.2 s.
+* The trainer's ``_sync_vllm_weights`` dispatch needed to include
+  ``"nccl"`` (not just ``"ipc"``) to route through ``sync_weights_from_model``.
+
+### Phase 4c (rejected): colocated TP=8 with NCCL
+
+Tried the same NCCL-side-group bring-up where every GPU has both an
+FSDP trainer rank AND a vLLM TP-worker. Initialization failed with
+``NCCL error: invalid usage`` at ``init_transfer_engine``. Cause:
+trainer rank 0 (on physical GPU 0) and Worker_TP0 (also on GPU 0)
+both try to register a NCCL communicator on the same physical
+device — NCCL forbids two ranks of one communicator on one device.
+Workable only with a hybrid sync (CUDA IPC mem handles cross-process
+within a GPU + a different mechanism for the cross-GPU TP-shards),
+multi-day port; deferred.
 
 ### Phase 6 (deferred): port to GRPO/PPO/CASPO
 

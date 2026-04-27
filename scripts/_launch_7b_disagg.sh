@@ -109,14 +109,14 @@ unset ACTIVATION_CHECKPOINTING_MODE
 # rest of the world doesn't need them visible).
 ROLLOUT_GPUS_CSV=$(IFS=,; echo "${ROLLOUT_GPUS[*]}")
 
-# Weight-sync backend default. Phase 4a uses 'checkpoint' (file-based)
-# for verifiable correctness: rank 0 save_pretrained's the gathered
-# FSDP state to a scratch dir, then vLLM reload_weights from there.
-# This path is paper-correct but slow (~10 s per sync = ~3 h over a
-# 1000-step run). Phase 4b will introduce 'nccl' which broadcasts via
-# vLLM's PyNcclCommunicator side group. Override at the launcher level
-# via WEIGHT_SYNC_BACKEND env.
-DISAGG_WEIGHT_SYNC_BACKEND="${DISAGG_WEIGHT_SYNC_BACKEND:-${WEIGHT_SYNC_BACKEND:-checkpoint}}"
+# Weight-sync backend default. 'nccl' is the production path (Phase
+# 4b): trainer rank 0 + N vLLM workers join a side
+# PyNcclCommunicator and broadcast packed weight buffers over
+# NVLink, ~0.2 s/sync at 7B vs ~28 s/sync for the checkpoint
+# (save_pretrained + reload_weights) path. 'checkpoint' is kept as
+# an opt-in fallback for environments where the side NCCL group
+# can't form.
+DISAGG_WEIGHT_SYNC_BACKEND="${DISAGG_WEIGHT_SYNC_BACKEND:-${WEIGHT_SYNC_BACKEND:-nccl}}"
 
 OVERRIDES=(
     --override "method=${METHOD}"
