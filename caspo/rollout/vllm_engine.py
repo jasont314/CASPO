@@ -284,6 +284,15 @@ class VLLMRolloutEngine:
                 seed=seed,
                 disable_log_stats=True,
             )
+            # KV cache dtype: cfg.vllm_kv_cache_dtype is None (auto, fp16/bf16
+            # to match the model dtype) or "fp8". fp8 halves KV memory, which
+            # at vllm_gpu_memory_utilization=const doubles the concurrent
+            # decode batch size — directly speeds up VinePPO's K=9 MC fan-out.
+            # Verified inference-only fp8 in vLLM has accuracy hit below seed
+            # noise on avg@k benchmarks; safe for rollout where we don't need
+            # bit-exact KV with the trainer's bf16 forward.
+            if cfg.vllm_kv_cache_dtype:
+                engine_kwargs["kv_cache_dtype"] = str(cfg.vllm_kv_cache_dtype)
             # vLLM's "custom" all-reduce uses CUDA IPC mem handles to bypass
             # NCCL for small payloads. On installs where flashinfer's JIT
             # all-reduce kernel fails to compile (eg the env we hit on this
