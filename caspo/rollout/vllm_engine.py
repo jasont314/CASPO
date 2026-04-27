@@ -284,6 +284,20 @@ class VLLMRolloutEngine:
                 seed=seed,
                 disable_log_stats=True,
             )
+            # vLLM's "custom" all-reduce uses CUDA IPC mem handles to bypass
+            # NCCL for small payloads. On installs where flashinfer's JIT
+            # all-reduce kernel fails to compile (eg the env we hit on this
+            # H100 box: flashinfer 0.6.6 uses std::optional but the
+            # ninja-issued nvcc invocation doesn't have -std=c++17, so
+            # trtllm_allreduce_fusion.cu fails with "namespace 'std' has no
+            # member 'optional'") the next fallback is the custom kernel,
+            # which then hits "Cuda error custom_all_reduce.cuh:455 invalid
+            # argument" and kills VllmWorker-0. Disabling the custom path
+            # forces NCCL all-reduce, which works correctly on H100 NVLink.
+            # Only matters when tensor_parallel_size > 1 (TP=1 has no
+            # all-reduce path); harmless to set unconditionally.
+            if int(tensor_parallel_size) > 1:
+                engine_kwargs["disable_custom_all_reduce"] = True
             if max_num_seqs is not None:
                 engine_kwargs["max_num_seqs"] = int(max_num_seqs)
             # Chunked prefill default: OFF for rollout. Verified empirically
