@@ -130,6 +130,24 @@ class CriticModel(nn.Module):
             backbone.config.use_cache = False
         except AttributeError:
             pass
+        # Mirror the policy's activation checkpointing: at 7B with
+        # critic colocated on trainer GPUs, the second forward+backward
+        # through a 7B backbone in the policy mb loop triples the
+        # activation peak and OOMs at 80 GB. Enable HF's grad-ckpt path
+        # on the critic backbone so each block recomputes on backward.
+        # The cost is ~30% extra backward FLOPs on the critic, which is
+        # already the smaller cost vs the policy backward.
+        if getattr(cfg, "use_gradient_checkpointing", False):
+            try:
+                backbone.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+            except (AttributeError, TypeError):
+                # Some HF versions don't accept kwargs; fall through.
+                try:
+                    backbone.gradient_checkpointing_enable()
+                except AttributeError:
+                    pass
         hidden_size = int(getattr(hf_cfg, "hidden_size", 0))
         if hidden_size <= 0:
             raise RuntimeError(
