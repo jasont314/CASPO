@@ -190,14 +190,21 @@ def _tokenize_delimiter(tokenizer, delimiter: str) -> List[int]:
 
 def _group_relative_advantage(rewards: torch.Tensor, group_size: int) -> torch.Tensor:
     """GRPO advantage (Shao et al., DeepSeekMath): center+std-normalize within
-    each group of G samples sharing a prompt. Zero-variance groups → 0."""
+    each group of G samples sharing a prompt. Zero-variance groups → 0.
+
+    Uses Bessel-corrected unbiased variance (``unbiased=True``) to match
+    VinePPO upstream's ``masked_whiten(unbiased_variance=True)``. Earlier
+    biased version was sqrt(G/(G-1)) ≈ 1.07 too small at G=8 — small but
+    consistent and compounds with other normalization mismatches.
+    """
     B = rewards.numel()
     if B % group_size != 0:
         raise ValueError(f"rewards.numel()={B} not divisible by G={group_size}")
     g = rewards.view(B // group_size, group_size)
     mean = g.mean(dim=1, keepdim=True)
     centered = g - mean
-    std = g.std(dim=1, keepdim=True, unbiased=False)
+    # Bessel-corrected: divide by G-1 not G. Falls back to biased at G==1.
+    std = g.std(dim=1, keepdim=True, unbiased=(group_size > 1))
     safe = torch.where(std <= 1e-8, torch.ones_like(std), std)
     out = centered / safe
     out = torch.where(std.expand_as(out) <= 1e-8, torch.zeros_like(out), out)
@@ -1139,9 +1146,15 @@ class CASPOTrainer:
             local_count,
         ])
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
-        denom = sums[2].clamp(min=1.0)
+        n = sums[2]
+        denom = n.clamp(min=1.0)
         mean = sums[0] / denom
-        var = (sums[1] / denom - mean * mean).clamp(min=0.0)
+        # Bessel-corrected unbiased variance: E[X^2] - E[X]^2 is the BIASED
+        # estimate; convert to unbiased by multiplying by n/(n-1). Matches
+        # VinePPO upstream's ``unbiased_variance=True`` whitening.
+        biased_var = (sums[1] / denom - mean * mean).clamp(min=0.0)
+        n_safe = n.clamp(min=2.0)
+        var = biased_var * n_safe / (n_safe - 1.0)
         std = var.sqrt()
         if (std <= 1e-8).item():
             return A_step.clone()
@@ -1200,13 +1213,18 @@ class CASPOTrainer:
                     local_count,
                 ])
                 dist.all_reduce(sums, op=dist.ReduceOp.SUM)
-                denom = sums[2].clamp(min=1.0)
+                n = sums[2]
+                denom = n.clamp(min=1.0)
                 mean = sums[0] / denom
-                var = (sums[1] / denom - mean * mean).clamp(min=0.0)
+                biased_var = (sums[1] / denom - mean * mean).clamp(min=0.0)
             else:
-                denom = mask_f.sum().clamp(min=1.0)
+                n = mask_f.sum()
+                denom = n.clamp(min=1.0)
                 mean = (a * mask_f).sum() / denom
-                var = ((a - mean).square() * mask_f).sum() / denom
+                biased_var = ((a - mean).square() * mask_f).sum() / denom
+            # Bessel-corrected: convert biased to unbiased by n/(n-1).
+            n_safe = n.clamp(min=2.0)
+            var = biased_var * n_safe / (n_safe - 1.0)
             std = var.sqrt()
             if (std <= eps).item():
                 out = torch.zeros_like(a)

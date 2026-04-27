@@ -307,6 +307,8 @@ def standardize_step_advantage(
     scope: str = "batch",
     group_size: int = 1,
     eps: float = 1e-8,
+    distributed: bool = False,
+    unbiased: bool = True,
 ) -> torch.Tensor:
     """Whiten step-level advantages over the chosen scope.
 
@@ -316,6 +318,14 @@ def standardize_step_advantage(
         scope: ``"batch"``, ``"group"`` or ``"off"``.
         group_size: required when ``scope == "group"``.
         eps: zero-variance threshold; below it we leave the values unchanged.
+        distributed: if True and torch.distributed is initialized, all-reduce
+            the mean and variance across DP ranks (paper-faithful — VinePPO
+            upstream uses ``masked_whiten(distributed=True, unbiased_variance=True)``).
+            Without this, rank-local std is systematically smaller than the
+            global std at FSDP world>=2, producing oversized policy steps.
+            No-op at world_size=1 (1B / single-GPU).
+        unbiased: Bessel-corrected variance (divides by ``n-1``). Matches
+            VinePPO upstream's default.
 
     Returns:
         Tensor with the same shape as ``A_step``. Invalid positions
@@ -356,14 +366,34 @@ def standardize_step_advantage(
 
     if scope == "batch":
         masked = A_compute * fmask
-        denom = fmask.sum().clamp(min=1.0)
-        mean = masked.sum() / denom
+        masked_sum = masked.sum()
+        valid_n = fmask.sum()
+        if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
+            # All-reduce sum-of-values and count of valid slots so mean
+            # is a TRUE global mean across DP ranks. Without this the
+            # per-rank mean differs from the global mean and the resulting
+            # standardization is systematically biased.
+            torch.distributed.all_reduce(masked_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(valid_n, op=torch.distributed.ReduceOp.SUM)
+        denom = valid_n.clamp(min=1.0)
+        mean = masked_sum / denom
         # Reuse the same fmask-multiplied tensor for variance: subtracting
         # mean*fmask preserves zero at invalid slots while contributing
-        # (a - mean)^2 only at valid slots. This avoids one extra broadcast
-        # multiply versus ((a - mean)**2 * fmask).
+        # (a - mean)^2 only at valid slots.
         centered = masked - mean * fmask
-        var = (centered * centered).sum() / denom
+        sq_sum = (centered * centered).sum()
+        if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(sq_sum, op=torch.distributed.ReduceOp.SUM)
+        # Bessel-correction: divide by (n-1) for unbiased variance estimate.
+        # Matches VinePPO upstream's ``unbiased_variance=True``. At small
+        # n (e.g. group whitening with G=8) this is a sqrt(8/7)≈1.07
+        # difference; at batch whitening with hundreds of valid slots
+        # the difference is negligible. Falls back to biased when n<=1.
+        if unbiased:
+            var_denom = (valid_n - 1.0).clamp(min=1.0)
+        else:
+            var_denom = denom
+        var = sq_sum / var_denom
         std = var.clamp(min=0.0).sqrt()
         # Tensor-side comparison (no host sync). If the batch has only one
         # valid entry we'd still get std==0 and fall through to a clone.
