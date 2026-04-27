@@ -320,6 +320,12 @@ class VLLMRolloutEngine:
                 # exports CASPO_WEIGHT_SYNC_MASTER_ADDR/PORT (separate
                 # from the trainer's torchrun MASTER_PORT so the two
                 # rendezvous don't collide).
+                #
+                # vLLM's WeightTransferConfig pydantic schema only
+                # accepts {"backend": ...} — init_info is NOT a config
+                # field; it's passed later via the
+                # ``init_weight_transfer_engine`` collective RPC. Two
+                # plumbing channels.
                 ws_addr = os.environ.get("CASPO_WEIGHT_SYNC_MASTER_ADDR", "127.0.0.1")
                 ws_port_str = os.environ.get("CASPO_WEIGHT_SYNC_MASTER_PORT", "0")
                 if not ws_port_str or ws_port_str == "0":
@@ -329,17 +335,12 @@ class VLLMRolloutEngine:
                         "scripts/_launch_7b_disagg.sh / "
                         "scripts/_launch_7b_tp8_colocated.sh)."
                     )
-                init_info = {
+                self._nccl_weight_sync_init_info = {
                     "master_address": ws_addr,
                     "master_port": int(ws_port_str),
                     "world_size": 1 + int(tensor_parallel_size),
                 }
-                # Stash for trainer-side init below.
-                self._nccl_weight_sync_init_info = dict(init_info)
-                engine_kwargs["weight_transfer_config"] = {
-                    "backend": "nccl",
-                    "init_info": init_info,
-                }
+                engine_kwargs["weight_transfer_config"] = {"backend": "nccl"}
             engine_args = AsyncEngineArgs(**engine_kwargs)
             self.engine = AsyncLLM.from_engine_args(engine_args)
 
