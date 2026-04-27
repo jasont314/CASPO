@@ -528,8 +528,12 @@ def evaluate_vllm(
         binary = [1.0 if grade_math(r, gt) >= 1.0 else 0.0 for r in responses]
         correctness_per_problem.append(sum(binary) / max(len(binary), 1))
         pass_per_problem.append(1.0 if any(b >= 1.0 for b in binary) else 0.0)
-        for r in responses:
-            response_lens.append(len(r))
+        # Length in tokens (vLLM exposes token_ids per completion). Was
+        # ``len(r)`` over the decoded text — that gave chars not tokens
+        # and made the stat incomparable to the ``max_response_len=1024``
+        # cap. Use the actual generated-token count.
+        for c in completions:
+            response_lens.append(len(c.token_ids) if c is not None and c.token_ids is not None else 0)
 
     if owns_engine and engine is not None:
         try:
@@ -546,7 +550,7 @@ def evaluate_vllm(
         "pass@k": float(sum(pass_per_problem) / max(n, 1)),
         "mean_response_len": float(sum(response_lens) / max(len(response_lens), 1)),
         "gen_time_s": float(gen_time),
-        "tokens_per_sec_estimate": float(sum(response_lens) / 4 / max(gen_time, 1e-3)),  # ~4 chars/token rough
+        "tokens_per_sec_estimate": float(sum(response_lens) / max(gen_time, 1e-3)),
     }
 
 
@@ -683,8 +687,16 @@ def evaluate(
         correctness_per_problem.append(sum(binary) / max(len(binary), 1))
         pass_per_problem.append(1.0 if any(b >= 1.0 for b in binary) else 0.0)
 
-        for r in responses:
-            response_lens.append(len(r))
+        # Length in tokens (was ``len(r)`` over decoded text — chars not
+        # tokens). Count non-pad tokens in the new-tokens slice.
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            response_lens.extend([int(new_tokens.shape[1])] * new_tokens.shape[0])
+        else:
+            response_lens.extend(
+                int((new_tokens[i] != pad_id).sum().item())
+                for i in range(new_tokens.shape[0])
+            )
 
     n = len(rows)
     return {
