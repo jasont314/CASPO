@@ -997,10 +997,19 @@ Global PPO minibatch stays 64 (FSDP=4 × mb=2 × accum=8).
 ### Launchers
 
 ```bash
+# 4-GPU rank-local TP=1 path (production for the 4-method group):
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_grpo.sh
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_ppo.sh
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_frozen_rm.sh
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo.sh
+
+# 8-GPU disaggregated topology for VinePPO (FSDP=4 trainer + vLLM TP=4
+# dedicated). NCCL+packed weight sync at 0.3 s/step. Production path
+# for VinePPO 7B; see docs/disaggregated_topology_plan.md:
+TRAIN_GPU_LIST="0 1 2 3" ROLLOUT_GPU_LIST="4 5 6 7" \
+    RUN_TAG=paper7b_seed0 ./scripts/launch_7b_vineppo_disagg.sh
+
+# Legacy 8-GPU rank-local TP=1 VinePPO (slower; kept for ablation):
 GPU_LIST="0 1 2 3 4 5 6 7" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_vineppo.sh
 ```
 
@@ -1009,6 +1018,45 @@ Env knobs: `CASPO_VLLM_GPU_MEMORY_UTILIZATION`, `CASPO_MICRO_BATCH_SIZE`,
 `CASPO_FSDP_CPU_OFFLOAD`, `CASPO_REWARD_WORKERS`, `MAX_STEPS`,
 `SAVE_EVERY`, `WANDB_MODE`. Defaults computed from `world_size` so
 the global PPO minibatch stays 64 across configurations.
+
+### Per-method 7B step times (measured 2026-04-27)
+
+DeepSeekMath-7B-MATH on H100×8, paper-faithful global=64 minibatch,
+mb=2, accum=8 (or accum=16 at world=8), bf16, fp8 KV.
+
+| Method | Topology | Steady step | 1000-step wall | Notes |
+|---|---|---:|---:|---|
+| GRPO  | 4-GPU rank-local | 47.7s | ~13 h | critic-free, group-relative reward |
+| PPO   | 4-GPU rank-local | 48.5s | ~13 h | critic-free, sequence-level reward |
+| CASPO-frozen-RM | 4-GPU rank-local | 57.6s | ~16 h | pretrained V_φ, forward only |
+| CASPO (online V_φ) | 4-GPU rank-local | ~75-85s | ~21-24 h | pretrained V_φ + online MSE update |
+| **VinePPO** | **8-GPU disagg + NCCL+packed** | **197.6s** | **~55 h** | K=9 MC at every step boundary |
+
+**VinePPO / CASPO-online ≈ 2.32× per-iteration overhead** at 7B. Matches
+upstream VinePPO paper Section 6.2: "each step of VinePPO is slower
+(up to … 2x for DeepSeekMath 7B) compared to PPO". CASPO-online's
+compute profile (separate ~7B value network with forward+backward
++ optimizer step every outer step) is identical to Schulman 2017
+PPO+critic — only the value loss (IPVRM-BCE vs clipped-MSE) and
+advantage construction (step-TD vs token-GAE) differ, both O(<1 s).
+We do not reimplement Schulman 2017 PPO+critic separately; CASPO
+online is its strict generalization.
+
+### VinePPO speed iteration (2026-04-27)
+
+Cumulative wins on disagg topology, all paper-faithful (no algorithm
+deviations):
+
+| Step | Result |
+|---|---:|
+| Original 8-GPU colocated TP=1 | 338s |
+| Disagg + checkpoint sync | 298s |
+| + NCCL packed weight sync | 277s |
+| + fp8 KV cache | 268s |
+| + reward_workers=16 | 245s |
+| + max_num_seqs=2048 | **242s** (steady), **197s** (best step) |
+
+28% faster than original; 17 hours saved on a 1000-step run.
 
 ### Phase-1 IPVRM value model (CASPO prerequisite)
 

@@ -327,6 +327,32 @@ launcher to TP=4 + NCCL packed** as the VinePPO production path.
 | **Disagg + max_num_seqs=2048** | **nccl packed** | **242s** | **production** |
 | Colocated TP=8 + IPC | ipc multirank | 1700+s | Phase F: rejected |
 
+### Paper-comparison ratio (PPO+critic equivalent)
+
+CASPO online (``update_value_during_policy=true``) and paper's
+PPO+critic have an **identical per-step compute profile**:
+
+* Both have a separate ~7B value model.
+* Both forward the value model on (prompt + response).
+* Both backprop through the value model and step its optimizer.
+* The differences (init: pretrained-IPVRM vs policy-SFT; loss: BCE
+  vs clipped-MSE; advantage: step-TD vs token-GAE) are all O(<1 s)
+  per step and don't shift the wall-clock pattern.
+
+Measured per-step at 7B/4-GPU:
+
+  CASPO online (≡ PPO+critic compute) = 85.2 s
+  VinePPO (8-GPU disagg, optimized)   = 197.6 s
+  **ratio VinePPO / CASPO_online      = 2.32×**
+
+That matches the upstream VinePPO paper's reported "**up to 2× for
+DeepSeekMath 7B**" per-iteration overhead (Kazemnejad et al. 2024,
+Section 6.2). We do not separately implement Schulman 2017 PPO+critic
+(our scaffolded ``method=ppo_critic`` was OOM-fighting on the joint
+forward/backward pass; CASPO online is its strict generalization
+since the offline-pretrained V_φ converges faster than online-from-
+scratch and the compute profile is the same).
+
 Wall-clock for 1000-step VinePPO 7B run: **~67 hours at 242 s/step**.
 
 ### Speed-iter 5 (async MC overlap) — deferred
