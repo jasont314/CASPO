@@ -1297,7 +1297,7 @@ class VLLMRolloutEngine:
             "names": names,
             "dtype_names": dtype_names,
             "shapes": shapes,
-            "packed": False,
+            "packed": True,
         }
         request = WeightTransferUpdateRequest(update_info=update_info)
 
@@ -1311,7 +1311,7 @@ class VLLMRolloutEngine:
                 args_obj = NCCLTrainerSendWeightsArgs(
                     group=self._nccl_weight_sync_group,
                     src=0,
-                    packed=False,
+                    packed=True,
                 )
                 NCCLWeightTransferEngine.trainer_send_weights(
                     iter(named), args_obj,
