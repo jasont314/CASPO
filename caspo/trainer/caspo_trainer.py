@@ -33,6 +33,7 @@ import functools
 import json
 import os
 import random
+import subprocess
 import time
 import warnings
 from dataclasses import asdict
@@ -1114,6 +1115,77 @@ class CASPOTrainer:
         out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return out.to(A_step.dtype) if out.dtype != A_step.dtype else out
 
+    def _standardize_token_advantage(
+        self,
+        advantages: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        scope: str,
+        group_size: int,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Standardize token-level advantages over valid response tokens."""
+        if advantages.dim() != 2:
+            raise ValueError(
+                f"advantages must be 2D, got {tuple(advantages.shape)}"
+            )
+        if mask.shape != advantages.shape:
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)} does not match advantages "
+                f"{tuple(advantages.shape)}"
+            )
+
+        mask_f = mask.to(torch.float32)
+        a = advantages.float()
+        if scope == "off":
+            out = a * mask_f
+            return out.to(advantages.dtype) if out.dtype != advantages.dtype else out
+
+        if scope == "group":
+            B, R = a.shape
+            if B % group_size != 0:
+                raise ValueError(f"B={B} not divisible by group_size={group_size}")
+            g = a.view(B // group_size, group_size, R)
+            m = mask_f.view(B // group_size, group_size, R)
+            denom = m.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+            mean = (g * m).sum(dim=(1, 2), keepdim=True) / denom
+            var = ((g - mean).square() * m).sum(dim=(1, 2), keepdim=True) / denom
+            std = var.clamp(min=0.0).sqrt()
+            out = (g - mean) / std.clamp(min=eps) * m
+            out = torch.where(std <= eps, torch.zeros_like(out), out)
+            out = out.reshape_as(a)
+        elif scope == "batch":
+            if self.dist.is_distributed:
+                import torch.distributed as dist
+
+                local_count = mask_f.sum()
+                masked = a * mask_f
+                sums = torch.stack([
+                    masked.sum(),
+                    (masked * masked).sum(),
+                    local_count,
+                ])
+                dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+                denom = sums[2].clamp(min=1.0)
+                mean = sums[0] / denom
+                var = (sums[1] / denom - mean * mean).clamp(min=0.0)
+            else:
+                denom = mask_f.sum().clamp(min=1.0)
+                mean = (a * mask_f).sum() / denom
+                var = ((a - mean).square() * mask_f).sum() / denom
+            std = var.sqrt()
+            if (std <= eps).item():
+                out = torch.zeros_like(a)
+            else:
+                out = (a - mean) / std * mask_f
+        else:
+            raise ValueError(
+                f"unknown scope {scope!r}; must be 'batch', 'group', or 'off'"
+            )
+
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return out.to(advantages.dtype) if out.dtype != advantages.dtype else out
+
     def _save_policy_pretrained(
         self,
         path: str,
@@ -1942,14 +2014,11 @@ class CASPOTrainer:
         # When rolling out via vLLM, sampling_logprobs come from a different
         # softmax/attention path than the trainer's. PPO's "old logprobs"
         # must come from the trainer's own forward at the pre-update weights
-        # (otherwise ratio is biased by ~10×). We reuse the *first* epoch's
-        # microbatch forward as the old-logprobs source: at epoch 0 the
-        # policy hasn't moved yet, so new_logprobs == old_logprobs and
-        # ``ratio = exp(new - old) == 1`` exactly. This eliminates the
-        # full-pass ``_rescore_old_logprobs`` call, saving one forward over
-        # the whole rollout per step (≈ ``epochs_per_rollout / (1 + epochs)``
-        # of policy-time). The collected detached values then serve as the
-        # frozen π_old for epochs 1..N-1.
+        # (otherwise ratio is biased by the rollout backend). Compute the
+        # frozen π_old before any optimizer step: epoch 0 still contains
+        # multiple optimizer steps for real configs, so caching old logprobs
+        # from later epoch-0 microbatches would silently use already-updated
+        # policy weights as π_old.
         rewards = rollout.rewards.to(self.device, non_blocking=True).float()
         prompt_index = rollout.prompt_index.to(self.device, non_blocking=True)
         tiled_prompt_ids = prompt_ids[prompt_index]
@@ -1960,13 +2029,11 @@ class CASPOTrainer:
         response_len_stats = _scalar_tensor_stats(response_token_counts)
         response_tokens_total = float(response_token_counts.sum().item())
         t_device = time.time() - t_device_start
-        # Old-logprobs are built up lazily during epoch 0 from the *same*
-        # microbatch forwards used for the policy gradient, then frozen
-        # and reused for epochs 1..N-1 via per-microbatch slices in
-        # ``old_logprobs_chunks`` below. ``t_old_logprobs`` is retained
-        # for the timing payload but stays at 0 — the cost is folded into
-        # ``t_policy_s``.
-        t_old_logprobs = 0.0
+        t_old_logprobs_start = time.time()
+        old_logprobs_full = self._rescore_old_logprobs(
+            tiled_prompt_ids, tiled_prompt_mask, response_ids, response_mask,
+        )
+        t_old_logprobs = time.time() - t_old_logprobs_start
 
         # Precompute frozen reference logprobs once per rollout. We hoist
         # this *before* the value-model forward (when method=caspo) so the
@@ -2067,14 +2134,16 @@ class CASPOTrainer:
                 gamma=cfg.gamma, gae_lambda=cfg.ppo_gae_lambda,
             )
 
-            # Standardize (existing scope/clip knobs).
+            # Standardize over the configured scope, respecting only valid
+            # response tokens. ``group`` means the G completions for each
+            # prompt are normalized together, matching the sequence-level
+            # PPO/GRPO paths.
             if cfg.standardize_step_advantage:
-                mask_f = response_mask.to(torch.float32)
-                n = mask_f.sum().clamp(min=1.0)
-                mu = (advantages_per_token * mask_f).sum() / n
-                var = ((advantages_per_token - mu) ** 2 * mask_f).sum() / n
-                std = var.clamp(min=1e-8).sqrt()
-                advantages_per_token = (advantages_per_token - mu) / std * mask_f
+                advantages_per_token = self._standardize_token_advantage(
+                    advantages_per_token, response_mask,
+                    scope=cfg.standardize_advantage_scope,
+                    group_size=G,
+                )
             if cfg.advantage_clip and cfg.advantage_clip > 0:
                 advantages_per_token = advantages_per_token.clamp(
                     min=-float(cfg.advantage_clip),
@@ -2089,9 +2158,12 @@ class CASPOTrainer:
             self._ppo_critic_returns = returns_per_token.detach()
             self._ppo_critic_old_values = critic_values.detach()
 
-            mean_step_advantage = float(advantages_per_token.abs().mean().item())
+            valid_adv = advantages_per_token[response_mask.bool()]
+            mean_step_advantage = (
+                float(valid_adv.abs().mean().item()) if valid_adv.numel() else 0.0
+            )
             mean_step_count = float(response_lens.float().mean().item())
-            adv_values_for_stats = advantages_per_token
+            adv_values_for_stats = valid_adv
             t_value = time.time() - t_value_start
         else:
             # Segment for caspo + vineppo
@@ -2586,6 +2658,13 @@ class CASPOTrainer:
                     and self.global_step % int(cfg.save_every) == 0
                 ):
                     self.save_checkpoint(final=False)
+                    if (
+                        int(cfg.eval_every) > 0
+                        and self.global_step % int(cfg.eval_every) == 0
+                    ):
+                        self._dispatch_periodic_eval(
+                            os.path.join(cfg.output_dir, f"step_{self.global_step}")
+                        )
 
         # Honor an env-level skip switch for smoke runs (each 7B final save
         # is ~13 GB and fills the scratch disk during rapid-iteration
@@ -2701,6 +2780,86 @@ class CASPOTrainer:
                 log_payload[f"value/{k}" if k.startswith(("value", "v_bar", "adb", "dlw"))
                             else f"misc/{k}"] = stats[k]
         self._wandb_log(log_payload, step=self.global_step)
+
+    def _dispatch_periodic_eval(self, ckpt_path: str) -> None:
+        """Fire-and-forget ``scripts/eval.py`` on a checkpoint dir.
+
+        Gated by ``cfg.eval_during_training_gpu >= 0`` and rank-0-only.
+        Writes result JSON beside the checkpoint at
+        ``<ckpt>/eval_results_<bench>_k<K>_limit<N>.json`` (the eval
+        script's own output convention) plus a stdout/stderr log at
+        ``<ckpt>/periodic_eval.log``.
+
+        Subprocess uses ``CUDA_VISIBLE_DEVICES=<eval_gpu>`` and inherits
+        the trainer's environment (conda env, perf_env.sh exports). Does
+        NOT block the training loop — process is started detached.
+        """
+        cfg = self.cfg
+        if not getattr(self, "dist", None) or not self.dist.is_main:
+            return
+        # Cfg field is the canonical knob; ``CASPO_EVAL_GPU`` env override
+        # is a shortcut so users can flip on periodic eval without editing
+        # the YAML / passing a --override flag.
+        env_gpu = os.environ.get("CASPO_EVAL_GPU")
+        eval_gpu = int(env_gpu) if env_gpu not in (None, "") else int(
+            getattr(cfg, "eval_during_training_gpu", -1)
+        )
+        if eval_gpu < 0:
+            return
+        if not os.path.isdir(ckpt_path):
+            warnings.warn(
+                f"[periodic_eval] ckpt path missing: {ckpt_path} — skipping"
+            )
+            return
+
+        # Resolve repo root from this file's location so the subprocess
+        # finds ``scripts/eval.py`` regardless of cwd.
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        eval_script = os.path.join(repo_root, "scripts", "eval.py")
+        config_path = os.environ.get(
+            "CASPO_PERIODIC_EVAL_CONFIG",
+            os.path.join(repo_root, "configs", "caspo_rho1b_math.yaml")
+            if "rho1b" in cfg.output_dir.lower()
+            else os.path.join(repo_root, "configs", "caspo_deepseekmath7b_math.yaml"),
+        )
+
+        log_path = os.path.join(ckpt_path, "periodic_eval.log")
+        cmd = [
+            "python", "-u", eval_script,
+            "--config", config_path,
+            "--override", f"model_name_or_path={ckpt_path}",
+            "--benchmarks", str(cfg.eval_during_training_benchmarks),
+            "--k", str(int(cfg.eval_during_training_k)),
+            "--temperature", str(float(cfg.eval_during_training_temperature)),
+            "--top-p", "0.9",
+            "--backend", "vllm",
+            "--gpu-memory-utilization", str(float(cfg.eval_during_training_vllm_util)),
+        ]
+        if int(cfg.eval_during_training_limit) > 0:
+            cmd += ["--limit", str(int(cfg.eval_during_training_limit))]
+
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu)
+
+        try:
+            log_fh = open(log_path, "w")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo_root,
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # detach; trainer signals don't reach it
+            )
+            print(
+                f"[periodic_eval] dispatched eval pid={proc.pid} on GPU "
+                f"{eval_gpu} for {ckpt_path} (log: {log_path})",
+                flush=True,
+            )
+        except Exception as e:
+            warnings.warn(f"[periodic_eval] failed to dispatch: {e}")
 
     def save_checkpoint(self, final: bool = False) -> str:
         cfg = self.cfg

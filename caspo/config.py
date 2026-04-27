@@ -22,7 +22,6 @@ import yaml
 # lose the reason mapping. We freeze the message lookup at module load.
 _DEPRECATED_OR_UNUSED: dict[str, str] = {
     "compile": "torch.compile is not wired up in CASPOTrainer; ignored at runtime.",
-    "eval_every": "in-loop eval is not wired up in CASPOTrainer; run scripts/eval.py separately.",
     "vllm_skip_initial_sync": "vLLM engine always inits from cfg.model_name_or_path; flag not consumed.",
     "value_save_every": "scripts/train_value.py only writes a single 'final' checkpoint; periodic save not consumed.",
 }
@@ -285,10 +284,26 @@ class CASPOConfig:
     max_steps: int = 1000
     seed: int = 0
     log_every: int = 1
-    # ``save_every`` writes periodic policy checkpoints; ``eval_every`` is
-    # currently metadata only, with eval invoked via scripts/eval.py.
+    # ``save_every`` writes periodic policy checkpoints AND drives
+    # periodic in-loop eval cadence. Eval fires at every save when
+    # ``eval_during_training_gpu >= 0`` (or ``CASPO_EVAL_GPU`` env is
+    # set). ``eval_every`` is metadata only — setting it != save_every
+    # was a footgun (would mis-align and only fire at LCM cadence).
     save_every: int = 200
     eval_every: int = 200
+    # Set to a free GPU index (e.g. CASPO_EVAL_GPU=2 in the launcher
+    # env) to dispatch ``scripts/eval.py`` as a fire-and-forget
+    # subprocess after each ``eval_every`` checkpoint. -1 disables.
+    # Subprocess uses CUDA_VISIBLE_DEVICES=<this gpu>; result JSON
+    # lands at ``<ckpt>/eval.json``. Rank-0 only.
+    eval_during_training_gpu: int = -1
+    # Periodic-eval sample params (cheap MATH-500 sample by default;
+    # override via launcher env if you want different settings).
+    eval_during_training_benchmarks: str = "math500"
+    eval_during_training_k: int = 8
+    eval_during_training_limit: int = 100
+    eval_during_training_temperature: float = 0.35
+    eval_during_training_vllm_util: float = 0.30
 
     # ---- vLLM backend (when rollout_backend = "vllm") ----
     vllm_gpu_memory_utilization: float = 0.85
