@@ -1184,6 +1184,136 @@ class CASPOTrainer:
             warnings.warn(f"wandb.log failed: {e}")
 
     @torch.no_grad()
+    def _ppo_critic_train_critic(
+        self,
+        tiled_prompt_ids: torch.Tensor,
+        tiled_prompt_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        old_values: torch.Tensor,
+        returns: torch.Tensor,
+        n_epochs: int = 1,
+    ) -> Tuple[float, float]:
+        """Decoupled critic training pass for ``method='ppo_critic'``.
+
+        Runs ``n_epochs`` over the rollout batch in
+        ``cfg.micro_batch_size`` chunks, computing
+        ``clipped_value_loss(values, old_values, returns, mask,
+        cliprange=cfg.cliprange_value)`` per chunk and accumulating
+        gradients across ``cfg.grad_accum_steps`` before stepping
+        ``self.critic_optimizer``.
+
+        This mirrors what a joint policy+critic backward in the
+        Schulman 2017 PPO loop would compute in expectation; because
+        the policy and critic parameter sets are disjoint, the
+        gradient with respect to the critic params is identical
+        regardless of whether the policy and critic backwards run
+        together or separately. The decoupling is purely a memory
+        optimization: it halves the activation peak (only one
+        network's grad graph alive at a time) and is what TRL,
+        OpenRLHF, and ColossalAI all do at scale.
+
+        Returns ``(t_critic_seconds, mean_v_loss_scalar)``.
+        """
+        from caspo.critic import clipped_value_loss
+
+        cfg = self.cfg
+        if self.critic_model is None or self.critic_optimizer is None:
+            return 0.0, 0.0
+        t0 = time.time()
+        B = response_ids.shape[0]
+        mb = max(1, int(cfg.micro_batch_size))
+        accum = max(1, int(cfg.grad_accum_steps))
+        coef = float(cfg.value_loss_coef)
+        cliprange = float(cfg.cliprange_value)
+
+        self.critic_model.train()
+        self.critic_optimizer.zero_grad(set_to_none=True)
+
+        v_loss_terms: list[torch.Tensor] = []
+        n_micro = 0
+        for _ in range(int(n_epochs)):
+            for start in range(0, B, mb):
+                end = min(start + mb, B)
+                mb_resp_mask = response_mask[start:end]
+                # Per-microbatch padding trim: shrink R to the longest
+                # actual response in this slice. Mirrors the policy mb
+                # loop's per-mb trim and saves attention compute on
+                # short responses.
+                R_eff = int(mb_resp_mask.sum(dim=1).max().item())
+                if R_eff == 0:
+                    continue
+                mb_resp_mask_eff = mb_resp_mask[:, :R_eff]
+                full_ids = torch.cat(
+                    [
+                        tiled_prompt_ids[start:end],
+                        response_ids[start:end, :R_eff],
+                    ],
+                    dim=1,
+                )
+                full_mask = torch.cat(
+                    [tiled_prompt_mask[start:end], mb_resp_mask_eff],
+                    dim=1,
+                )
+                crit_full = self.critic_model(
+                    input_ids=full_ids, attention_mask=full_mask,
+                )
+                P = tiled_prompt_ids[start:end].shape[1]
+                crit_values = crit_full[:, P - 1 : P - 1 + R_eff]
+                crit_values = crit_values * mb_resp_mask_eff.to(
+                    crit_values.dtype,
+                )
+                old_v_mb = old_values[start:end, :R_eff]
+                ret_mb = returns[start:end, :R_eff]
+                v_loss = clipped_value_loss(
+                    crit_values, old_v_mb, ret_mb, mb_resp_mask_eff,
+                    cliprange=cliprange,
+                )
+                # value_loss_coef folded into per-mb grad weight; accum
+                # divisor matches the policy loop's pattern so the
+                # effective loss after accumulation = coef * mean.
+                grad_weight = coef / float(accum)
+                (v_loss * grad_weight).backward()
+                v_loss_terms.append(v_loss.detach())
+                n_micro += 1
+                if n_micro % accum == 0:
+                    if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
+                        try:
+                            self._clip_grad_norm(
+                                self.critic_model,
+                                self.critic_model.parameters(),
+                                max_norm=cfg.critic_grad_clip,
+                            )
+                        except Exception:
+                            pass
+                    self.critic_optimizer.step()
+                    if self.critic_lr_scheduler is not None:
+                        self.critic_lr_scheduler.step()
+                    self.critic_optimizer.zero_grad(set_to_none=True)
+        # Step on any remainder microbatches (n_micro not a multiple of
+        # accum, e.g. small final-step batch).
+        if n_micro % accum != 0:
+            if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
+                try:
+                    self._clip_grad_norm(
+                        self.critic_model,
+                        self.critic_model.parameters(),
+                        max_norm=cfg.critic_grad_clip,
+                    )
+                except Exception:
+                    pass
+            self.critic_optimizer.step()
+            if self.critic_lr_scheduler is not None:
+                self.critic_lr_scheduler.step()
+            self.critic_optimizer.zero_grad(set_to_none=True)
+
+        v_loss_mean = (
+            float(torch.stack(v_loss_terms).mean().item())
+            if v_loss_terms
+            else 0.0
+        )
+        return time.time() - t0, v_loss_mean
+
     def _sync_vllm_weights_fsdp(self) -> float:
         """IPC sync from an FSDP-wrapped policy to the rank-local vLLM engine.
 
@@ -2151,45 +2281,17 @@ class CASPOTrainer:
                         ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
                         kl_estimator=cfg.kl_estimator,
                     )
-                    # PPO+critic: clipped-MSE value loss on the same
-                    # microbatch slice. Critic forward consumes the
-                    # full (prompt+response) input (matches the values
-                    # we built advantages against). The loss is added
-                    # to the policy loss with cfg.value_loss_coef
-                    # weighting; backward runs through both networks.
-                    if method == "ppo_critic" and self.critic_model is not None:
-                        from caspo.critic import clipped_value_loss
-
-                        full_ids_mb = torch.cat(
-                            [tiled_prompt_ids[start:end], response_ids[start:end, :R_eff]], dim=1,
-                        )
-                        full_mask_mb = torch.cat(
-                            [tiled_prompt_mask[start:end], mb_resp_mask], dim=1,
-                        )
-                        crit_full_mb = self.critic_model(
-                            input_ids=full_ids_mb, attention_mask=full_mask_mb,
-                        )
-                        P_mb = tiled_prompt_ids[start:end].shape[1]
-                        crit_values_mb = crit_full_mb[:, P_mb - 1 : P_mb - 1 + R_eff]
-                        crit_values_mb = crit_values_mb * mb_resp_mask.to(
-                            crit_values_mb.dtype,
-                        )
-                        old_v_mb = self._ppo_critic_old_values[start:end, :R_eff]
-                        ret_mb = self._ppo_critic_returns[start:end, :R_eff]
-                        v_loss = clipped_value_loss(
-                            crit_values_mb, old_v_mb, ret_mb, mb_resp_mask,
-                            cliprange=float(cfg.cliprange_value),
-                        )
-                        # Joint loss; one backward fuses policy + critic
-                        # gradients efficiently (different params, same
-                        # graph thanks to torch.cat keeping them paired).
-                        joint = loss + float(cfg.value_loss_coef) * v_loss
-                        (joint * grad_weight).backward()
-                        # Stash for stats (one .item() at end of step).
-                        if "v_loss_terms" not in stats:
-                            stats["_v_loss_scalar"] = v_loss.detach().to(accum_dtype)
-                    else:
-                        (loss * grad_weight).backward()
+                    # PPO+critic: critic forward+backward is run in a
+                    # SEPARATE pass after the policy mb loop completes
+                    # (see ``_ppo_critic_train_critic`` below). Doing
+                    # joint forward+backward inside the policy mb loop
+                    # doubles the activation peak (~120 GB at 7B) and
+                    # OOMs even at mb=1; decoupling halves it and
+                    # produces identical gradients (the critic and
+                    # policy parameter sets are disjoint, so a joint
+                    # backward over the same graph is not numerically
+                    # different from two separate backwards).
+                    (loss * grad_weight).backward()
 
                 with torch.no_grad():
                     # Stage on-device contributions; we ``.tolist()`` the
@@ -2226,29 +2328,10 @@ class CASPOTrainer:
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
-                    # Critic step shares the policy-step boundary so
-                    # the joint loss above produces aligned gradients.
-                    if (
-                        method == "ppo_critic"
-                        and self.critic_optimizer is not None
-                        and self.critic_model is not None
-                    ):
-                        if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
-                            try:
-                                self._clip_grad_norm(
-                                    self.critic_model,
-                                    self.critic_model.parameters(),
-                                    max_norm=cfg.critic_grad_clip,
-                                )
-                            except Exception:
-                                # Don't let a critic clip-norm bug kill
-                                # the run; the joint backward already
-                                # produced a valid gradient.
-                                pass
-                        self.critic_optimizer.step()
-                        if self.critic_lr_scheduler is not None:
-                            self.critic_lr_scheduler.step()
-                        self.critic_optimizer.zero_grad(set_to_none=True)
+                    # Critic update is decoupled from the policy mb
+                    # loop (see ``_ppo_critic_train_critic`` invoked
+                    # AFTER this loop completes). Here we only step
+                    # the policy.
                     n_optim_steps += 1
         # Single sync: materialize all per-stat token-weighted sums in one
         # CUDA→host round-trip. ``torch.stack`` over zero-dim tensors costs
@@ -2271,6 +2354,26 @@ class CASPOTrainer:
             stat_vals[3], stat_vals[4], stat_vals[5],
         )
         t_policy = time.time() - t_policy_start
+
+        # PPO+critic: critic update runs AFTER the policy mb loop
+        # completes. Same gradient algebra as a joint backward (the
+        # parameter sets are disjoint) but half the activation peak
+        # because we only ever materialize one network's grad graph
+        # at a time. Reuses cfg.micro_batch_size + cfg.grad_accum_steps
+        # for granularity; runs cfg.epochs_per_rollout passes over the
+        # batch (matching the policy loop's effective compute count).
+        if method == "ppo_critic" and self.critic_model is not None:
+            t_value_extra, v_loss_avg = self._ppo_critic_train_critic(
+                tiled_prompt_ids, tiled_prompt_mask,
+                response_ids, response_mask,
+                self._ppo_critic_old_values, self._ppo_critic_returns,
+                n_epochs=int(cfg.epochs_per_rollout),
+            )
+            t_value = t_value + t_value_extra
+            value_stats = {"v_loss": v_loss_avg}
+            # Drop the stashed tensors so they don't leak across steps.
+            self._ppo_critic_old_values = None
+            self._ppo_critic_returns = None
 
         # Sync vLLM weights for the next rollout (if applicable). The train
         # loop passes ``sync_vllm=False`` for its final step because no later
