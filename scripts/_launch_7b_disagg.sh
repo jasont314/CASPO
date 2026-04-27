@@ -109,10 +109,19 @@ unset ACTIVATION_CHECKPOINTING_MODE
 # rest of the world doesn't need them visible).
 ROLLOUT_GPUS_CSV=$(IFS=,; echo "${ROLLOUT_GPUS[*]}")
 
+# Weight-sync backend default. Phase 4a uses 'checkpoint' (file-based)
+# for verifiable correctness: rank 0 save_pretrained's the gathered
+# FSDP state to a scratch dir, then vLLM reload_weights from there.
+# This path is paper-correct but slow (~10 s per sync = ~3 h over a
+# 1000-step run). Phase 4b will introduce 'nccl' which broadcasts via
+# vLLM's PyNcclCommunicator side group. Override at the launcher level
+# via WEIGHT_SYNC_BACKEND env.
+DISAGG_WEIGHT_SYNC_BACKEND="${DISAGG_WEIGHT_SYNC_BACKEND:-${WEIGHT_SYNC_BACKEND:-checkpoint}}"
+
 OVERRIDES=(
     --override "method=${METHOD}"
     --override rollout_backend=vllm
-    --override vllm_weight_sync_backend=nccl
+    --override "vllm_weight_sync_backend=${DISAGG_WEIGHT_SYNC_BACKEND}"
     --override vllm_disaggregated=true
     --override "vllm_disaggregated_tp=${NROLLOUT}"
     --override "vllm_gpu_memory_utilization=${CASPO_VLLM_GPU_MEMORY_UTILIZATION}"
