@@ -235,25 +235,31 @@ class CASPOConfig:
     # paper-faithful baseline for VinePPO comparison (the upstream paper's
     # "PPO" reference is critic-based).
     critic_model_name_or_path: Optional[str] = None  # None = use cfg.model_name_or_path
-    # Critic optimizer hyperparameters. Critic typically wants a higher lr
-    # than the policy (it's just a regression head); VinePPO upstream uses
-    # 1e-5 vs the policy's 1e-6.
-    critic_lr: float = 1e-5
+    # Critic optimizer hyperparameters. Aligned with VinePPO upstream's
+    # ``configs/trainers/ppo_MATH.jsonnet`` which uses ``learning_rate=1e-6``
+    # for both policy and critic (single ``learning_rate`` field shared by
+    # actor + critic in their DeepSpeed setup; verified 2026-04-27).
+    critic_lr: float = 1e-6
     critic_weight_decay: float = 0.0
     critic_warmup_steps: int = 0
     critic_grad_clip: float = 1.0
     # Value-loss coefficient in the joint objective. The full PPO loss is
-    # ``policy_pg_loss + value_loss_coef * value_loss``. VinePPO upstream
-    # uses 0.1 (the value loss is ~10x larger in raw scale than the policy
-    # loss because returns are O(1) while policy loss is O(0.01)).
-    value_loss_coef: float = 0.1
+    # ``policy_pg_loss + value_loss_coef * value_loss``. VinePPO upstream's
+    # ppo_trainer scales by 0.5 inside the loss function and applies a
+    # separate vf_coef multiplier; we fold the 0.5 into ``clipped_value_loss``
+    # already and default ``value_loss_coef=1.0`` to match the effective
+    # policy:value ratio (1:1).
+    value_loss_coef: float = 1.0
     # Clipped value loss range (Schulman 2017 §6.1). Each value prediction
     # is clipped to [old_v - cliprange, old_v + cliprange] before the MSE.
     # Stabilizes value training when V is far from the target return.
     cliprange_value: float = 0.2
-    # GAE (Schulman 2016) discount and λ. VinePPO upstream uses
-    # gamma=1.0, lambda=0.95.
-    ppo_gae_lambda: float = 0.95
+    # GAE (Schulman 2016) discount and λ. VinePPO upstream's effective
+    # config for DeepSeekMath SFT2 (``configs/trainers/lam1.jsonnet``
+    # overrides the base ``ppo_MATH.jsonnet`` lam=0.96 to lam=1.0)
+    # uses gamma=1.0, lambda=1.0 (Monte-Carlo-like advantage with no
+    # bootstrap-decay).
+    ppo_gae_lambda: float = 1.0
     # Whether the critic shares its FSDP wrap policy with the main policy.
     # True (default) keeps the critic under the same fsdp_wrap_block_group_size
     # / fsdp_sharding_strategy as the policy. False is a future hook for
