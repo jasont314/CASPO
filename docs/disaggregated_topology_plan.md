@@ -143,3 +143,47 @@ is >10%, port the YAML defaults.
   (vs current 338 s colocated 8-GPU).
 * GRPO/PPO/CASPO/CASPO-frozen-RM step times unchanged when run on the
   legacy rank-local launchers (regression guard).
+
+## Phase 5a result (file-based checkpoint sync, 2026-04-27)
+
+VinePPO 7B disaggregated FSDP=4 (GPUs 0-3) + vLLM TP=4 (GPUs 4-7),
+``vllm_weight_sync_backend=checkpoint``. ``MAX_STEPS=2`` smoke.
+
+| Step | t_step | t_roll | t_value | t_ref | t_pol | t_sync |
+|---:|---:|---:|---:|---:|---:|---:|
+|  1 | 451.9s | 53.5s | 323.5s | 4.3s | 35.1s | 27.9s |
+|  2 | 270.0s |  6.1s | 220.7s | 4.2s | 33.2s |  0.0s¹ |
+
+¹ Step 2 was the final step → ``sync_vllm=False``; t_sync omitted.
+Adding the omitted file-sync (~28 s) gives a real steady-state of
+~298 s/step.
+
+vs colocated 8-GPU steady (338 s/step) the disaggregated path is
+**~12% faster** (steady, with file-sync) or **~20% faster** if Phase
+4b's NCCL sync drops t_sync from 28 s → ~2 s.
+
+### Why not the 4× I hoped for
+
+t_value (the K=9 MC fan-out) is the dominant cost, and pooled TP=4
+KV cache does not beat 4× TP=1 engines on this specific 5184-sequence
+workload. The NCCL all-reduce per layer at TP=4 eats most of the
+KV-pool advantage. A single TP=8 engine would halve t_value but
+breaks rank-local IPC compatibility *and* the FSDP world ÷ mb ÷
+accum = 64 paper-faithful math (would need world=8 + mb=2 + accum=4).
+Out of scope; documenting as a known ceiling.
+
+### Phase 4b plan (NCCL weight sync, next commit)
+
+Replace file-based ``sync_weights_from_path`` with
+``NCCLWeightTransferEngine.trainer_send_weights`` (vLLM ships this in
+``vllm/distributed/weight_transfer/nccl_engine.py``). Trainer rank 0
+joins a side ``PyNcclCommunicator`` group with the 4 vLLM workers
+(world_size = 1 + tp). Per-step sync wall time should drop from ~28
+s (save_pretrained 14 GB + reload) to ~1-2 s (NVLink bcast). Saves
+~7 hours over a 1000-step run.
+
+### Phase 6 (deferred): port to GRPO/PPO/CASPO
+
+The 4-method group already runs at 47-85 s/step rank-local. Disagg
+would not help (those methods don't have the K=9 MC fan-out that
+benefits from pooled KV). Skip.
