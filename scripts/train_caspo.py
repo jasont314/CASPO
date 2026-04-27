@@ -55,9 +55,9 @@ def _validate_cfg(cfg) -> None:
         raise ValueError(
             f"cfg.prompts_per_step={cfg.prompts_per_step} must be >= 1"
         )
-    if cfg.method not in {"ppo", "caspo", "grpo", "vineppo"}:
+    if cfg.method not in {"ppo", "caspo", "grpo", "vineppo", "ppo_critic"}:
         raise ValueError(
-            f"cfg.method={cfg.method!r} not in {{'ppo','caspo','grpo','vineppo'}}"
+            f"cfg.method={cfg.method!r} not in {{'ppo','caspo','grpo','vineppo','ppo_critic'}}"
         )
     if cfg.method == "vineppo" and cfg.rollout_backend != "vllm":
         raise ValueError(
