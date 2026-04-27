@@ -70,20 +70,27 @@ class CriticModel(nn.Module):
         in the SAME shape used for the policy forward (so values
         line up with response_ids slicing in the trainer).
         """
-        # Drop kwargs the backbone doesn't accept (avoid HF's strict
-        # forward signature on some versions). ``output_hidden_states``
-        # is the one we explicitly need; everything else goes through.
-        out = self.backbone(
+        # CRITICAL: bypass the LM-head wrapper and call the encoder
+        # directly. Calling ``self.backbone(..., output_hidden_states
+        # =True)`` would force HF to retain ALL 33 layers' hidden
+        # states in the output dict (input embedding + 32 layer
+        # outputs), spiking activation memory by ~32× and OOMing on
+        # 7B + colocated policy. By calling the inner model
+        # (``self.backbone.model`` for LlamaForCausalLM-style
+        # architectures) we get just the final hidden state without
+        # the per-layer retention.
+        encoder = getattr(self.backbone, "model", self.backbone)
+        out = encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
             use_cache=False,
             return_dict=True,
             **{k: v for k, v in kwargs.items()
                if k not in ("output_hidden_states", "use_cache", "return_dict")},
         )
-        # Last hidden state: [B, S, H] in the backbone's compute dtype.
-        h = out.hidden_states[-1]
+        # ``out.last_hidden_state`` is [B, S, H] in the backbone's
+        # compute dtype.
+        h = out.last_hidden_state
         # Project to scalar values, then squeeze the trailing 1-dim.
         # Cast to fp32 for downstream MSE / GAE numerics; the value head
         # weights themselves stay in the backbone's dtype.
