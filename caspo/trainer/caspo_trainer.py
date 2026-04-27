@@ -408,6 +408,40 @@ class CASPOTrainer:
                     p.requires_grad_(False)
                 self.value_model.phi.eval()
 
+        # ---- learned critic — only for method="ppo_critic" ----
+        # Schulman 2017 PPO with a separate value network. Built from
+        # cfg.critic_model_name_or_path (defaults to cfg.model_name_or_path
+        # so the critic shares the policy's SFT init — VinePPO upstream
+        # pattern). Trained jointly with the policy via clipped-MSE loss
+        # against GAE returns. FSDP-wrapped on the same path as the policy.
+        self.critic_model = None
+        self.critic_optimizer: Optional[AdamW] = None
+        self.critic_lr_scheduler = None
+        if cfg.method == "ppo_critic":
+            from caspo.critic import CriticModel
+
+            critic_path = cfg.critic_model_name_or_path or cfg.model_name_or_path
+            self.critic_model = CriticModel.from_pretrained(cfg, critic_path)
+            self.critic_model.to(self.device)
+            self.critic_model.train()
+            self.critic_model = self._wrap_fsdp_if_enabled(
+                self.critic_model, module_name="critic",
+            )
+            self.critic_model = self._wrap_ddp_if_enabled(
+                self.critic_model, module_name="critic",
+            )
+            self.critic_optimizer = AdamW(
+                (p for p in self.critic_model.parameters() if p.requires_grad),
+                lr=cfg.critic_lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=cfg.critic_weight_decay,
+                fused=_fused_adamw_supported(self.device),
+            )
+            self.critic_lr_scheduler = _build_lr_schedule(
+                self.critic_optimizer, cfg.critic_warmup_steps,
+            )
+
         # ---- reference policy for PPO KL term (optional) ----
         self.ref_policy = None
         if cfg.kl_coef and cfg.kl_coef > 0:
@@ -1836,6 +1870,81 @@ class CASPOTrainer:
             mean_step_advantage = float(adv_per_seq.abs().mean().item())
             mean_step_count = 1.0
             adv_values_for_stats = adv_per_seq
+        elif method == "ppo_critic":
+            # Schulman 2017 PPO with learned critic. Per-token rewards
+            # are terminal-only (verifier-RL convention): the last
+            # valid response token gets the verifier reward, all
+            # others zero. GAE rolls the reward backward through the
+            # critic's per-token value predictions.
+            from caspo.critic import compute_gae
+
+            t_value_start = time.time()
+            B_local = response_mask.shape[0]
+            R_local = response_mask.shape[1]
+            response_lens = response_mask.sum(dim=1).long()  # [B]
+            last_idx = (response_lens - 1).clamp(min=0)
+            per_token_rewards = torch.zeros(
+                B_local, R_local, device=self.device, dtype=torch.float32,
+            )
+            # Scatter terminal reward to last response token of each row.
+            row_idx = torch.arange(B_local, device=self.device)
+            per_token_rewards[row_idx, last_idx] = rewards.float()
+            # Mask out rows that have zero response length (shouldn't
+            # happen but defensive).
+            valid = (response_lens > 0).float()
+            per_token_rewards = per_token_rewards * valid.unsqueeze(1)
+
+            # Critic forward over the full (prompt + response) input.
+            # ``critic_full[:, t]`` = V of the state with input[:t+1]
+            # consumed, i.e., V after position t.
+            # Position P-1 is end-of-prompt → V(s_0) = V(prompt).
+            # Position P-1+t is end-of-(prompt + response[:t]) → V(s_t).
+            # So the value window for response tokens is
+            # ``critic_full[:, P-1:P-1+R]`` (length R), aligning V(s_t)
+            # with response token t.
+            with torch.no_grad():
+                full_ids = torch.cat([tiled_prompt_ids, response_ids], dim=1)
+                full_mask = torch.cat([tiled_prompt_mask, response_mask], dim=1)
+                P = tiled_prompt_ids.shape[1]
+                critic_full = self.critic_model(
+                    input_ids=full_ids, attention_mask=full_mask,
+                )
+                critic_values = critic_full[:, P - 1 : P - 1 + R_local].contiguous()
+            # Mask values past the response end so GAE doesn't propagate
+            # through padding.
+            critic_values = critic_values * response_mask.to(critic_values.dtype)
+
+            advantages_per_token, returns_per_token = compute_gae(
+                per_token_rewards, critic_values, response_mask,
+                gamma=cfg.gamma, gae_lambda=cfg.ppo_gae_lambda,
+            )
+
+            # Standardize (existing scope/clip knobs).
+            if cfg.standardize_step_advantage:
+                mask_f = response_mask.to(torch.float32)
+                n = mask_f.sum().clamp(min=1.0)
+                mu = (advantages_per_token * mask_f).sum() / n
+                var = ((advantages_per_token - mu) ** 2 * mask_f).sum() / n
+                std = var.clamp(min=1e-8).sqrt()
+                advantages_per_token = (advantages_per_token - mu) / std * mask_f
+            if cfg.advantage_clip and cfg.advantage_clip > 0:
+                advantages_per_token = advantages_per_token.clamp(
+                    min=-float(cfg.advantage_clip),
+                    max=float(cfg.advantage_clip),
+                )
+            token_advantage = (
+                advantages_per_token.to(torch.float32)
+                * response_mask.to(torch.float32)
+            )
+
+            # Stash for the policy mb loop's clipped-value-loss path.
+            self._ppo_critic_returns = returns_per_token.detach()
+            self._ppo_critic_old_values = critic_values.detach()
+
+            mean_step_advantage = float(advantages_per_token.abs().mean().item())
+            mean_step_count = float(response_lens.float().mean().item())
+            adv_values_for_stats = advantages_per_token
+            t_value = time.time() - t_value_start
         else:
             # Segment for caspo + vineppo
             if cfg.segmentation_mode == "latex_aware":
@@ -2042,7 +2151,45 @@ class CASPOTrainer:
                         ref_logprobs=ref_lp, kl_coef=cfg.kl_coef,
                         kl_estimator=cfg.kl_estimator,
                     )
-                    (loss * grad_weight).backward()
+                    # PPO+critic: clipped-MSE value loss on the same
+                    # microbatch slice. Critic forward consumes the
+                    # full (prompt+response) input (matches the values
+                    # we built advantages against). The loss is added
+                    # to the policy loss with cfg.value_loss_coef
+                    # weighting; backward runs through both networks.
+                    if method == "ppo_critic" and self.critic_model is not None:
+                        from caspo.critic import clipped_value_loss
+
+                        full_ids_mb = torch.cat(
+                            [tiled_prompt_ids[start:end], response_ids[start:end, :R_eff]], dim=1,
+                        )
+                        full_mask_mb = torch.cat(
+                            [tiled_prompt_mask[start:end], mb_resp_mask], dim=1,
+                        )
+                        crit_full_mb = self.critic_model(
+                            input_ids=full_ids_mb, attention_mask=full_mask_mb,
+                        )
+                        P_mb = tiled_prompt_ids[start:end].shape[1]
+                        crit_values_mb = crit_full_mb[:, P_mb - 1 : P_mb - 1 + R_eff]
+                        crit_values_mb = crit_values_mb * mb_resp_mask.to(
+                            crit_values_mb.dtype,
+                        )
+                        old_v_mb = self._ppo_critic_old_values[start:end, :R_eff]
+                        ret_mb = self._ppo_critic_returns[start:end, :R_eff]
+                        v_loss = clipped_value_loss(
+                            crit_values_mb, old_v_mb, ret_mb, mb_resp_mask,
+                            cliprange=float(cfg.cliprange_value),
+                        )
+                        # Joint loss; one backward fuses policy + critic
+                        # gradients efficiently (different params, same
+                        # graph thanks to torch.cat keeping them paired).
+                        joint = loss + float(cfg.value_loss_coef) * v_loss
+                        (joint * grad_weight).backward()
+                        # Stash for stats (one .item() at end of step).
+                        if "v_loss_terms" not in stats:
+                            stats["_v_loss_scalar"] = v_loss.detach().to(accum_dtype)
+                    else:
+                        (loss * grad_weight).backward()
 
                 with torch.no_grad():
                     # Stage on-device contributions; we ``.tolist()`` the
@@ -2079,6 +2226,29 @@ class CASPOTrainer:
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    # Critic step shares the policy-step boundary so
+                    # the joint loss above produces aligned gradients.
+                    if (
+                        method == "ppo_critic"
+                        and self.critic_optimizer is not None
+                        and self.critic_model is not None
+                    ):
+                        if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
+                            try:
+                                self._clip_grad_norm(
+                                    self.critic_model,
+                                    self.critic_model.parameters(),
+                                    max_norm=cfg.critic_grad_clip,
+                                )
+                            except Exception:
+                                # Don't let a critic clip-norm bug kill
+                                # the run; the joint backward already
+                                # produced a valid gradient.
+                                pass
+                        self.critic_optimizer.step()
+                        if self.critic_lr_scheduler is not None:
+                            self.critic_lr_scheduler.step()
+                        self.critic_optimizer.zero_grad(set_to_none=True)
                     n_optim_steps += 1
         # Single sync: materialize all per-stat token-weighted sums in one
         # CUDA→host round-trip. ``torch.stack`` over zero-dim tensors costs
