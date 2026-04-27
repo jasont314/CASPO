@@ -270,12 +270,61 @@ handle production is local.
 
 Phases (each = its own commit):
 * F.1 (research, this section): vLLM IPC engine multi-GPU dispatch
-  validation.
-* F.2: extend ``sync_weights_from_model`` (or a new ``_sync_weights_ipc_tp``)
-  to gather per-rank handles and submit aggregated.
-* F.3: launcher ``_launch_7b_tp8_ipc.sh`` — TP=8 colocated with
-  ipc backend.
+  validation. Confirmed: per-param multi-UUID dict works as-is;
+  workers look up their own UUID, ignore others; load_weights does
+  TP-shard slicing internally; no schema changes needed.
+* F.2: ``DisaggregatedSamplerProxy._sync_weights_multirank_ipc`` +
+  ``VLLMRolloutEngine._sync_weights_from_aggregated_ipc`` —
+  trainer-side gather + per-param multi-UUID merge + submit.
+* F.3: launcher ``scripts/launch_7b_vineppo_tp8_ipc.sh`` (Phase A's
+  ``_launch_7b_tp8_colocated.sh`` body with WEIGHT_SYNC_BACKEND=ipc).
 * F.4: smoke + tune.
+
+### Phase F.4 result (rejected for VinePPO 7B, mechanism correct)
+
+VinePPO 7B colocated TP=8 (FSDP=8 + vLLM TP=8 on the same 8 GPUs)
++ Phase F multirank-IPC sync. ``MAX_STEPS=2`` smoke, step 1:
+
+  t_step  = 1735.7s  (!)
+  t_roll  =  181.4s
+  t_value = 1514.6s   ← bottleneck
+  t_ref   =    3.3s
+  t_pol   =   22.1s   (FSDP=8 helped here vs FSDP=4's 33s)
+  t_sync  =    2.9s   ← Phase F mechanism: working, ~10× faster
+                        than Phase 4b's NCCL packed (which already
+                        won 130× over file-based).
+
+The IPC sync mechanism is working correctly: 2.9 s for 7B at TP=8 is
+within expected range (per-rank handle production + gather + one
+update_weights RPC, each rank holds keepalive across the barrier).
+
+But the topology trade is bad for this workload:
+
+* **t_value 5x worse** (1515 s vs 287 s on disagg TP=4 cold-start).
+  TP=8 forces a per-layer NCCL all-reduce inside vLLM; for K=9 MC's
+  many small per-prefix decode batches, the all-reduce latency
+  dominates over the throughput gain from a 2x larger KV pool.
+* The pooled-KV intuition was wrong for this workload: VinePPO MC
+  is decode-latency-bound (many short generations), not KV-bound.
+  Pooling helps only when generations are long enough that KV
+  pressure forces queueing — that's the prefill / long-context
+  regime, not ours.
+* **t_pol 33% better** (22 s vs 33 s) — FSDP=8 trainer side does
+  speed up, but not enough to offset the t_value blowup.
+
+Conclusion: keep the Phase F code paths (they're correct and may help
+future workloads with KV-bound generation), but **default the disagg
+launcher to TP=4 + NCCL packed** as the VinePPO production path.
+
+### Final winner — recap
+
+| Topology | Sync | Steady t_step | Notes |
+|---|---|---:|---|
+| Colocated TP=1 (8-GPU) | ipc | 338s | original |
+| Disagg FSDP=4 + TP=4 | nccl packed | **277s** | **production** |
+| Colocated TP=8 + IPC | ipc multirank | 1700+s | rejected for VinePPO |
+
+Wall-clock for 1000-step VinePPO 7B run: ~77 hours at 277 s/step.
 
 ### Phase 6 (deferred): port to GRPO/PPO/CASPO
 
