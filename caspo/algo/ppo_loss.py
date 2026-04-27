@@ -225,7 +225,15 @@ def ppo_clipped_loss(
             raise ValueError(
                 f"unknown kl_estimator {kl_estimator!r}; must be 'k1' or 'k3'"
             )
-        mean_kl = (kl * fmask).sum() / denom
+        # KL reduction: per-sequence sum, then batch mean. Matches VinePPO
+        # upstream's ``ref_kl.sum(dim=1).mean()`` (treetune ppo_trainer.py:920).
+        # The earlier per-token mean (``(kl * fmask).sum() / denom``) made the
+        # effective KL coefficient ~response_length × smaller (e.g. ~200× at
+        # mean=200 tokens), so kl_coef=1e-4 acted like ~5e-7 — policy drifted
+        # unconstrained from SFT and regressed below baseline on eval. Switching
+        # to per-sequence sum-then-mean restores paper-faithful KL strength.
+        kl_per_seq = (kl * fmask).sum(dim=1)              # [B]
+        mean_kl = kl_per_seq.mean()
         mean_kl_val = mean_kl.detach()
         if kl_coef != 0.0:
             loss = loss + kl_coef * mean_kl

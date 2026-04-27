@@ -100,13 +100,32 @@ def _fused_adamw_supported(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_available()
 
 
-def _build_lr_schedule(optimizer, warmup_steps: int) -> LambdaLR:
+def _build_lr_schedule(
+    optimizer,
+    warmup_steps: int,
+    total_steps: Optional[int] = None,
+) -> LambdaLR:
+    """Linear-warmup → linear-decay-to-zero.
+
+    Matches VinePPO upstream's HF ``get_linear_schedule_with_warmup``
+    (lr_scheduler_type='linear' default). The earlier constant-tail
+    schedule kept LR at the peak value forever — at step 800/1000 we
+    were training at lr=1e-6 while upstream had decayed to ~2e-7,
+    contributing to late-training drift below SFT. ``total_steps`` is
+    the total number of optimizer.step() calls expected over the run;
+    when omitted we fall back to constant-tail (legacy callers like
+    the V_φ trainer that don't expose total).
+    """
     def lr_lambda(step: int) -> float:
-        if warmup_steps <= 0:
-            return 1.0
-        if step < warmup_steps:
+        if warmup_steps > 0 and step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
-        return 1.0
+        if total_steps is None or total_steps <= warmup_steps:
+            return 1.0
+        # Linear decay from 1.0 at step=warmup_steps down to 0.0 at total_steps.
+        progress = float(step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return max(0.0, 1.0 - progress)
     return LambdaLR(optimizer, lr_lambda)
 
 
@@ -546,7 +565,21 @@ class CASPOTrainer:
             weight_decay=cfg.weight_decay,
             fused=_fused_adamw_supported(self.device),
         )
-        self.lr_scheduler = _build_lr_schedule(self.optimizer, cfg.warmup_steps)
+        # Total optimizer.step() calls over the run for linear-decay-to-zero
+        # schedule. ``cfg.max_steps`` outer iterations × ``cfg.epochs_per_rollout``
+        # epochs over each rollout × (rollout_size / (mb × accum)) optim steps
+        # per epoch. Rollout size = prompts_per_step × group_size. Falls back
+        # to a conservative estimate if any term is missing.
+        _ppr = max(1, int(getattr(cfg, "prompts_per_step", 64)))
+        _G = max(1, int(getattr(cfg, "group_size", 8)))
+        _mb = max(1, int(getattr(cfg, "micro_batch_size", 8)))
+        _acc = max(1, int(getattr(cfg, "grad_accum_steps", 8)))
+        _epr = max(1, int(getattr(cfg, "epochs_per_rollout", 2)))
+        _per_outer_optim_steps = max(1, (_ppr * _G) // (_mb * _acc) * _epr)
+        _total_optim_steps = int(cfg.max_steps) * _per_outer_optim_steps
+        self.lr_scheduler = _build_lr_schedule(
+            self.optimizer, cfg.warmup_steps, total_steps=_total_optim_steps,
+        )
 
         # ---- delimiter token ids (for token_delimiter segmentation only) ----
         self.delimiter_token_ids = _tokenize_delimiter(self.tokenizer, cfg.step_delimiter)
