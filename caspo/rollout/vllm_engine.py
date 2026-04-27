@@ -282,7 +282,15 @@ class VLLMRolloutEngine:
                 enforce_eager=enforce_eager,
                 max_model_len=max_model_len,
                 seed=seed,
-                disable_log_stats=True,
+                # Set CASPO_VLLM_LOG_STATS=1 in the launcher to surface
+                # vLLM's per-iteration scheduler stats (prompt throughput,
+                # generation throughput, GPU KV cache usage, prefix-cache
+                # hit rate). Useful for diagnosing decode-bound vs
+                # KV-bound vs prefix-cache-miss regimes; disable for
+                # production to keep logs lean.
+                disable_log_stats=os.environ.get(
+                    "CASPO_VLLM_LOG_STATS", "0"
+                ) not in ("1", "true", "True"),
             )
             # KV cache dtype: cfg.vllm_kv_cache_dtype is None (auto, fp16/bf16
             # to match the model dtype) or "fp8". fp8 halves KV memory, which

@@ -41,6 +41,14 @@ vllm_max_num_batched_tokens: 16384     # single-prefill chunk for our 16-prompt
                                        # × ~600-token batches; default ~8192
                                        # split into 2 prefills, costing 0.3-0.6s
                                        # of prefill→decode fence overhead.
+vllm_kv_cache_dtype: fp8               # halves KV memory; ~3% step-time win
+                                       # at disagg TP=4 (smoke 2026-04-27).
+                                       # Not the predicted 20% — we are
+                                       # decode-latency-bound, not KV-bound.
+                                       # Still strictly better than bf16 KV
+                                       # at the same util setting; enabled by
+                                       # default. Accuracy hit is below seed
+                                       # noise on avg@k.
 vllm_max_inflight_requests: 1024
 vllm_weight_sync_backend: ipc        # FSDP-aware IPC sync (summon_full_params + per-rank push)
 prompts_per_step: 64                 # paper-faithful: 64 × G=8 = 512 episodes / outer step (matches VinePPO Table 2 for 7B)
