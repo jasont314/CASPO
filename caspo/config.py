@@ -50,7 +50,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "torch_dtype": ("bfloat16", "float16", "float32"),
     "rollout_backend": ("hf", "vllm"),
     "segmentation_mode": ("token_delimiter", "latex_aware"),
-    "method": ("ppo", "caspo", "grpo", "vineppo"),
+    "method": ("ppo", "caspo", "grpo", "vineppo", "ppo_critic"),
     "caspo_advantage_transform": ("value", "prob", "logprob"),
     "standardize_advantage_scope": ("batch", "group", "off"),
     "kl_estimator": ("k1", "k3"),
@@ -184,11 +184,17 @@ class CASPOConfig:
 
     # ---- method dispatch ----
     # Picks the credit-assignment recipe in CASPOTrainer.step():
-    # * "ppo"     — sequence-level terminal reward advantage + PPO clip
-    # * "caspo"   — step segmentation + V_φ + step TD (this paper's contribution)
-    # * "grpo"    — no segmentation, group-relative reward as advantage
-    # * "vineppo" — step segmentation + K MC rollouts at each boundary + step TD
-    method: Literal["ppo", "caspo", "grpo", "vineppo"] = "caspo"
+    # * "ppo"        — sequence-level terminal reward advantage + PPO clip
+    #                  (critic-free; "standard practice for verifier-RL")
+    # * "caspo"      — step segmentation + V_φ + step TD (this paper's contribution)
+    # * "grpo"       — no segmentation, group-relative reward as advantage
+    # * "vineppo"    — step segmentation + K MC rollouts at each boundary + step TD
+    # * "ppo_critic" — Schulman 2017 PPO with a learned value network (separate
+    #                  PreTrainedModel, ~14 GB at 7B) + GAE + clipped-value MSE.
+    #                  Provided as a fair head-to-head baseline against VinePPO
+    #                  per the upstream paper's framing (PPO+critic is the
+    #                  reference VinePPO compares against).
+    method: Literal["ppo", "caspo", "grpo", "vineppo", "ppo_critic"] = "caspo"
     vineppo_mc_rollouts: int = 9       # K in VinePPO Eq. 5
     # Optional speed/quality tradeoff for VinePPO MC value estimates. 0 keeps
     # the paper-faithful remaining-response budget; positive values cap each
@@ -218,6 +224,41 @@ class CASPOConfig:
     clip_eps_high: float = 0.20       # symmetric by default; can DAPO-style decouple
     kl_coef: float = 0.0              # KL to π_ref as per-token bonus, 0 disables
     kl_estimator: Literal["k1", "k3"] = "k3"  # Schulman k3 unbiased estimator
+
+    # ---- PPO+critic (method="ppo_critic") ----
+    # Schulman 2017's classic PPO with a learned value network. The critic is
+    # a separate ``PreTrainedModel`` (~14 GB at 7B bf16) initialized from
+    # ``critic_model_name_or_path`` (defaults to the policy SFT path so the
+    # value head sees a pretrained backbone). It is trained jointly with the
+    # policy via clipped-value MSE loss against GAE returns; both models live
+    # on the trainer GPUs and share the FSDP wrap pipeline. Provided as a
+    # paper-faithful baseline for VinePPO comparison (the upstream paper's
+    # "PPO" reference is critic-based).
+    critic_model_name_or_path: Optional[str] = None  # None = use cfg.model_name_or_path
+    # Critic optimizer hyperparameters. Critic typically wants a higher lr
+    # than the policy (it's just a regression head); VinePPO upstream uses
+    # 1e-5 vs the policy's 1e-6.
+    critic_lr: float = 1e-5
+    critic_weight_decay: float = 0.0
+    critic_warmup_steps: int = 0
+    critic_grad_clip: float = 1.0
+    # Value-loss coefficient in the joint objective. The full PPO loss is
+    # ``policy_pg_loss + value_loss_coef * value_loss``. VinePPO upstream
+    # uses 0.1 (the value loss is ~10x larger in raw scale than the policy
+    # loss because returns are O(1) while policy loss is O(0.01)).
+    value_loss_coef: float = 0.1
+    # Clipped value loss range (Schulman 2017 §6.1). Each value prediction
+    # is clipped to [old_v - cliprange, old_v + cliprange] before the MSE.
+    # Stabilizes value training when V is far from the target return.
+    cliprange_value: float = 0.2
+    # GAE (Schulman 2016) discount and λ. VinePPO upstream uses
+    # gamma=1.0, lambda=0.95.
+    ppo_gae_lambda: float = 0.95
+    # Whether the critic shares its FSDP wrap policy with the main policy.
+    # True (default) keeps the critic under the same fsdp_wrap_block_group_size
+    # / fsdp_sharding_strategy as the policy. False is a future hook for
+    # asymmetric sharding (e.g., critic CPU-offloaded).
+    critic_share_fsdp_policy: bool = True
 
     # ---- training ----
     output_dir: str = "out/caspo"
