@@ -67,6 +67,7 @@ COMMON_OVERRIDES=(
     --override "grad_accum_steps=${GRAD_ACCUM_STEPS:-8}"
     --override "use_gradient_checkpointing=${USE_GRADIENT_CHECKPOINTING:-false}"
     --override "save_every=${SAVE_EVERY:-250}"
+    --override "eval_every=${EVAL_EVERY:-${SAVE_EVERY:-250}}"
     --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
 )

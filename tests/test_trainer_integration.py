@@ -677,3 +677,54 @@ def test_online_ipvrm_update_skipped_on_fully_saturated_batch():
     delta_mix = (after_mix - initial_mix).abs().max().item()
     assert delta_mix > 0.0, f"phi did not move on mixed batch (delta={delta_mix})"
     assert torch.isfinite(after_mix).all()
+
+
+def test_token_advantage_standardization_respects_group_and_padding():
+    """PPO+critic token advantages use the configured scope and ignore pads."""
+    from caspo.trainer.caspo_trainer import CASPOTrainer
+
+    class _Dist:
+        is_distributed = False
+
+    fake = CASPOTrainer.__new__(CASPOTrainer)
+    fake.dist = _Dist()
+
+    advantages = torch.tensor([
+        [1.0, 2.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [10.0, 10.0, 0.0],
+        [12.0, 14.0, 0.0],
+    ])
+    mask = torch.tensor([
+        [1, 1, 0],
+        [1, 0, 0],
+        [1, 1, 0],
+        [1, 1, 0],
+    ])
+
+    out = CASPOTrainer._standardize_token_advantage(
+        fake, advantages, mask, scope="group", group_size=2,
+    )
+
+    assert torch.allclose(out[mask == 0], torch.zeros_like(out[mask == 0]))
+    for group_idx in range(2):
+        rows = slice(group_idx * 2, (group_idx + 1) * 2)
+        valid = out[rows][mask[rows].bool()]
+        assert abs(float(valid.mean().item())) < 1e-6
+        assert abs(float(valid.square().mean().sqrt().item()) - 1.0) < 1e-6
+
+    off = CASPOTrainer._standardize_token_advantage(
+        fake, advantages, mask, scope="off", group_size=2,
+    )
+    assert torch.allclose(off, advantages * mask)
+
+
+def test_trainer_uses_preupdate_old_logprob_rescore():
+    """Regression guard: PPO old logprobs must be frozen before mb updates."""
+    import inspect
+
+    from caspo.trainer.caspo_trainer import CASPOTrainer
+
+    src = inspect.getsource(CASPOTrainer.step)
+    assert "old_logprobs_full = self._rescore_old_logprobs" in src
+    assert "old_logprobs_chunks" not in src

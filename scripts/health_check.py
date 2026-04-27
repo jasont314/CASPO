@@ -29,8 +29,8 @@ _TAIL_BYTES = 2 * 1024 * 1024
 
 # Step header lines come from CASPOTrainer._log and look like:
 #   [caspo step 39/1000] loss=1.7507 pg=1.2874 reward=0.016 pass@G=0.125 ...
-# ``method`` is one of "ppo", "caspo", "grpo", "vineppo".
-_STEP_RE = re.compile(r"^\[(?P<method>ppo|caspo|grpo|vineppo) step (?P<step>\d+)/(?P<max>\d+)\]")
+# ``method`` is one of the trainer dispatch names.
+_STEP_RE = re.compile(r"^\[(?P<method>ppo|ppo_critic|caspo|grpo|vineppo) step (?P<step>\d+)/(?P<max>\d+)\]")
 
 # Numeric fields. We require a leading boundary so e.g. ``v_loss=`` does NOT
 # match ``loss=`` and ``positive_loss=`` would not either. Values may be

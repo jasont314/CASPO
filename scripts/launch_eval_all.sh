@@ -70,7 +70,7 @@ if [[ -n "${EVAL_LIMIT:-}" ]]; then
 fi
 BENCH_TAG="${BENCHMARKS//,/+}"
 CKPT_TAG="${CKPT_SUBDIR//\//_}"
-read -r -a METHODS <<< "${METHODS:-grpo ppo vineppo_ddp2 caspo caspo_prob caspo_logprob caspo_frozen_rm}"
+read -r -a METHODS <<< "${METHODS:-grpo ppo_critic vineppo_ddp2 caspo caspo_prob caspo_logprob caspo_frozen_rm}"
 IFS=' ' read -r -a EVAL_GPUS <<< "${EVAL_GPU_LIST:-0 1 2 3 4 5 6}"
 if (( ${#EVAL_GPUS[@]} < ${#METHODS[@]} )); then
     echo "[eval] EVAL_GPU_LIST must provide at least ${#METHODS[@]} GPUs; got: ${EVAL_GPU_LIST:-0 1 2 3 4 5 6}" >&2

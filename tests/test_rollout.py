@@ -227,6 +227,31 @@ def test_build_response_mask_pad_equals_eos():
     assert torch.equal(mask, expected), f"got {mask.tolist()}"
 
 
+def test_length_finished_mask_detects_max_token_truncation():
+    """HF fallback should mirror vLLM: max-length unfinished rows get reward 0."""
+    EOS = 2
+    response_ids = torch.tensor(
+        [
+            [5, 6, 7, 8],      # hit cap, no EOS -> length-finished
+            [5, EOS, EOS, EOS], # EOS in valid span -> completed
+            [5, 6, 0, 0],      # shorter than cap via mask -> not length-finished
+        ],
+        dtype=torch.long,
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 0, 0],
+            [1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    out = HFRolloutSampler._length_finished_mask(
+        response_ids, response_mask, EOS, max_new_tokens=4,
+    )
+    assert torch.equal(out, torch.tensor([True, False, False]))
+
+
 # ---------------------------------------------------------------------------
 # End-to-end tests through the tiny model
 # ---------------------------------------------------------------------------

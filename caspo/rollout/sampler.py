@@ -1,11 +1,10 @@
 """Group-of-G rollout sampler.
 
 For each prompt we sample ``cfg.group_size`` responses with HuggingFace
-``model.generate``. Sampling-time log-probabilities are extracted directly
-from ``output_scores`` (the per-step logits returned by ``generate``) so the
-trainer's importance ratio uses the *true* on-policy logprobs at the time
-each token was sampled — not a re-forward, which would already include the
-post-update parameters once we start training off-policy mini-epochs.
+``model.generate``. Sampling-time log-probabilities are retained for
+diagnostics/backward compatibility, but the trainer rescoring path computes
+PPO's frozen ``π_old`` with the trainer model before any optimizer update so
+vLLM/HF sampling backends share the same importance-ratio semantics.
 
 Outputs are returned on CPU; the trainer is responsible for moving them to
 the model's device.
@@ -178,6 +177,28 @@ class HFRolloutSampler:
             keep = keep & (response_ids != pad_token_id)
         return keep.to(torch.long)
 
+    @staticmethod
+    def _length_finished_mask(
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        eos_token_id: int,
+        max_new_tokens: int,
+    ) -> torch.BoolTensor:
+        """Rows that likely stopped because the generation length cap fired.
+
+        HF ``generate`` does not return per-row finish reasons. If the decoded
+        response span reached the requested ``max_new_tokens`` and no real EOS
+        appears inside the valid span, treat it as ``finish_reason='length'``.
+        This mirrors the vLLM backend's strict Math RL contract.
+        """
+        B = response_ids.shape[0]
+        if response_ids.numel() == 0 or response_ids.shape[1] < int(max_new_tokens):
+            return torch.zeros(B, dtype=torch.bool, device=response_ids.device)
+        valid = response_mask.to(torch.bool)
+        valid_lengths = valid.sum(dim=1)
+        has_eos = ((response_ids == int(eos_token_id)) & valid).any(dim=1)
+        return (valid_lengths >= int(max_new_tokens)) & ~has_eos
+
     # ------------------------------------------------------------------
     # Main API
     # ------------------------------------------------------------------
@@ -343,6 +364,15 @@ class HFRolloutSampler:
             # ground truths tiled to match the G-replicated layout.
             tiled_gt = [ground_truths[i // G] for i in range(num_prompts * G)]
             raw_rewards = self.reward_fn(raw_responses, tiled_gt)
+            # VinePPO-strict / vLLM parity: unfinished responses that ran
+            # into the max token cap get zero reward even if a truncated
+            # boxed answer happens to be present in decoded text.
+            length_finished = self._length_finished_mask(
+                response_ids, response_mask, self.eos_token_id, max_new_tokens,
+            )
+            for i, is_length in enumerate(length_finished.cpu().tolist()):
+                if is_length:
+                    raw_rewards[i] = 0.0
             rewards = torch.tensor(raw_rewards, dtype=torch.float32)
 
             # prompt_index[b] = which prompt response b belongs to

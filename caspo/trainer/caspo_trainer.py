@@ -34,6 +34,7 @@ import json
 import os
 import random
 import subprocess
+import sys
 import time
 import warnings
 from dataclasses import asdict
@@ -1308,15 +1309,54 @@ class CASPOTrainer:
         accum = max(1, int(cfg.grad_accum_steps))
         coef = float(cfg.value_loss_coef)
         cliprange = float(cfg.cliprange_value)
+        micro_ranges = [(start, min(start + mb, B)) for start in range(0, B, mb)]
+        n_micros_total = len(micro_ranges)
+        row_token_counts = response_mask.sum(dim=1).detach().cpu()
+        micro_token_counts = [
+            float(row_token_counts[start:end].sum().item())
+            for start, end in micro_ranges
+        ]
+        group_token_counts = [
+            sum(micro_token_counts[i : min(i + accum, n_micros_total)])
+            for i in range(0, n_micros_total, accum)
+        ]
+        global_group_token_counts = list(group_token_counts)
+        world_size = max(1, int(self.dist.world_size))
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            group_tokens_t = torch.tensor(
+                global_group_token_counts,
+                device=response_mask.device,
+                dtype=torch.float32,
+            )
+            dist.all_reduce(group_tokens_t, op=dist.ReduceOp.SUM)
+            global_group_token_counts = [
+                float(x) for x in group_tokens_t.detach().cpu().tolist()
+            ]
 
         self.critic_model.train()
         self.critic_optimizer.zero_grad(set_to_none=True)
 
         v_loss_terms: list[torch.Tensor] = []
-        n_micro = 0
+        v_loss_weight_denom = 0.0
         for _ in range(int(n_epochs)):
-            for start in range(0, B, mb):
-                end = min(start + mb, B)
+            n_micro_in_epoch = 0
+            for micro_idx, (start, end) in enumerate(micro_ranges):
+                group_idx = micro_idx // accum
+                global_group_tokens = (
+                    global_group_token_counts[group_idx]
+                    if global_group_token_counts else 0.0
+                )
+                micro_tokens = micro_token_counts[micro_idx]
+                grad_weight = (
+                    coef * micro_tokens * world_size / global_group_tokens
+                    if global_group_tokens > 0.0 else 0.0
+                )
+                will_step = (
+                    ((n_micro_in_epoch + 1) % accum == 0)
+                    or (micro_idx == n_micros_total - 1)
+                )
                 mb_resp_mask = response_mask[start:end]
                 # Per-microbatch padding trim: shrink R to the longest
                 # actual response in this slice. Mirrors the policy mb
@@ -1324,6 +1364,21 @@ class CASPOTrainer:
                 # short responses.
                 R_eff = int(mb_resp_mask.sum(dim=1).max().item())
                 if R_eff == 0:
+                    n_micro_in_epoch += 1
+                    if will_step:
+                        if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
+                            try:
+                                self._clip_grad_norm(
+                                    self.critic_model,
+                                    self.critic_model.parameters(),
+                                    max_norm=cfg.critic_grad_clip,
+                                )
+                            except Exception:
+                                pass
+                        self.critic_optimizer.step()
+                        if self.critic_lr_scheduler is not None:
+                            self.critic_lr_scheduler.step()
+                        self.critic_optimizer.zero_grad(set_to_none=True)
                     continue
                 mb_resp_mask_eff = mb_resp_mask[:, :R_eff]
                 full_ids = torch.cat(
@@ -1351,14 +1406,14 @@ class CASPOTrainer:
                     crit_values, old_v_mb, ret_mb, mb_resp_mask_eff,
                     cliprange=cliprange,
                 )
-                # value_loss_coef folded into per-mb grad weight; accum
-                # divisor matches the policy loop's pattern so the
-                # effective loss after accumulation = coef * mean.
-                grad_weight = coef / float(accum)
+                # Weight microbatch token means by their valid-token count
+                # inside each accumulation group. This matches the policy
+                # objective and avoids overweighting short responses.
                 (v_loss * grad_weight).backward()
-                v_loss_terms.append(v_loss.detach())
-                n_micro += 1
-                if n_micro % accum == 0:
+                v_loss_terms.append(v_loss.detach() * float(micro_tokens))
+                v_loss_weight_denom += float(micro_tokens)
+                n_micro_in_epoch += 1
+                if will_step:
                     if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
                         try:
                             self._clip_grad_norm(
@@ -1372,25 +1427,9 @@ class CASPOTrainer:
                     if self.critic_lr_scheduler is not None:
                         self.critic_lr_scheduler.step()
                     self.critic_optimizer.zero_grad(set_to_none=True)
-        # Step on any remainder microbatches (n_micro not a multiple of
-        # accum, e.g. small final-step batch).
-        if n_micro % accum != 0:
-            if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
-                try:
-                    self._clip_grad_norm(
-                        self.critic_model,
-                        self.critic_model.parameters(),
-                        max_norm=cfg.critic_grad_clip,
-                    )
-                except Exception:
-                    pass
-            self.critic_optimizer.step()
-            if self.critic_lr_scheduler is not None:
-                self.critic_lr_scheduler.step()
-            self.critic_optimizer.zero_grad(set_to_none=True)
 
         v_loss_mean = (
-            float(torch.stack(v_loss_terms).mean().item())
+            float(torch.stack(v_loss_terms).sum().item() / max(v_loss_weight_denom, 1.0))
             if v_loss_terms
             else 0.0
         )
@@ -1574,6 +1613,16 @@ class CASPOTrainer:
         total_rows = max(1.0, sum(micro_row_counts))
         total_pos_rows = max(1.0, sum(micro_pos_counts))
         total_neg_rows = max(1.0, sum(micro_neg_counts))
+        global_total_rows = total_rows
+        world_size = max(1, int(self.dist.world_size))
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            total_rows_t = torch.tensor(
+                total_rows, device=self.device, dtype=torch.float32,
+            )
+            dist.all_reduce(total_rows_t, op=dist.ReduceOp.SUM)
+            global_total_rows = float(total_rows_t.item())
         out_chunks = []
         agg = {"value_loss": 0.0, "value_acc": 0.0,
                "v_bar_pos": 0.0, "v_bar_neg": 0.0}
@@ -1597,10 +1646,18 @@ class CASPOTrainer:
                     loss_weights=w_slice,
                 )
                 micro_rows = micro_row_counts[micro_idx]
-                weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
-                (v_loss * weight).backward()
-            agg["value_loss"] += v_stats["loss"] * weight
-            agg["value_acc"] += v_stats["acc_at_last"] * weight
+                # Distributed backends average gradients across ranks. Scale
+                # by world_size/global_rows so the effective gradient is a
+                # true row-weighted mean, not an equal average of rank-local
+                # means when response counts differ by rank.
+                grad_weight = (
+                    micro_rows * world_size / global_total_rows
+                    if global_total_rows > 0.0 else 0.0
+                )
+                (v_loss * grad_weight).backward()
+            stat_weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
+            agg["value_loss"] += v_stats["loss"] * stat_weight
+            agg["value_acc"] += v_stats["acc_at_last"] * stat_weight
             agg["v_bar_pos"] += (
                 v_stats["mean_v_bar_pos"]
                 * (micro_pos_counts[micro_idx] / total_pos_rows)
@@ -2306,18 +2363,32 @@ class CASPOTrainer:
             sum(micro_token_counts[i : min(i + accum, n_micros_total)])
             for i in range(0, n_micros_total, accum)
         ]
-        old_logprobs_chunks = [None] * n_micros_total
+        global_group_token_counts = list(group_token_counts)
+        world_size = max(1, int(self.dist.world_size))
+        if self.dist.is_distributed:
+            import torch.distributed as dist
+
+            group_tokens_t = torch.tensor(
+                global_group_token_counts, device=self.device, dtype=torch.float32,
+            )
+            dist.all_reduce(group_tokens_t, op=dist.ReduceOp.SUM)
+            global_group_token_counts = [
+                float(x) for x in group_tokens_t.detach().cpu().tolist()
+            ]
         for epoch in range(n_epochs):
             # Reset accumulator counter so the optimizer step boundary
             # ``n_micro_in_epoch % accum == 0`` is computed within the epoch.
             n_micro_in_epoch = 0
             for micro_idx, (start, end) in enumerate(micro_ranges):
                 group_idx = micro_idx // accum
-                group_tokens = group_token_counts[group_idx] if group_token_counts else 0.0
+                global_group_tokens = (
+                    global_group_token_counts[group_idx]
+                    if global_group_token_counts else 0.0
+                )
                 micro_tokens = micro_token_counts[micro_idx]
                 grad_weight = (
-                    micro_tokens / group_tokens
-                    if group_tokens > 0.0 else 0.0
+                    micro_tokens * world_size / global_group_tokens
+                    if global_group_tokens > 0.0 else 0.0
                 )
                 will_step = ((n_micro_in_epoch + 1) % accum == 0) or (end == B)
                 # Per-microbatch padding trim: MATH responses average ~600
@@ -2338,25 +2409,7 @@ class CASPOTrainer:
                         tiled_prompt_ids[start:end], tiled_prompt_mask[start:end],
                         mb_resp_ids, mb_resp_mask,
                     )
-                    if epoch == 0:
-                        # Freeze π_old from this microbatch's forward. At
-                        # epoch 0 the policy hasn't moved yet, so by
-                        # construction ``ratio = exp(new - old) == 1``
-                        # exactly here — the PPO clip term reduces to
-                        # ``-A`` (unclipped surrogate). Subsequent epochs
-                        # read this slice unmodified. Cached at R_eff; the
-                        # trim is deterministic from response_mask which is
-                        # frozen across epochs, so R_eff is identical
-                        # epoch-to-epoch and the cached shape stays valid.
-                        old_lp = new_logprobs.detach()
-                        old_logprobs_chunks[micro_idx] = old_lp
-                    else:
-                        cached = old_logprobs_chunks[micro_idx]
-                        assert cached is not None, (
-                            f"missing cached old_logprobs for microbatch "
-                            f"{micro_idx} at epoch {epoch}"
-                        )
-                        old_lp = cached
+                    old_lp = old_logprobs_full[start:end, :R_eff]
                     adv = token_advantage[start:end, :R_eff]
 
                     ref_lp = (
@@ -2473,13 +2526,13 @@ class CASPOTrainer:
         # weight sync OOMs colocated vLLM. Saves 200–800 MB / rank in our
         # measurements (caspo trainer wave 4, 2026-04-27).
         del loss_terms, pg_terms, logp_terms, clip_terms, ratio_terms, kl_terms
-        # ref_logprobs_full / old_logprobs_chunks may not exist on every
+        # ref_logprobs_full / old_logprobs_full may not exist on every
         # branch (no-ref-policy GRPO, first-epoch caspo). Use locals()
         # rather than dir() — dir() in a method returns instance attrs,
         # not the function's locals.
         _locals = locals()
-        if "old_logprobs_chunks" in _locals:
-            del old_logprobs_chunks
+        if "old_logprobs_full" in _locals:
+            del old_logprobs_full
         if "ref_logprobs_full" in _locals:
             del ref_logprobs_full
         del _locals
@@ -2827,7 +2880,7 @@ class CASPOTrainer:
 
         log_path = os.path.join(ckpt_path, "periodic_eval.log")
         cmd = [
-            "python", "-u", eval_script,
+            sys.executable, "-u", eval_script,
             "--config", config_path,
             "--override", f"model_name_or_path={ckpt_path}",
             "--benchmarks", str(cfg.eval_during_training_benchmarks),

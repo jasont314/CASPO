@@ -196,11 +196,11 @@ write_pids_json
 trainer_log_for() {
     local method="$1"
     case "$method" in
-        grpo|ppo|caspo|caspo_prob|caspo_logprob|caspo_frozen_rm)
+        grpo|ppo_critic|caspo|caspo_prob|caspo_logprob|caspo_frozen_rm)
             local tag
             case "$method" in
                 grpo)             tag="grpo" ;;
-                ppo)              tag="ppo" ;;
+                ppo_critic)       tag="ppo_critic" ;;
                 caspo)            tag="caspo" ;;
                 caspo_prob)       tag="caspo_delta_prob" ;;
                 caspo_logprob)    tag="caspo_delta_log_prob" ;;

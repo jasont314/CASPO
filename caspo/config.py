@@ -37,7 +37,10 @@ _FLOAT_FIELDS: tuple[str, ...] = (
     "rollout_temperature", "rollout_top_p",
     "gamma", "advantage_clip",
     "clip_eps_low", "clip_eps_high", "kl_coef",
+    "critic_lr", "critic_weight_decay", "critic_grad_clip",
+    "value_loss_coef", "cliprange_value", "ppo_gae_lambda",
     "lr", "weight_decay", "grad_clip",
+    "eval_during_training_temperature", "eval_during_training_vllm_util",
     "vllm_gpu_memory_utilization",
 )
 
@@ -79,6 +82,7 @@ _BOOL_FIELDS: tuple[str, ...] = (
     "vllm_return_logprobs", "vllm_enable_chunked_prefill",
     "wandb_enabled",
     "compile", "use_gradient_checkpointing",
+    "critic_share_fsdp_policy",
     "fsdp_auto_wrap", "fsdp_use_orig_params", "fsdp_cpu_offload",
     "fsdp_forward_prefetch", "fsdp_limit_all_gathers",
 )
@@ -757,6 +761,8 @@ class CASPOConfig:
             raise ValueError(
                 f"online_value_lr must be >= 0, got {self.online_value_lr}"
             )
+        if self.critic_lr < 0.0:
+            raise ValueError(f"critic_lr must be >= 0, got {self.critic_lr}")
         if self.weight_decay < 0.0:
             raise ValueError(
                 f"weight_decay must be >= 0, got {self.weight_decay}"
@@ -765,6 +771,11 @@ class CASPOConfig:
             raise ValueError(
                 f"value_weight_decay must be >= 0, "
                 f"got {self.value_weight_decay}"
+            )
+        if self.critic_weight_decay < 0.0:
+            raise ValueError(
+                f"critic_weight_decay must be >= 0, "
+                f"got {self.critic_weight_decay}"
             )
         # IPVRM β rescales log-ratios into the BCE; 0 collapses V to 0
         # everywhere, negative β sign-inverts the value head.
@@ -787,6 +798,42 @@ class CASPOConfig:
             raise ValueError(
                 f"value_grad_clip must be >= 0 (0 disables), "
                 f"got {self.value_grad_clip}"
+            )
+        if self.critic_grad_clip < 0.0:
+            raise ValueError(
+                f"critic_grad_clip must be >= 0 (0 disables), "
+                f"got {self.critic_grad_clip}"
+            )
+        if self.value_loss_coef < 0.0:
+            raise ValueError(
+                f"value_loss_coef must be >= 0, got {self.value_loss_coef}"
+            )
+        if self.cliprange_value < 0.0:
+            raise ValueError(
+                f"cliprange_value must be >= 0, got {self.cliprange_value}"
+            )
+        if not (0.0 <= self.ppo_gae_lambda <= 1.0):
+            raise ValueError(
+                f"ppo_gae_lambda must be in [0, 1], got {self.ppo_gae_lambda}"
+            )
+        if self.eval_during_training_k < 1:
+            raise ValueError(
+                f"eval_during_training_k must be >= 1, got {self.eval_during_training_k}"
+            )
+        if self.eval_during_training_limit < 0:
+            raise ValueError(
+                "eval_during_training_limit must be >= 0 "
+                f"(0 means no explicit cap), got {self.eval_during_training_limit}"
+            )
+        if self.eval_during_training_temperature < 0.0:
+            raise ValueError(
+                "eval_during_training_temperature must be >= 0, got "
+                f"{self.eval_during_training_temperature}"
+            )
+        if not (0.0 < self.eval_during_training_vllm_util <= 1.0):
+            raise ValueError(
+                "eval_during_training_vllm_util must be in (0, 1], got "
+                f"{self.eval_during_training_vllm_util}"
             )
         if self.vllm_max_num_seqs is not None and self.vllm_max_num_seqs < 1:
             raise ValueError(

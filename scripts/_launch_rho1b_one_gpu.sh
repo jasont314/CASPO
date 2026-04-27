@@ -102,6 +102,7 @@ COMMON_OVERRIDES=(
     --override "reward_workers=${CASPO_REWARD_WORKERS}"
     --override "compile=${CASPO_COMPILE}"
     --override "save_every=${SAVE_EVERY:-250}"
+    --override "eval_every=${EVAL_EVERY:-${SAVE_EVERY:-250}}"
     --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
     --override "output_dir=${OUTDIR}"

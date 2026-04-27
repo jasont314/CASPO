@@ -113,6 +113,7 @@ OVERRIDES=(
     --override "prompts_per_step=${PROMPTS_PER_STEP_VAL}"
     --override "reward_workers=${CASPO_REWARD_WORKERS}"
     --override "save_every=${SAVE_EVERY:-250}"
+    --override "eval_every=${EVAL_EVERY:-${SAVE_EVERY:-250}}"
     --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-7b-math}"
     --override "output_dir=${ROOT}/deepseekmath7b_math_${RUN_METHOD_TAG}${RUN_TAG:+_${RUN_TAG}}"

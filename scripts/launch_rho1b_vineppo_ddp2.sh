@@ -12,8 +12,10 @@
 # rank-local device as the trainer, while torch.distributed still connects
 # both ranks through the shared MASTER_ADDR/MASTER_PORT rendezvous.
 #
-# Defaults preserve the paper-faithful global batch:
-#   2 ranks x 32 prompts/rank x G=8 = 512 responses/global outer step
+# Defaults preserve the paper-faithful global batch. The trainer interprets
+# prompts_per_step as a GLOBAL count, so PROMPTS_PER_STEP=64 becomes
+# 32 prompts/rank at world_size=2:
+#   64 global prompts x G=8 = 512 responses/global outer step
 #   2 ranks x grad_accum_steps=8 x micro_batch_size=4 = 64-response global PPO minibatch
 #
 # Usage:
@@ -66,7 +68,7 @@ OUTDIR="$ROOT/caspo_rho1b_math_${METHOD_TAG}${RUN_SUFFIX}"
 LOG0="$LOGDIR/phase2_${METHOD_TAG}_rank0.log"
 LOG1="$LOGDIR/phase2_${METHOD_TAG}_rank1.log"
 
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-32}"
+PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-64}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
@@ -108,6 +110,7 @@ OVERRIDES=(
     --override "reward_workers=${CASPO_REWARD_WORKERS}"
     --override "compile=${CASPO_COMPILE}"
     --override "save_every=${SAVE_EVERY:-250}"
+    --override "eval_every=${EVAL_EVERY:-${SAVE_EVERY:-250}}"
     --override "wandb_mode=${WANDB_MODE:-offline}"
     --override "wandb_project=${WANDB_PROJECT:-caspo-rho1b-math}"
     --override "output_dir=${OUTDIR}"
