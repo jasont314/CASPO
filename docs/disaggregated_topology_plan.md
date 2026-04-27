@@ -321,10 +321,50 @@ launcher to TP=4 + NCCL packed** as the VinePPO production path.
 | Topology | Sync | Steady t_step | Notes |
 |---|---|---:|---|
 | Colocated TP=1 (8-GPU) | ipc | 338s | original |
-| Disagg FSDP=4 + TP=4 | nccl packed | **277s** | **production** |
-| Colocated TP=8 + IPC | ipc multirank | 1700+s | rejected for VinePPO |
+| Disagg FSDP=4 + TP=4 | nccl packed | 277s | Phase 5b |
+| Disagg + fp8 KV | nccl packed | 268s | iter 1 |
+| Disagg + reward_workers=16 | nccl packed | 245s | iter 3 |
+| **Disagg + max_num_seqs=2048** | **nccl packed** | **242s** | **production** |
+| Colocated TP=8 + IPC | ipc multirank | 1700+s | Phase F: rejected |
 
-Wall-clock for 1000-step VinePPO 7B run: ~77 hours at 277 s/step.
+Wall-clock for 1000-step VinePPO 7B run: **~67 hours at 242 s/step**.
+
+### Speed-iter 5 (async MC overlap) — deferred
+
+Sequential dependency in step():
+
+  rollout (rank 0, vLLM) → ref_forward (trainer FSDP collective) →
+  MC value pass (rank 0, vLLM, ~190 s) → policy mb loop (FSDP)
+
+Theoretically, ref_forward (~5 s) and the start of policy epoch-0
+forward (~16 s) run on trainer GPUs (0-3) and don't depend on MC
+output, so they could overlap with MC pass running on rollout GPUs
+(4-7). Maximum achievable savings: **~20 s/step (~8%)**.
+
+Implementation requires:
+
+1. ``sample_with_prefix_dispatch(...)`` that submits to vLLM via
+   ``engine.generate`` (async generator) without awaiting, returns
+   a handle.
+2. ``sample_with_prefix_collect(handle)`` that awaits the
+   generators and returns results.
+3. Trainer hoists MC dispatch BEFORE ref_forward, awaits AFTER.
+
+**Skipped because:**
+
+* The proxy's ``sample_with_prefix`` does a ``dist.gather_object``
+  collective at entry; running it from a non-main thread risks
+  conflicting with the trainer's FSDP NCCL group (which is also
+  using the same ProcessGroup). Mixing NCCL ops from multiple
+  threads on one PG is a known footgun.
+* ~20 s win for ~3-4 hours of careful threaded-asyncio +
+  NCCL-thread-safety work is a poor ROI given the 28% cumulative
+  win already achieved across iters 1-4.
+
+If/when we revisit, the cleanest implementation is a dedicated
+asyncio-loop background thread for vLLM that the main thread
+hands work to via ``asyncio.run_coroutine_threadsafe``. That
+keeps NCCL on the main thread and asyncio strictly off it.
 
 ### Phase 6 (deferred): port to GRPO/PPO/CASPO
 
