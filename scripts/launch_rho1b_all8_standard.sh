@@ -148,7 +148,7 @@ if [[ -n "${PYTHON_BIN:-}" ]]; then
 fi
 
 launch_job grpo            "${GPUS[0]}"                 env "${COMMON_ENV[@]}" "GPU=${GPUS[0]}"                       ./scripts/launch_rho1b_grpo.sh
-launch_job ppo             "${GPUS[1]}"                 env "${COMMON_ENV[@]}" "GPU=${GPUS[1]}"                       ./scripts/launch_rho1b_ppo.sh
+launch_job ppo_critic      "${GPUS[1]}"                 env "${COMMON_ENV[@]}" "GPU=${GPUS[1]}"                       ./scripts/launch_rho1b_ppo_critic.sh
 launch_job vineppo_ddp2    "${GPUS[2]},${GPUS[3]}"      env "${COMMON_ENV[@]}" "GPU_LIST=${GPUS[2]} ${GPUS[3]}"       ./scripts/launch_rho1b_vineppo_ddp2.sh
 launch_job caspo           "${GPUS[4]}"                 env "${COMMON_ENV[@]}" "GPU=${GPUS[4]}"                       ./scripts/launch_rho1b_caspo.sh
 launch_job caspo_prob      "${GPUS[5]}"                 env "${COMMON_ENV[@]}" "GPU=${GPUS[5]}"                       ./scripts/launch_rho1b_caspo_delta_prob.sh

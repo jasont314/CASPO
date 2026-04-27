@@ -317,6 +317,29 @@ class VLLMRolloutEngine:
                 engine_kwargs["disable_custom_all_reduce"] = True
             if max_num_seqs is not None:
                 engine_kwargs["max_num_seqs"] = int(max_num_seqs)
+            # Trim CUDA-graph capture set: vLLM v1 default captures ~256 shapes
+            # (= 2 * max_num_seqs) plus piecewise prefill graphs. Each captured
+            # shape on a 7B model holds 5–15 MB of static workspace per worker;
+            # together they consume 150–300 MB / rank that we can free at near-
+            # zero speed cost for our pattern. RL rollouts are decode-bound; we
+            # only need a sparse log-spaced capture set up to max_num_seqs, and
+            # FULL_DECODE_ONLY drops the piecewise prefill graphs whose memory
+            # vLLM itself documents as the largest contributor. Gated off via
+            # CASPO_VLLM_CUDAGRAPH_TRIM=0 if a regression is suspected.
+            if (
+                not enforce_eager
+                and os.environ.get(
+                    "CASPO_VLLM_CUDAGRAPH_TRIM", "1"
+                ) in ("1", "true", "True")
+            ):
+                _ms = int(max_num_seqs) if max_num_seqs is not None else 256
+                _sizes = sorted({
+                    s for s in (1, 2, 4, 8, 16, 32, 64, 128, 256, _ms) if s <= _ms
+                })
+                engine_kwargs["compilation_config"] = {
+                    "cudagraph_capture_sizes": _sizes,
+                    "cudagraph_mode": "FULL_DECODE_ONLY",
+                }
             # Chunked prefill default: OFF for rollout. Verified empirically
             # (Apr 2026) that VinePPO K=9 MC rollouts regress ~70% (191s ->
             # 321s/step) when chunked_prefill is forced on, because mixed

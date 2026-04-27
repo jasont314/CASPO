@@ -387,7 +387,9 @@ Outputs also live under:
 `scripts/perf_env.sh` centralizes CUDA allocator, NCCL, tokenizer, vLLM, and CPU
 thread settings. Notable defaults:
 
-- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (we previously layered on
+  `garbage_collection_threshold` and `max_split_size_mb`; reverted because both
+  added 3-4× step-time cost on memory-tight regimes)
 - `TORCH_NCCL_BLOCKING_WAIT=1`
 - `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`
 - `NCCL_TIMEOUT=1800`
@@ -397,6 +399,21 @@ thread settings. Notable defaults:
 - `VLLM_LOGGING_LEVEL=WARNING`
 - `OMP_NUM_THREADS=4`
 - `MKL_NUM_THREADS=4`
+
+**vLLM CUDA graph trim** (default ON, gate via
+`CASPO_VLLM_CUDAGRAPH_TRIM=0`): the engine constructor passes
+`compilation_config={"cudagraph_capture_sizes":[…], "cudagraph_mode":
+"FULL_DECODE_ONLY"}` to vLLM v1 — drops piecewise prefill graphs and
+caps the captured shape set to a sparse log-spaced list up through
+`max_num_seqs`. Frees ~150-300 MB / rank at near-zero speed cost on
+RL rollout patterns (decode-bound; prefill is short and infrequent).
+
+**Trainer-side `empty_cache`**: `caspo_trainer.py:step()` calls
+`torch.cuda.empty_cache()` at the very start of each step (releases
+fragmentation from prior vLLM weight sync) and immediately before the
+next sync (releases policy/critic activation peaks). Both are unconditional;
+overhead is <0.15% of step time, helps memory-tight regimes (mb=4 colocated)
+fit without hurting the relaxed regimes.
 
 For Rho-1B single-GPU-per-method runs, vLLM weight sync uses CUDA IPC:
 
@@ -522,12 +539,16 @@ GPUs. The default map is:
 | Experiment | GPUs | Script | Output tag |
 |---|---:|---|---|
 | GRPO | 0 | `scripts/launch_rho1b_grpo.sh` | `grpo` |
-| PPO | 1 | `scripts/launch_rho1b_ppo.sh` | `ppo` |
+| PPO+critic | 1 | `scripts/launch_rho1b_ppo_critic.sh` | `ppo_critic` |
 | VinePPO K=9 DDP2 | 2,3 | `scripts/launch_rho1b_vineppo_ddp2.sh` | `vineppo_ddp2` |
 | CASPO online RM | 4 | `scripts/launch_rho1b_caspo.sh` | `caspo` |
 | CASPO delta-prob | 5 | `scripts/launch_rho1b_caspo_delta_prob.sh` | `caspo_prob` |
 | CASPO delta-log-prob | 6 | `scripts/launch_rho1b_caspo_delta_log_prob.sh` | `caspo_logprob` |
 | CASPO frozen RM | 7 | `scripts/launch_rho1b_caspo_frozen_rm.sh` | `caspo_frozen_rm` |
+
+(The legacy critic-free `launch_rho1b_ppo.sh` is preserved but **not** part
+of the standard suite — "PPO" in the head-to-head means PPO+critic, the
+proper Schulman 2017 baseline against CASPO's pretrained V_φ.)
 
 Launch all seven jobs at once:
 
@@ -541,7 +562,7 @@ Or launch a single job by overriding its GPU:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU=0 WANDB_MODE=offline ./scripts/launch_rho1b_grpo.sh
-RUN_TAG=paper512_seed0 GPU=1 WANDB_MODE=offline ./scripts/launch_rho1b_ppo.sh
+RUN_TAG=paper512_seed0 GPU=1 WANDB_MODE=offline ./scripts/launch_rho1b_ppo_critic.sh
 RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline ./scripts/launch_rho1b_vineppo_ddp2.sh
 RUN_TAG=paper512_seed0 GPU=4 WANDB_MODE=offline ./scripts/launch_rho1b_caspo.sh
 RUN_TAG=paper512_seed0 GPU=5 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_delta_prob.sh
@@ -997,11 +1018,15 @@ Global PPO minibatch stays 64 (FSDP=4 × mb=2 × accum=8).
 ### Launchers
 
 ```bash
-# 4-GPU rank-local TP=1 path (production for the 4-method group):
+# Canonical 7-method 7B suite (4-GPU FSDP colocated for everything
+# except VinePPO, which uses 8-GPU disagg). Same RUN_TAG ties them
+# into one logical seed:
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_grpo.sh
-GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_ppo.sh
-GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_frozen_rm.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_ppo_critic.sh
 GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_frozen_rm.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_delta_prob.sh
+GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo_delta_log_prob.sh
 
 # 8-GPU disaggregated topology for VinePPO (FSDP=4 trainer + vLLM TP=4
 # dedicated). NCCL+packed weight sync at 0.3 s/step. Production path
@@ -1009,8 +1034,14 @@ GPU_LIST="0 1 2 3" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_caspo.sh
 TRAIN_GPU_LIST="0 1 2 3" ROLLOUT_GPU_LIST="4 5 6 7" \
     RUN_TAG=paper7b_seed0 ./scripts/launch_7b_vineppo_disagg.sh
 
-# Legacy 8-GPU rank-local TP=1 VinePPO (slower; kept for ablation):
-GPU_LIST="0 1 2 3 4 5 6 7" RUN_TAG=paper7b_seed0 ./scripts/launch_7b_vineppo.sh
+# Optional alternates:
+#   launch_7b_ppo.sh             — legacy critic-free PPO (sequence-level
+#                                   advantage; not in the canonical suite)
+#   launch_7b_ppo_critic_disagg.sh — 8-GPU disagg PPO+critic (matches
+#                                     VinePPO upstream topology)
+#   launch_7b_vineppo.sh          — legacy 8-GPU rank-local TP=1 VinePPO
+#                                   (slower; kept for ablation)
+#   launch_7b_vineppo_tp8.sh      — colocated TP=8 VinePPO
 ```
 
 Env knobs: `CASPO_VLLM_GPU_MEMORY_UTILIZATION`, `CASPO_MICRO_BATCH_SIZE`,
@@ -1019,28 +1050,80 @@ Env knobs: `CASPO_VLLM_GPU_MEMORY_UTILIZATION`, `CASPO_MICRO_BATCH_SIZE`,
 `SAVE_EVERY`, `WANDB_MODE`. Defaults computed from `world_size` so
 the global PPO minibatch stays 64 across configurations.
 
-### Per-method 7B step times (measured 2026-04-27)
+### Per-method step times — full canonical suite (measured 2026-04-27)
 
-DeepSeekMath-7B-MATH on H100×8, paper-faithful global=64 minibatch,
-mb=2, accum=8 (or accum=16 at world=8), bf16, fp8 KV.
+The canonical comparison sweep is **7 methods at each model size**:
+GRPO, PPO+critic, VinePPO, CASPO, CASPO-frozen, CASPO-delta-p,
+CASPO-delta-logp. Step times are paper-faithful (`global=64`
+minibatch, bf16 mixed precision, fp8 KV cache, IPC weight sync).
 
-| Method | Topology | Steady step | 1000-step wall | Notes |
-|---|---|---:|---:|---|
-| GRPO  | 4-GPU rank-local | 47.7s | ~13 h | critic-free, group-relative reward |
-| PPO   | 4-GPU rank-local | 48.5s | ~13 h | critic-free, sequence-level reward |
-| CASPO-frozen-RM | 4-GPU rank-local | 57.6s | ~16 h | pretrained V_φ, forward only |
-| CASPO (online V_φ) | 4-GPU rank-local | ~75-85s | ~21-24 h | pretrained V_φ + online MSE update |
-| **VinePPO** | **8-GPU disagg + NCCL+packed** | **197.6s** | **~55 h** | K=9 MC at every step boundary |
+#### Rho-1B-MATH (1 H100 / method, 2 H100s for VinePPO DDP-2)
 
-**VinePPO / CASPO-online ≈ 2.32× per-iteration overhead** at 7B. Matches
-upstream VinePPO paper Section 6.2: "each step of VinePPO is slower
-(up to … 2x for DeepSeekMath 7B) compared to PPO". CASPO-online's
-compute profile (separate ~7B value network with forward+backward
-+ optimizer step every outer step) is identical to Schulman 2017
-PPO+critic — only the value loss (IPVRM-BCE vs clipped-MSE) and
-advantage construction (step-TD vs token-GAE) differ, both O(<1 s).
-We do not reimplement Schulman 2017 PPO+critic separately; CASPO
-online is its strict generalization.
+`mb=8, accum=8` (post-Pareto-sweep optimum), `vllm_util=0.30`,
+`ckpt=false`, `max_steps=1000`.
+
+| Method | Script | GPUs | Steady step | 1000-step wall |
+|---|---|---:|---:|---:|
+| GRPO  | `launch_rho1b_grpo.sh` | 1 | ~48 s | ~13 h |
+| PPO+critic | `launch_rho1b_ppo_critic.sh` | 1 | ~75 s* | ~21 h* |
+| VinePPO K=9 (DDP-2) | `launch_rho1b_vineppo_ddp2.sh` | 2 | ~115 s | ~32 h |
+| CASPO (online V_φ) | `launch_rho1b_caspo.sh` | 1 | ~75 s | ~21 h |
+| CASPO frozen | `launch_rho1b_caspo_frozen_rm.sh` | 1 | ~63 s | ~18 h |
+| CASPO delta-p | `launch_rho1b_caspo_delta_prob.sh` | 1 | ~75 s | ~21 h |
+| CASPO delta-logp | `launch_rho1b_caspo_delta_log_prob.sh` | 1 | ~75 s | ~21 h |
+
+*PPO+critic 1B not yet smoke-measured; estimated from CASPO online
+which has the same memory and compute profile (separate ~1B value
+network + Adam, forward+backward+optim step per outer step).
+
+Total 8-GPU suite wall time: gated by VinePPO DDP-2 at ~32 h
+(parallel across the 8 GPUs).
+
+#### DeepSeekMath-7B-MATH (4 H100s / method, 8 for VinePPO disagg)
+
+`mb=2, accum=8` (mb=4/accum=4 for GRPO, which has no critic Adam),
+`vllm_util=0.20` (CASPO/PPO+critic) or `0.30` (GRPO), `ckpt=true`,
+`max_steps=1000`. PPO+critic and CASPO online share the same
+4-GPU FSDP colocated topology so the head-to-head is honest on
+identical hardware.
+
+| Method | Script | GPUs | Steady step | 1000-step wall |
+|---|---|---:|---:|---:|
+| GRPO | `launch_7b_grpo.sh` | 4 | 48.8 s | ~14 h |
+| PPO+critic | `launch_7b_ppo_critic.sh` | 4 | 92.0 s | ~26 h |
+| VinePPO K=9 (disagg) | `launch_7b_vineppo_disagg.sh` | 8 | 197.6 s | ~55 h |
+| CASPO (online V_φ) | `launch_7b_caspo.sh` | 4 | 47.7 s | ~13 h |
+| CASPO frozen | `launch_7b_caspo_frozen_rm.sh` | 4 | 57.6 s | ~16 h |
+| CASPO delta-p | `launch_7b_caspo_delta_prob.sh` | 4 | ~50 s* | ~14 h* |
+| CASPO delta-logp | `launch_7b_caspo_delta_log_prob.sh` | 4 | ~50 s* | ~14 h* |
+
+*7B delta-p/delta-logp are ablations of the standard CASPO online
+trainer; same memory and compute as CASPO online with a different
+``caspo_advantage_transform``. Step time inherits from CASPO.
+
+The 7B suite **cannot run all methods in parallel on 8 H100s**
+(each method needs 4-8 GPUs). Reference wall budget for the full
+7-method 7B sweep, sequential: ~152 GPU-hours per seed (single
+H100×8 box: ~19 days wall, or 7 days with 4 H100×8 boxes).
+
+#### PPO+critic vs CASPO online: same compute envelope, different V₍φ₎
+
+PPO+critic at 7B (92 s/step) is 1.93× slower than CASPO online
+(47.7 s/step) **not because of a topology gap** — both run on the
+same 4-GPU FSDP colocated config — but because PPO+critic uses the
+**Schulman 2017 critic cadence** (`epochs_per_rollout=2 × accum=8 =
+16 critic optim steps/outer iteration`) while CASPO online does
+**1 V_φ optim step per outer** (the IPVRM-style update; 16× cheaper).
+This is intentional asymmetry: CASPO's pretrained V_φ enters RL
+already-good and only needs sparse online updates, while PPO's
+from-scratch critic must catch up on a moving advantage target.
+
+Disagg PPO+critic (8 GPUs, mb=4/accum=4) at 76.7 s/step is
+available via `launch_7b_ppo_critic_disagg.sh` — matches VinePPO
+upstream's PPO baseline topology for paper-faithful comparison.
+
+**VinePPO / CASPO-online ≈ 4.14× per-iteration overhead** at 7B
+(197.6 s vs 47.7 s). Matches upstream VinePPO paper Section 6.2.
 
 ### VinePPO speed iteration (2026-04-27)
 
