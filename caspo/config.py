@@ -62,7 +62,7 @@ _LITERAL_CHECKS: dict[str, tuple[str, ...]] = {
     "fsdp_backward_prefetch": ("backward_pre", "backward_post", "none"),
     "activation_checkpointing_mode": ("off", "full", "selective"),
     "vllm_multi_sample_mode": ("auto", "expanded", "batched"),
-    "vllm_weight_sync_backend": ("checkpoint", "ipc"),
+    "vllm_weight_sync_backend": ("checkpoint", "ipc", "nccl"),
     # vllm_kv_cache_dtype is Optional — None means "auto" (vLLM default).
     # Validated below in __post_init__ rather than via the curated table so
     # we keep None passthrough.
@@ -286,7 +286,25 @@ class CASPOConfig:
     # "checkpoint": save_pretrained() to disk, then vLLM reload_weights().
     # "ipc": use vLLM's CUDA-IPC RL weight-transfer API. IPC is single-node and
     # requires trainer and vLLM engine to live on the same physical GPU.
-    vllm_weight_sync_backend: Literal["checkpoint", "ipc"] = "checkpoint"
+    # "nccl": vLLM's NCCL weight-transfer backend. Required for the
+    # disaggregated topology where trainer and vLLM live on disjoint GPU
+    # sets — IPC handles can't span physical GPUs. The trainer side opens a
+    # side PyNcclCommunicator group with the vLLM workers and broadcasts
+    # weights through it once per outer step.
+    vllm_weight_sync_backend: Literal["checkpoint", "ipc", "nccl"] = "checkpoint"
+    # Disaggregated rollout: trainer ranks live on one GPU set, vLLM
+    # AsyncLLM(tensor_parallel_size=N) lives on a disjoint set. Only rank
+    # 0 of the trainer instantiates the engine; other ranks gather their
+    # examples to rank 0 before sample(), and rank 0 scatters back.
+    # Memory layout: trainer GPUs hold FSDP-sharded params + activations
+    # only (no colocated vLLM); rollout GPUs hold TP-sharded vLLM only
+    # (so vllm_gpu_memory_utilization can rise to ~0.85 vs 0.30 for
+    # colocated). See docs/disaggregated_topology_plan.md.
+    vllm_disaggregated: bool = False
+    # vLLM tensor-parallel size when disaggregated. Validated against
+    # rollout-GPU count by the launcher (each TP rank pins one GPU).
+    # Has no effect when vllm_disaggregated=False.
+    vllm_disaggregated_tp: int = 1
     # If True, skip the initial sync from disk (use SFT init, faster startup
     # for the very first iter).
     # NOTE: not currently consumed — VLLMRolloutEngine always inits from
@@ -534,6 +552,54 @@ class CASPOConfig:
                     "vllm_tensor_parallel_size=1 so trainer and vLLM share one "
                     "physical GPU."
                 )
+            if self.vllm_disaggregated:
+                raise ValueError(
+                    "vllm_weight_sync_backend='ipc' cannot be combined with "
+                    "vllm_disaggregated=True; IPC handles cannot span the "
+                    "physical-GPU boundary between trainer ranks and the "
+                    "dedicated rollout GPUs. Use 'nccl' or 'checkpoint'."
+                )
+        # Disaggregated topology validations
+        if self.vllm_disaggregated:
+            if self.vllm_disaggregated_tp < 1:
+                raise ValueError(
+                    f"vllm_disaggregated_tp must be >= 1, "
+                    f"got {self.vllm_disaggregated_tp}"
+                )
+            if self.rollout_backend != "vllm":
+                raise ValueError(
+                    "vllm_disaggregated=True requires rollout_backend='vllm'"
+                )
+            if self.distributed_backend != "fsdp":
+                raise ValueError(
+                    "vllm_disaggregated=True is only validated against "
+                    f"distributed_backend='fsdp', got "
+                    f"{self.distributed_backend!r}"
+                )
+            if self.vllm_weight_sync_backend not in ("nccl", "checkpoint"):
+                raise ValueError(
+                    f"vllm_disaggregated=True requires "
+                    f"vllm_weight_sync_backend in {{'nccl','checkpoint'}}, "
+                    f"got {self.vllm_weight_sync_backend!r} (IPC cannot span "
+                    f"physical GPUs)."
+                )
+            # vllm_tensor_parallel_size on the trainer-side cfg is ignored
+            # under disaggregation — TP belongs to the rollout engine and is
+            # carried by vllm_disaggregated_tp instead. Reject the redundant
+            # combo to keep launcher logic unambiguous.
+            if self.vllm_tensor_parallel_size != 1:
+                raise ValueError(
+                    "Under vllm_disaggregated=True the trainer-side cfg "
+                    "must keep vllm_tensor_parallel_size=1; the rollout "
+                    "engine's TP size is set by vllm_disaggregated_tp "
+                    f"(here: {self.vllm_disaggregated_tp})."
+                )
+        elif self.vllm_disaggregated_tp != 1:
+            raise ValueError(
+                "vllm_disaggregated_tp != 1 only makes sense with "
+                "vllm_disaggregated=True; set vllm_disaggregated=True or "
+                "leave vllm_disaggregated_tp=1 (default)."
+            )
         # Optional Literal["bfloat16", "float16", "float32"] — None passthrough
         # means "match torch_dtype". Anything else is rejected.
         if self.fsdp_reduce_dtype is not None and self.fsdp_reduce_dtype not in (
