@@ -554,23 +554,73 @@ class CASPOTrainer:
                         "(for example scripts/launch_rho1b_vineppo_ddp2.sh); "
                         f"torch.cuda.device_count()={visible_cuda_devices}."
                     )
-            engine_kwargs = dict(
-                gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-                tensor_parallel_size=cfg.vllm_tensor_parallel_size,
-                enforce_eager=cfg.vllm_enforce_eager,
-                seed=cfg.seed,
-                max_num_seqs=cfg.vllm_max_num_seqs,
-                max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
-                max_inflight_requests=cfg.vllm_max_inflight_requests,
-                enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
-                gpu_id=(
-                    self.dist.local_rank
-                    if self.dist.is_distributed
-                    and cfg.vllm_tensor_parallel_size == 1
-                    else None
-                ),
-            )
-            self.sampler = build_rollout_engine(cfg, self.reward_fn, **engine_kwargs)
+            # Disaggregated topology: only trainer rank 0 holds the real
+            # VLLMRolloutEngine. The engine spawns vllm_disaggregated_tp
+            # worker subprocesses pinned to the rollout GPUs (whose
+            # physical IDs are passed in via CASPO_ROLLOUT_GPU_PHYSICAL_IDS
+            # by the disaggregated launcher). Other ranks wrap a
+            # ``DisaggregatedSamplerProxy`` so generation calls go through
+            # rank 0 via gather/scatter.
+            if cfg.vllm_disaggregated:
+                from caspo.rollout.disagg import DisaggregatedSamplerProxy
+
+                if self.dist.is_main:
+                    rollout_ids_env = os.environ.get(
+                        "CASPO_ROLLOUT_GPU_PHYSICAL_IDS", ""
+                    ).strip()
+                    if not rollout_ids_env:
+                        raise RuntimeError(
+                            "vllm_disaggregated=True requires the launcher to "
+                            "set CASPO_ROLLOUT_GPU_PHYSICAL_IDS=<csv list> for "
+                            "rank 0 (see scripts/_launch_7b_disagg.sh)."
+                        )
+                    rollout_ids = [int(s) for s in rollout_ids_env.split(",") if s.strip()]
+                    if len(rollout_ids) != int(cfg.vllm_disaggregated_tp):
+                        raise RuntimeError(
+                            f"CASPO_ROLLOUT_GPU_PHYSICAL_IDS has "
+                            f"{len(rollout_ids)} GPU(s) but "
+                            f"vllm_disaggregated_tp={cfg.vllm_disaggregated_tp}; "
+                            f"the launcher must keep them in sync."
+                        )
+                    inner_kwargs = dict(
+                        gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+                        tensor_parallel_size=int(cfg.vllm_disaggregated_tp),
+                        enforce_eager=cfg.vllm_enforce_eager,
+                        seed=cfg.seed,
+                        max_num_seqs=cfg.vllm_max_num_seqs,
+                        max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+                        max_inflight_requests=cfg.vllm_max_inflight_requests,
+                        enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
+                        # Tell the engine: bind to these PHYSICAL GPU IDs as
+                        # a contiguous TP group. The engine handles the
+                        # CUDA_VISIBLE_DEVICES gymnastics so that AsyncLLM
+                        # workers see them as cuda:0..cuda:N-1.
+                        gpu_ids=rollout_ids,
+                    )
+                    inner = build_rollout_engine(
+                        cfg, self.reward_fn, **inner_kwargs,
+                    )
+                else:
+                    inner = None
+                self.sampler = DisaggregatedSamplerProxy(inner, self.dist)
+            else:
+                engine_kwargs = dict(
+                    gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+                    tensor_parallel_size=cfg.vllm_tensor_parallel_size,
+                    enforce_eager=cfg.vllm_enforce_eager,
+                    seed=cfg.seed,
+                    max_num_seqs=cfg.vllm_max_num_seqs,
+                    max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+                    max_inflight_requests=cfg.vllm_max_inflight_requests,
+                    enable_chunked_prefill=bool(cfg.vllm_enable_chunked_prefill),
+                    gpu_id=(
+                        self.dist.local_rank
+                        if self.dist.is_distributed
+                        and cfg.vllm_tensor_parallel_size == 1
+                        else None
+                    ),
+                )
+                self.sampler = build_rollout_engine(cfg, self.reward_fn, **engine_kwargs)
             self._sync_dir = cfg.vllm_sync_dir or os.path.join(cfg.output_dir, "_vllm_sync")
             os.makedirs(self._sync_dir, exist_ok=True)
             self._sync_tokenizer_saved = False

@@ -79,6 +79,7 @@ class VLLMRolloutEngine:
         enforce_eager: bool = False,
         max_model_len: Optional[int] = None,
         gpu_id: Optional[int] = None,
+        gpu_ids: Optional[Sequence[int]] = None,
         seed: int = 0,
         max_num_seqs: Optional[int] = None,
         max_num_batched_tokens: Optional[int] = None,
@@ -163,7 +164,59 @@ class VLLMRolloutEngine:
             "MASTER_ADDR", "MASTER_PORT",
         )
         prev_dist_env = {k: os.environ.get(k) for k in dist_env_keys}
-        if gpu_id is not None:
+        if gpu_ids is not None and gpu_id is not None:
+            raise ValueError(
+                "Pass at most one of gpu_id (TP=1) or gpu_ids (TP>=1, multi-GPU)"
+            )
+        if gpu_ids is not None:
+            # Disaggregated path: pin AsyncLLM workers to a contiguous TP
+            # group of physical GPUs. Translate physical IDs through the
+            # current CUDA_VISIBLE_DEVICES so the eventual env var still
+            # references *physical* device indices the OS recognizes.
+            gpu_id_list = [int(g) for g in gpu_ids]
+            if not gpu_id_list:
+                raise ValueError("gpu_ids must contain at least one GPU id")
+            if int(tensor_parallel_size) != len(gpu_id_list):
+                raise ValueError(
+                    f"tensor_parallel_size={tensor_parallel_size} != "
+                    f"len(gpu_ids)={len(gpu_id_list)} — must match"
+                )
+            if prev_cvd:
+                visible = [x.strip() for x in prev_cvd.split(",") if x.strip()]
+                # gpu_ids in this branch are *physical* IDs (the same the
+                # launcher set in CASPO_ROLLOUT_GPU_PHYSICAL_IDS). They
+                # must each appear in the parent's visible list.
+                phys_to_visible_idx = {p: i for i, p in enumerate(visible)}
+                for g in gpu_id_list:
+                    if str(g) not in phys_to_visible_idx:
+                        raise ValueError(
+                            f"physical GPU id {g} (from gpu_ids) is not in "
+                            f"parent CUDA_VISIBLE_DEVICES={prev_cvd!r}"
+                        )
+                # AsyncLLM workers will inherit our env at spawn — present
+                # them with EXACTLY the rollout GPUs, in TP-rank order, as
+                # the only visible devices. They will index them as
+                # cuda:0..cuda:N-1.
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_id_list)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_id_list)
+            # Mirror the rank-local env stripping below so vLLM workers
+            # don't inherit the trainer's torchrun rendezvous and try to
+            # join FSDP's PG. AsyncLLM TP=N spawns its own multiproc PG
+            # with TP-internal ranks; we just make the inherited env safe
+            # so init_distributed_environment doesn't get confused.
+            base_port = 41100  # offset to avoid collision with TP=1 path
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(base_port + int(gpu_id_list[0]))
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["LOCAL_WORLD_SIZE"] = "1"
+            for key in ("GROUP_RANK", "ROLE_RANK", "ROLE_WORLD_SIZE"):
+                os.environ.pop(key, None)
+            prev_dist_env["VLLM_HOST_IP"] = os.environ.get("VLLM_HOST_IP")
+            os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+        elif gpu_id is not None:
             gpu_idx = int(gpu_id)
             if prev_cvd:
                 visible = [x.strip() for x in prev_cvd.split(",") if x.strip()]
@@ -267,7 +320,7 @@ class VLLMRolloutEngine:
         finally:
             # Restore parent process env. (The engine subprocess already forked
             # with the override, so its CUDA_VISIBLE_DEVICES sticks.)
-            if gpu_id is not None:
+            if gpu_id is not None or gpu_ids is not None:
                 if prev_cvd is None:
                     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                 else:
