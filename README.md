@@ -1065,16 +1065,20 @@ minibatch, bf16 mixed precision, fp8 KV cache, IPC weight sync).
 | Method | Script | GPUs | Steady step | 1000-step wall |
 |---|---|---:|---:|---:|
 | GRPO  | `launch_rho1b_grpo.sh` | 1 | ~48 s | ~13 h |
-| PPO+critic | `launch_rho1b_ppo_critic.sh` | 1 | ~75 s* | ~21 h* |
+| PPO+critic | `launch_rho1b_ppo_critic.sh` | 1 | **45.4 s** | ~13 h |
 | VinePPO K=9 (DDP-2) | `launch_rho1b_vineppo_ddp2.sh` | 2 | ~115 s | ~32 h |
 | CASPO (online V_φ) | `launch_rho1b_caspo.sh` | 1 | ~75 s | ~21 h |
 | CASPO frozen | `launch_rho1b_caspo_frozen_rm.sh` | 1 | ~63 s | ~18 h |
 | CASPO delta-p | `launch_rho1b_caspo_delta_prob.sh` | 1 | ~75 s | ~21 h |
 | CASPO delta-logp | `launch_rho1b_caspo_delta_log_prob.sh` | 1 | ~75 s | ~21 h |
 
-*PPO+critic 1B not yet smoke-measured; estimated from CASPO online
-which has the same memory and compute profile (separate ~1B value
-network + Adam, forward+backward+optim step per outer step).
+PPO+critic 1B steady-state measured 2026-04-27 at t_pol=17.0s,
+t_value=20.3s, t_roll=5.0s, t_ref=3.1s → t_step=45.4s. Faster than
+CASPO online at 1B because the 16-step Schulman critic cadence on
+a 1B value head is cheap (small backward + Adam step), while CASPO
+runs a full IPVRM forward+backward path that's heavier than the
+clipped-MSE on a scalar value head. The 7B ratio flips because the
+critic backward dominates t_value at scale.
 
 Total 8-GPU suite wall time: gated by VinePPO DDP-2 at ~32 h
 (parallel across the 8 GPUs).

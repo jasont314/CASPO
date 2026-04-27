@@ -270,13 +270,28 @@ def _try_sympy(a: str, b: str, timeout_s: float = 2.0) -> Optional[bool]:
 
 
 def grade_math(prediction: str, ground_truth: str) -> float:
-    """Return 1.0 iff ``prediction`` (a model response containing ``\\boxed{}``)
-    is mathematically equivalent to ``ground_truth`` (boxed or bare). 0.0
-    otherwise.
+    """Return 1.0 iff ``prediction`` (a model response containing ``\\boxed{}``
+    or a GSM8K-style ``#### N`` final-answer marker) is mathematically
+    equivalent to ``ground_truth`` (boxed or bare). 0.0 otherwise.
     """
     pred_inner = extract_boxed_answer(prediction)
     if pred_inner is None:
-        return 0.0
+        # GSM8K-style fallback: ``#### N`` at end of response. SFT models
+        # finetuned on MATH default to ``\\boxed{}`` even on GSM8K prompts;
+        # but RL-trained variants and some SFT checkpoints emit ``#### N``.
+        # Without this fallback, a model that produces the correct numeric
+        # answer in GSM8K-native format scores 0 → SFT GSM8K under-reports
+        # by ~12 pp vs paper-faithful eval.
+        if "####" in prediction:
+            tail = prediction.rsplit("####", 1)[-1].strip()
+            # Take first line after the marker; strip trailing punctuation.
+            tail = tail.split("\n", 1)[0].strip().rstrip(",.;")
+            # Drop any leading $ wrapper or boldface markup.
+            tail = tail.strip("$* `")
+            if tail:
+                pred_inner = tail
+        if pred_inner is None:
+            return 0.0
     gt_bare = _strip_to_bare(ground_truth)
 
     # 1) Cheap normalized string equality FIRST. Most correctly-formatted
