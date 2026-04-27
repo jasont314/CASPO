@@ -77,7 +77,16 @@ OUTDIR="$ROOT/deepseekmath7b_math_${RUN_METHOD_TAG}${RUN_SUFFIX}"
 # the rollout GPUs are dedicated, so vllm_gpu_memory_utilization can
 # safely run hot. Default 0.85.
 CASPO_VLLM_GPU_MEMORY_UTILIZATION="${CASPO_VLLM_GPU_MEMORY_UTILIZATION:-${VLLM_GPU_MEMORY_UTILIZATION:-0.85}}"
-CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-1024}}"
+# max_num_seqs=2048 default (was 1024): tiny but consistent win on
+# disagg TP=4 VinePPO MC. Smoke 2026-04-27:
+#   1024 step 2: 245 s (t_value 197)
+#   2048 step 2: 242 s (t_value 192)
+# We're concurrency-bound at the scheduler layer; doubling the
+# pending-decode queue lets vLLM keep more of the K=9 MC fan-out
+# in flight per scheduler step. Safe at vllm_util=0.85 fp8 KV
+# (no OOM observed); the cost is ~few hundred MB of scheduler
+# bookkeeping.
+CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-2048}}"
 CASPO_VLLM_MAX_NUM_BATCHED_TOKENS="${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}}"
 CASPO_VLLM_ENFORCE_EAGER="${CASPO_VLLM_ENFORCE_EAGER:-false}"
 
