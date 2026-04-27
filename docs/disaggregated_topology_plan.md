@@ -220,8 +220,62 @@ trainer rank 0 (on physical GPU 0) and Worker_TP0 (also on GPU 0)
 both try to register a NCCL communicator on the same physical
 device — NCCL forbids two ranks of one communicator on one device.
 Workable only with a hybrid sync (CUDA IPC mem handles cross-process
-within a GPU + a different mechanism for the cross-GPU TP-shards),
-multi-day port; deferred.
+within a GPU + per-rank participation), see Phase F below.
+
+### Phase F (in progress): colocated TP=8 with hybrid per-GPU IPC
+
+Insight: same-GPU different-process CUDA IPC mem handles ARE
+supported (and that's exactly what the rank-local TP=1 path uses
+today). The "two NCCL ranks on same device" rule is NCCL-specific.
+By dropping NCCL and pairing every trainer rank with its same-GPU
+vLLM worker via IPC, we sidestep that rule entirely.
+
+Topology: world=8. Every rank has CUDA_VISIBLE_DEVICES=0..7 (so
+LOCAL_RANK pins to its own GPU) and AsyncLLM is built on rank 0 with
+TP=8 spanning all 8 GPUs.
+
+Sync flow per outer step:
+
+1. Every trainer rank calls ``summon_full_params(model)`` →
+   each rank materializes the FULL model on its OWN GPU (FSDP
+   all-gather replicates the same data on all 8 GPUs).
+2. Each trainer rank N produces a CUDA IPC handle for each named
+   param. The handle is keyed by GPU N's UUID:
+   ``{name: {uuid_N: reduce_tensor(p.detach())}}``.
+3. ``dist.gather_object(my_handles, ..., dst=0)`` aggregates onto
+   trainer rank 0.
+4. Rank 0 merges per-param dicts:
+   ``{name: {uuid_0: h0, uuid_1: h1, ..., uuid_7: h7}}``.
+5. Rank 0 calls ``AsyncLLM.update_weights(request)`` with the
+   aggregated handles. vLLM dispatches to all 8 workers via
+   collective_rpc.
+6. Worker_TP_N looks up its own GPU UUID in the dict, opens that
+   handle (same-GPU IPC, OK), and ``load_weights`` slices the
+   FULL tensor onto its TP-shard.
+
+Memory cost per GPU:
+* trainer FSDP shard (sharded): 1.75 GB
+* SUMMON-full transient (during sync only): +14 GB on every GPU
+* trainer Adam state (sharded): 10.5 GB
+* vLLM TP=8 weight shard: 1.75 GB
+* vLLM KV cache (util=0.4): ~32 GB
+
+Peak (during summon): 1.75 + 14 + 10.5 + 1.75 + 32 ≈ 60 GB on 80
+GB H100 — fits with headroom. Outside summon: ~46 GB.
+
+Expected step-time: t_value should drop substantially because TP=8
+has 2× the KV pool of TP=4 (and 8× the per-decode-step batched
+concurrency). t_sync ≈ same as TP=1 IPC (~1 s) since each rank's
+handle production is local.
+
+Phases (each = its own commit):
+* F.1 (research, this section): vLLM IPC engine multi-GPU dispatch
+  validation.
+* F.2: extend ``sync_weights_from_model`` (or a new ``_sync_weights_ipc_tp``)
+  to gather per-rank handles and submit aggregated.
+* F.3: launcher ``_launch_7b_tp8_ipc.sh`` — TP=8 colocated with
+  ipc backend.
+* F.4: smoke + tune.
 
 ### Phase 6 (deferred): port to GRPO/PPO/CASPO
 
