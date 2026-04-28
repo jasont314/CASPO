@@ -38,9 +38,56 @@ lets MATH-500 serve as a true OOD generalization eval.
 
 | Model | RM training | RL training | Eval | Why |
 |---|---|---|---|---|
-| **Rho-1B-SFT** | **`open-r1/Big-Math-RL-Verified-Processed`** (215,608 rows) | Same (subsampled to ~15K mid-difficulty for compute) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | Curated, deduped, has Llama-8B solve-rate annotations for difficulty filtering. Rho-1B's MATH solve rate ≈ 21%; pick problems with `llama8b_solve_rate ∈ [0.2, 0.7]` → most rollouts produce mixed outcomes. |
-| **DeepSeekMath-7B** | **`agentica-org/DeepScaleR-Preview-Dataset`** (40,315 rows) | Same (subsampled if needed) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | AIME/AMC/OmniMATH/Still-Math curated for 7B-scale reasoning. MATH-lighteval saturates too easily for 7B. |
+| **Rho-1B-SFT** | **`open-r1/Big-Math-RL-Verified-Processed`** config `level_1` (~40K prompts) | Same (subsampled if needed) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | Empirically: 62.5% mixed-outcome yield at level_1, drops to 40% at level_2, 16% at level_4. Use `level_1` for max efficiency. |
+| **DeepSeekMath-7B** | **`open-r1/Big-Math-RL-Verified-Processed`** config `level_2` (~45K prompts) | Same (subsampled if needed) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | Empirically: 81% mixed yield at level_2 (sweet spot — 7B-SFT saturates to all-correct on level_1 problems). Combined `level_1+level_2` (~85K, 82% avg yield) is also fine. **Note: DeepScaleR is TOO HARD** for the SFT base — only 12% mixed yield, 96% failures. |
 | (paper-faithful baseline) | `DigitalLearningGmbH/MATH-lighteval` (7,500 rows) | Same | MATH-500 only (matches VinePPO paper) | Reproduction reference. Too small for V_φ to reach paper-grade AUC (we plateau at ~0.63 here vs Big-Math's projected ~0.70). Run as the "VinePPO-faithful" arm only. |
+
+### Empirical mixed-outcome yield per model + Big-Math level
+
+Sampled 32 prompts × K=8 rollouts at temperature=1.0 to measure how
+many problems produce useful mixed-outcome (correct+incorrect) groups.
+**Saturated all-correct or all-incorrect prompts contribute zero
+training rows after the BCE-margin filter** — the mixed-outcome
+percentage is the effective compute efficiency.
+
+**Rho-1B-SFT-MATH** (`realtreetune/rho-1b-sft-MATH`, 32 prompts/level):
+
+| Level | Mixed | all-correct | all-incorrect | avg pos rate |
+|---|---|---|---|---|
+| `level_1` | **62.5%** (20/32) | 0 | 12 | 0.195 |
+| `level_2` | 40.6% (13/32) | 0 | 19 | 0.059 |
+| `level_3` | 31.2% (10/32) | 0 | 22 | 0.066 |
+| `level_4` | 15.6% (5/32) | 0 | 27 | 0.023 |
+
+Rho-1B never saturates to all-correct on any level — wasted compute is
+all on the all-incorrect side. **Pick `level_1`** → ~40K prompts ×
+62.5% mixed = ~25K mixed prompts (16× current v6_multi's 1,575).
+
+**DeepSeekMath-7B-SFT-MATH-v2** (`realtreetune/deepseekmath-7b-sft-MATH-v2`,
+32 prompts/level + DeepScaleR):
+
+| Pool | Mixed | all-correct | all-incorrect | avg pos rate |
+|---|---|---|---|---|
+| BigMath `level_1` | 84% (27/32) | 5 | 0 | 0.617 (saturating easy) |
+| BigMath `level_2` | **81%** (26/32) | 0 | 6 | 0.270 (sweet spot) |
+| BigMath `level_3` | 59% (19/32) | 0 | 13 | 0.168 |
+| BigMath `level_4` | 47% (15/32) | 0 | 17 | 0.113 |
+| BigMath `level_5` | 22% (7/32) | 0 | 25 | 0.035 |
+| **DeepScaleR** | **12.5%** (4/32) ✗ | 0 | 28 | 0.039 |
+
+**DeepScaleR is TOO HARD for DeepSeekMath-7B-SFT** — only 12% mixed
+yield because 96% of rollouts fail. DeepScaleR was likely curated for
+stronger reasoning baselines (R1-Distill / RL-finetuned). **Pick
+BigMath `level_2`** (or `level_1+level_2` combined for max data) → ~80K
+mixed prompts × multi-pair = ~250K rows.
+
+**Net dataset choice (replaces earlier per-model recommendation):**
+- Rho-1B → `open-r1/Big-Math-RL-Verified-Processed` config `level_1`
+- DeepSeekMath-7B-SFT → same dataset, config `level_2` (or `level_1+level_2`)
+- DeepScaleR is unused (too hard for both base models)
+
+Verification: rerun `/tmp/bigmath_sample.py` (Rho) or `/tmp/dsmath_sample.py`
+(DeepSeek) after any base model change to re-measure yield.
 
 ### Eval-set leakage (verified 2026-04-28)
 
