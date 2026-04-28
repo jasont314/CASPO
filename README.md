@@ -1172,11 +1172,25 @@ The orchestrator does:
    `v_acc >= 0.7`.
 
 End-to-end ~15-30 min on 4 H100s (multi-pair / paper-pairing) or
-~30-45 min (default). Output (current Apr 28 retrain set):
-* `caspo_rho1b_math_v2/value_final/` — keep-all-rollouts mode
-* `caspo_rho1b_math_v5_multi/value_final/` — multi-pair 5-epoch retrain (current)
+~30-45 min (default).
 
-**Caveat — `v_acc` is class-imbalance-sensitive**: at runtime the rollout
+**LR caveat — paper's 5e-7 doesn't learn full-FT at 1B**. The IPVRM
+paper uses 5e-7 with LoRA adapters; full fine-tuning the base SFT
+model needs more gradient signal. An LR=5e-7 retrain on the multi-pair
+dataset early-stopped at step 300 with val_loss = 5.0058 = initial
+margin (V_φ never moved off init). Bump to **`VALUE_LR=5e-6`** (10×)
+for full-FT runs. Pass via env to the orchestrator. Worked example:
+```bash
+VALUE_LR=5e-6 PAPER_PAIRING_MULTI=true \
+  GPU_LIST="4 5 6 7" bash scripts/retrain_value_rho1b_4gpu.sh
+```
+
+**Output paths** (current Apr 28 retrain set):
+* `caspo_rho1b_math_v2/value_final/` — **current live RM**, keep-all-rollouts mode at LR=5e-7 (yes, it learned anyway because of larger imbalanced dataset; AUC ≈ 0.55-0.61)
+* `caspo_rho1b_math_v5_multi_lr5e7_failed/` — multi-pair retrain at paper's 5e-7 (failed — kept for diagnostic)
+* `caspo_rho1b_math_v6_multi/value_final/` — multi-pair retrain at LR=5e-6 (in progress; AUC TBD)
+
+**`v_acc` is class-imbalance-sensitive**: at runtime the rollout
 class balance is ~80% incorrect / ~20% correct, so the *naive
 predict-incorrect* baseline already scores `v_acc ≈ 0.80`. A V_φ at
 `v_acc = 0.77` is therefore *below* the naive baseline by ~3pp; the
@@ -1186,8 +1200,9 @@ held-out val split via
 `python scripts/eval_vphi_auc.py --vphi <path> --label <tag>`.
 
 To deploy in a CASPO RL run, set
-`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v5_multi/value_final`
-in the launcher env (the 1B per-GPU launcher in
+`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final`
+(or `_v6_multi/value_final` once it's validated as better) in the
+launcher env (the 1B per-GPU launcher in
 `scripts/_launch_rho1b_one_gpu.sh` accepts this env override and
 forwards it as `--override prefix_value_path=...`).
 
