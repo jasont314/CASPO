@@ -11,7 +11,6 @@ METHOD=ppo_critic
 RUN_METHOD_TAG="${RUN_METHOD_TAG:-ppo_critic}"
 GPU_DEFAULT="${GPU_DEFAULT:-5}"
 EXTRA_OVERRIDES=(
-    --override "kl_coef=${KL_COEF:-1.0e-4}"
     --override "kl_estimator=${KL_ESTIMATOR:-k3}"
     --override "value_loss_coef=${VALUE_LOSS_COEF:-1.0}"
     --override "cliprange_value=${CLIPRANGE_VALUE:-0.2}"
@@ -23,4 +22,9 @@ EXTRA_OVERRIDES=(
     --override "clip_eps_high=${CLIP_EPS_HIGH:-0.2}"
     --override "epochs_per_rollout=${EPOCHS_PER_ROLLOUT:-2}"
 )
+# Note: kl_coef is NOT overridden here — let it inherit from the YAML
+# (currently 1e-2). Previously hardcoded to 1e-4 which silently bypassed
+# the YAML's stronger ref-anchor and caused PPO+critic to diverge while
+# CASPO/CASPO-Δp/GRPO (which don't override) trained stably.
+[[ -n "${KL_COEF:-}" ]] && EXTRA_OVERRIDES+=(--override "kl_coef=${KL_COEF}")
 source "$(dirname "$0")/_launch_rho1b_one_gpu.sh"
