@@ -78,6 +78,13 @@ caspo_advantage_transform: value
 gamma: 1.0
 standardize_step_advantage: true
 standardize_advantage_scope: batch
+advantage_clip: 3.0                # Re-enabled (was 0 / Patch H, paper-faithful).
+                                   # Without clipping, online-value methods (CASPO,
+                                   # CASPO-Δp, PPO+critic) drift KL → ∞ by step 15-20
+                                   # under fp32 master + lr ramp. Clip at ±3σ
+                                   # post-whitening bounds outlier-advantage
+                                   # contribution and stabilizes the policy update.
+                                   # GRPO unaffected (no learned value).
 
 # PPO (matches VinePPO MATH config exactly)
 clip_eps_low: 0.20
