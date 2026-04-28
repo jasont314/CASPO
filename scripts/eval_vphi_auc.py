@@ -38,10 +38,25 @@ def main(vphi_path: str, label: str, data_path: str = None):
     n = blob["prompt_ids"].shape[0]
     print(f"[{label}] dataset size: n={n}", flush=True)
 
-    # Use a held-out 10% (last 10%) so old V_φ doesn't get train-set leak
-    val_n = max(100, n // 10)
-    idxs = list(range(n - val_n, n))
-    print(f"[{label}] using last {val_n} as val set", flush=True)
+    # Use the EXACT prompt-level val split that scripts/train_value.py uses
+    # via the shared _split_train_val function. This ensures the AUC is on
+    # rows the trainer held out (no train-set leak). Trailing-row "last 10%"
+    # would not match what the trainer split (which seed-shuffles by prompt).
+    import sys as _sys
+    _sys.path.insert(0, "/home/jason/experiment/CASPO/scripts")
+    from train_value import _split_train_val
+    _, val_idxs = _split_train_val(
+        n_rows=n,
+        group_size=int(cfg.group_size),
+        val_fraction=float(cfg.value_val_fraction),
+        seed=int(cfg.seed),
+    )
+    idxs = val_idxs
+    val_n = len(idxs)
+    print(f"[{label}] held-out val: {val_n} rollouts "
+          f"({val_n // int(cfg.group_size)} prompts) "
+          f"via _split_train_val(seed={cfg.seed}, val_fraction={cfg.value_val_fraction})",
+          flush=True)
 
     pids = blob["prompt_ids"][idxs].to("cuda")
     pmask = blob["prompt_mask"][idxs].to("cuda")
