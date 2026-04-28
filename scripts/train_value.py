@@ -97,26 +97,59 @@ def _prepare_blob(blob: dict, device: str, prefer_device: bool) -> dict:
 
 
 def _split_train_val(
-    n_rows: int, group_size: int, val_fraction: float, seed: int
+    n_rows: int,
+    group_size: int,
+    val_fraction: float,
+    seed: int,
+    prompt_idx_per_row=None,
 ) -> Tuple[List[int], List[int]]:
     """Split row indices into train/val groups by prompt.
 
-    Rollouts for the same prompt are contiguous in groups of ``group_size``
-    (preserved by ``collect_value_data.py``'s mixed-outcome filter), so we
-    can split at the prompt level by holding out ``val_fraction`` of the
-    prompts entirely. This avoids same-prompt leakage where some rollouts
-    of a prompt are in train and others in val.
+    Two modes:
+    1. Default (prompt_idx_per_row=None): rollouts for the same prompt are
+       contiguous in groups of ``group_size`` (preserved by the default
+       ``collect_value_data.py`` mixed-outcome filter). Requires
+       n_rows % group_size == 0.
+    2. ``prompt_idx_per_row`` provided: a length-n_rows array giving the
+       source prompt index for each row. Used by --paper-pairing-multi
+       which yields a variable number of rows per prompt. Rows are still
+       split at the prompt level (held-out prompts go entirely to val).
     """
-    if group_size <= 0:
-        raise ValueError(f"group_size must be > 0, got {group_size}")
     if not (0.0 < val_fraction < 1.0):
         raise ValueError(
             f"val_fraction must be in (0, 1), got {val_fraction}"
         )
+    rng = random.Random(seed)
+
+    if prompt_idx_per_row is not None:
+        import numpy as _np
+        pids = _np.asarray(prompt_idx_per_row).reshape(-1)
+        if pids.shape[0] != n_rows:
+            raise ValueError(
+                f"prompt_idx_per_row length {pids.shape[0]} != n_rows {n_rows}"
+            )
+        unique_pids = sorted({int(x) for x in pids.tolist()})
+        n_prompts = len(unique_pids)
+        if n_prompts < 2:
+            raise ValueError(
+                f"need at least 2 unique prompts to split, got {n_prompts}"
+            )
+        prompt_perm = list(unique_pids)
+        rng.shuffle(prompt_perm)
+        n_val = max(1, min(n_prompts - 1, int(round(n_prompts * val_fraction))))
+        val_pids = set(prompt_perm[-n_val:])
+        train_rows: List[int] = []
+        val_rows: List[int] = []
+        for r in range(n_rows):
+            if int(pids[r]) in val_pids:
+                val_rows.append(r)
+            else:
+                train_rows.append(r)
+        return train_rows, val_rows
+
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
     if n_rows % group_size != 0:
-        # Be loud: this means cfg.group_size disagrees with the group_size
-        # used at collect time, or the data was corrupted/truncated. Splitting
-        # under the wrong G silently leaks rollouts across train/val.
         raise ValueError(
             f"n_rows={n_rows} is not divisible by group_size={group_size}; "
             f"cfg.group_size likely disagrees with the value of group_size "
@@ -128,14 +161,12 @@ def _split_train_val(
             f"need at least 2 prompts to split train/val, got {n_prompts} "
             f"(n_rows={n_rows}, group_size={group_size})"
         )
-    rng = random.Random(seed)
     prompt_perm = list(range(n_prompts))
     rng.shuffle(prompt_perm)
-    # Clamp n_val to [1, n_prompts - 1] so train is never empty.
     n_val = max(1, min(n_prompts - 1, int(round(n_prompts * val_fraction))))
     val_prompts = set(prompt_perm[-n_val:])
-    train_rows: List[int] = []
-    val_rows: List[int] = []
+    train_rows = []
+    val_rows = []
     for p in range(n_prompts):
         rows = list(range(p * group_size, (p + 1) * group_size))
         if p in val_prompts:
@@ -326,7 +357,24 @@ def main() -> None:
             )
             G = max(1, snap_G)
     val_fraction = float(cfg.value_val_fraction)
-    train_rows, val_rows = _split_train_val(N, G, val_fraction, seed=int(cfg.seed))
+    # If n_rows isn't divisible by G (e.g. --paper-pairing-multi yields a
+    # variable number of rows per prompt), derive prompt identity from the
+    # prompt_ids tensor — all rows from the same prompt share identical
+    # prompt tokens. unique(dim=0) returns inverse indices we use as prompt
+    # ids for the split.
+    prompt_idx_per_row = None
+    if N % G != 0:
+        _rprint(
+            f"[value] n_rows={N} not divisible by G={G}; deriving prompt ids "
+            f"from prompt_ids tensor uniqueness for the train/val split.",
+            flush=True,
+        )
+        _, prompt_inv = torch.unique(blob["prompt_ids"], dim=0, return_inverse=True)
+        prompt_idx_per_row = prompt_inv.cpu().tolist()
+    train_rows, val_rows = _split_train_val(
+        N, G, val_fraction, seed=int(cfg.seed),
+        prompt_idx_per_row=prompt_idx_per_row,
+    )
     full_train_count = len(train_rows)
     _rprint(
         f"[value] train: {full_train_count} rollouts ({full_train_count//G} prompts), "

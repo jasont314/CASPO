@@ -45,11 +45,19 @@ def main(vphi_path: str, label: str, data_path: str = None):
     import sys as _sys
     _sys.path.insert(0, "/home/jason/experiment/CASPO/scripts")
     from train_value import _split_train_val
+    G = int(cfg.group_size)
+    prompt_idx_per_row = None
+    if n % G != 0:
+        # multi-pair / paper-pairing data: derive prompt ids from prompt tokens
+        _, _inv = torch.unique(blob["prompt_ids"], dim=0, return_inverse=True)
+        prompt_idx_per_row = _inv.cpu().tolist()
+        print(f"[{label}] n_rows={n} not divisible by G={G}; deriving prompt ids from prompt_ids tensor", flush=True)
     _, val_idxs = _split_train_val(
         n_rows=n,
-        group_size=int(cfg.group_size),
+        group_size=G,
         val_fraction=float(cfg.value_val_fraction),
         seed=int(cfg.seed),
+        prompt_idx_per_row=prompt_idx_per_row,
     )
     idxs = val_idxs
     val_n = len(idxs)
