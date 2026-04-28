@@ -1186,9 +1186,9 @@ VALUE_LR=5e-6 PAPER_PAIRING_MULTI=true \
 ```
 
 **Output paths** (current Apr 28 retrain set):
-* `caspo_rho1b_math_v2/value_final/` — **current live RM**, keep-all-rollouts mode at LR=5e-7 (yes, it learned anyway because of larger imbalanced dataset; AUC ≈ 0.55-0.61)
-* `caspo_rho1b_math_v5_multi_lr5e7_failed/` — multi-pair retrain at paper's 5e-7 (failed — kept for diagnostic)
-* `caspo_rho1b_math_v6_multi/value_final/` — multi-pair retrain at LR=5e-6 (in progress; AUC TBD)
+* `caspo_rho1b_math_v6_multi/value_final/` — **current live RM** (YAML default), multi-pair 50/50 collect + LR=5e-6 + 5 epochs. **ROC-AUC = 0.633** on prompt-level held-out val.
+* `caspo_rho1b_math_v2/value_final/` — earlier same-day retrain (keep-all-rollouts, LR=5e-7). AUC = 0.517 on the same val set. Still used by live fixed_v6/v7 RL runs to keep their experimental condition consistent.
+* `caspo_rho1b_math_v5_multi_lr5e7_failed/` — multi-pair retrain at paper's 5e-7 (failed — kept for diagnostic).
 
 **`v_acc` is class-imbalance-sensitive**: at runtime the rollout
 class balance is ~80% incorrect / ~20% correct, so the *naive
@@ -1200,11 +1200,10 @@ held-out val split via
 `python scripts/eval_vphi_auc.py --vphi <path> --label <tag>`.
 
 To deploy in a CASPO RL run, set
-`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final`
-(or `_v6_multi/value_final` once it's validated as better) in the
-launcher env (the 1B per-GPU launcher in
-`scripts/_launch_rho1b_one_gpu.sh` accepts this env override and
-forwards it as `--override prefix_value_path=...`).
+`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v6_multi/value_final`
+(YAML default; explicit env only needed to override). The 1B per-GPU
+launcher in `scripts/_launch_rho1b_one_gpu.sh` accepts this env
+override and forwards it as `--override prefix_value_path=...`.
 
 ### Teammate handoff: CASPO ablation runs (Rho-1B, single GPU each)
 

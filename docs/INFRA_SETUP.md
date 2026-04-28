@@ -247,23 +247,24 @@ export MKL_NUM_THREADS=4
 
 ### IPVRM value model checkpoints (CASPO prerequisites)
 
-* **Rho-1B IPVRM v2** (current live, 2026-04-28):
-  `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final` —
-  produced by `scripts/retrain_value_rho1b_4gpu.sh` (4-shard parallel
-  collect + merge + FSDP=4 train_value, ~30-45 min on 4× H100). Default
-  collect mode (keep all G rollouts per mixed-outcome prompt; ~25%
-  positive rate). Runtime `v_acc=0.77` is **below** the
-  naive predict-incorrect baseline of `1 - pos_rate ≈ 0.80`; the
-  meaningful signal is ROC-AUC ≈ 0.55-0.61 (V_φ scores rank
-  correct > incorrect, but threshold 0 is miscalibrated).
-* **Rho-1B IPVRM v6_multi** (in-progress experiment, 2026-04-28 evening):
+* **Rho-1B IPVRM v6_multi** (current live, 2026-04-28 evening):
   `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v6_multi/value_final` —
-  same retrain pipeline with `PAPER_PAIRING_MULTI=true` (50/50
-  balanced dataset via min(n_pos, n_neg) disjoint pairs per prompt,
-  12,602 rows from 1575 unique prompts) and `VALUE_LR=5e-6` (10× over
-  paper's 5e-7, which was for LoRA — full-FT at 1B doesn't learn at
-  5e-7). 5 epochs, save_every=50 → 17 ckpts for AUC trajectory eval.
-  Will replace v2 if AUC clearly improves.
+  produced by `scripts/retrain_value_rho1b_4gpu.sh PAPER_PAIRING_MULTI=true
+  VALUE_LR=5e-6 VALUE_MAX_EPOCHS=5`. Paper-faithful min(n_pos, n_neg)
+  disjoint pairs per mixed-outcome prompt → 12,602 rows from 1,575
+  unique prompts, 50/50 balanced. **ROC-AUC = 0.633** on the
+  trainer's held-out prompt-level val split (ΔAUC=+0.115 over v2).
+  Sign-acc (0.519) declines vs early-training because the V=0
+  threshold slides as training continues — AUC is the metric that
+  matters for CASPO's ΔV step-TD. Trained 5 epochs at LR=5e-6
+  (paper's 5e-7 doesn't learn full-FT at 1B; 10× bump fixed it).
+* **Rho-1B IPVRM v2** (deprecated as default, 2026-04-28 morning):
+  `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final` — the
+  earlier same-day retrain using default collect mode (keep all G
+  rollouts per mixed-outcome prompt; ~25% positive rate). ROC-AUC =
+  0.517 on the v6_multi held-out val (essentially random ranking).
+  Live RL runs fixed_v6/v7 on GPUs 0-3 continue using v2 to keep
+  their experimental condition consistent.
 * **Rho-1B IPVRM v1** (deprecated, 2026-04-25):
   `/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final` — kept for
   reproducing pre-Apr-28 numbers. Step-1 runtime `v_acc=0.32` against

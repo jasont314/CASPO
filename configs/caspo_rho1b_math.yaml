@@ -64,14 +64,19 @@ value_data_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_data.pt
 # Phase 2 — value usage. Online updates ON (Eq. 15 with ADB+DLW per §3.3).
 # Paper IPVRM uses 1e-4 with LoRA; this full-model value update path is kept
 # at 1e-6 to avoid the saturation seen in earlier runs.
-prefix_value_path: /mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final
-                                     # Updated 2026-04-28: retrained V_φ
-                                     # against current verifier (Minerva
-                                     # extractor cascade) + BOS-prepended
-                                     # prompts (Patch A). Old Apr 25 V_φ at
-                                     # /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/
-                                     # value_final showed step-1 v_acc=0.32
-                                     # at runtime; new V_φ shows 0.74.
+prefix_value_path: /mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v6_multi/value_final
+                                     # Updated 2026-04-28 (evening): swapped
+                                     # from v2 (AUC=0.517) to v6_multi
+                                     # (AUC=0.633) — paper-pairing-multi
+                                     # collect (50/50 balanced via
+                                     # min(p,n) disjoint pairs, 12,602 rows
+                                     # from 1575 unique mixed-outcome
+                                     # prompts) trained 5 epochs at LR=5e-6
+                                     # (paper's 5e-7 didn't learn full-FT
+                                     # at 1B; 10x bump worked).
+                                     # Live RL runs fixed_v6/v7 on GPUs 0-3
+                                     # continue on v2 to keep their
+                                     # experimental condition consistent.
                                      # Override per-run via PREFIX_VALUE_PATH env.
 update_value_during_policy: true
 online_value_lr: 1.0e-6              # Restored to 1e-6 (2026-04-28 v7).
