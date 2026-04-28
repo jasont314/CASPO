@@ -94,7 +94,7 @@ advantage_clip: 3.0                # Re-enabled (was 0 / Patch H, paper-faithful
 # PPO (matches VinePPO MATH config exactly)
 clip_eps_low: 0.20
 clip_eps_high: 0.20
-kl_coef: 1.0e-3                   # bumped 10× from 1e-4 (2026-04-28).
+kl_coef: 1.0e-2                   # bumped 100× from 1e-4 (2026-04-28).
                                   # Online-value methods (CASPO especially)
                                   # need a stronger ref-anchor than upstream
                                   # VinePPO's 1e-4 because our learned V_φ
