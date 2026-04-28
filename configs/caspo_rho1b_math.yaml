@@ -94,7 +94,16 @@ advantage_clip: 3.0                # Re-enabled (was 0 / Patch H, paper-faithful
 # PPO (matches VinePPO MATH config exactly)
 clip_eps_low: 0.20
 clip_eps_high: 0.20
-kl_coef: 1.0e-4                   # init_kl_coef from refKl0.0001.jsonnet
+kl_coef: 1.0e-3                   # bumped 10× from 1e-4 (2026-04-28).
+                                  # Online-value methods (CASPO especially)
+                                  # need a stronger ref-anchor than upstream
+                                  # VinePPO's 1e-4 because our learned V_φ
+                                  # adds noise that upstream's K=9 MC
+                                  # averaging doesn't have. KL was driving
+                                  # to 100s by step 25; 1e-3 brings the
+                                  # KL term contribution into the same
+                                  # order of magnitude as reward (0.2)
+                                  # at KL≈100, providing a real anchor.
 kl_estimator: k3                  # control_variate ≈ k3 unbiased
 
 # training (matches VinePPO ppo_MATH.jsonnet general_training_args)
