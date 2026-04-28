@@ -1009,20 +1009,26 @@ master fit in 4×H100 80 GB:
 
 **1B Rho-1B-SFT-MATH (single GPU, no FSDP, fp32 master via autocast)**
 
-| Method | mb / accum | vllm_util | Multi-step |
-|---|---|---:|---|
-| GRPO            | 4 / 16 | 0.30 | ✓ 4 steps |
-| CASPO frozen-RM | 4 / 16 | 0.30 | ✓ 4 steps |
-| CASPO online    | 4 / 16 | 0.30 | ✓ 4 steps |
-| PPO+critic      | 4 / 16 | 0.30 | ✓ 4 steps¹ |
+| Method | mb / accum | vllm_util | Multi-step | Mean t_step |
+|---|---|---:|---|---:|
+| GRPO            | 4 / 16 | 0.30 | ✓ | ~50 s |
+| CASPO frozen-RM | 4 / 16 | 0.30 | ✓ | ~55 s |
+| CASPO online    | 4 / 16 | 0.30 | ✓ | ~75 s |
+| PPO+critic      | 4 / 16 | 0.30 | ✓ | ~100 s |
 
-¹ PPO+critic shows residual cumulative slowdown past step 2 (~+6 s/
-step) at single-GPU due to allocator pressure; OOM is gone but
-throughput regresses on long runs. Acceptable for production. 7B FSDP
-is unaffected.
+8-step PPO+critic probe with per-step `torch.cuda.memory_stats()`
+shows `mem_alloc=21.7 GiB`, `mem_reserved=22.0 GiB`, `n_alloc=1818`
+flat across all steps — no leak, no fragmentation accumulation. Step
+time oscillates 75-121 s around a ~102 s mean (rollout-content
+variance), with the warmup-tail contributing 4-step samples that
+look monotonic but aren't.
 
 `scripts/_launch_rho1b_one_gpu.sh` defaults: `mb=4, accum=16` (was
-`mb=8, accum=8` before fp32 master).
+`mb=8, accum=8` before fp32 master). The mb drop is required for
+PPO+critic — at mb=8, AdamW state init triggers a ~8.8 GiB burst
+allocation in step 3 that races vLLM's resident KV cache and OOMs.
+Preallocation + GAE microbatching + uniform R together close the
+gap at mb=4.
 
 **7B DeepSeekMath-7B-MATH (4-GPU FSDP, hybrid_shard, colocated vLLM)**
 
