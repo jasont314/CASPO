@@ -518,6 +518,30 @@ def main() -> None:
             if do_break:
                 break
 
+        # ---- periodic checkpointing every value_save_every steps ----
+        # All ranks must enter save_pretrained together (FSDP FULL_STATE_DICT
+        # is collective). Triggered independently of eval so trajectories can
+        # be reconstructed even with eval disabled.
+        if (
+            int(cfg.value_save_every) > 0
+            and step > 0
+            and step % int(cfg.value_save_every) == 0
+        ):
+            step_path = os.path.join(cfg.output_dir, f"step_{step}")
+            model.save_pretrained(step_path)
+            if is_main:
+                _step_meta = {"step": step}
+                # Add the most recent val_loss/val_acc if we have them.
+                if 'val_stats' in dir():
+                    _step_meta["val_loss"] = float(val_stats["val_loss"])
+                    _step_meta["val_acc_at_last"] = float(
+                        val_stats["val_acc_at_last"]
+                    )
+                with open(os.path.join(step_path, "step.json"), "w") as f:
+                    json.dump(_step_meta, f)
+                print(f"[value step {step}] saved checkpoint to {step_path}",
+                      flush=True)
+
     # ---- finalize: copy best → final, or save current if no eval happened ----
     # save_pretrained on FSDP-wrapped phi is collective: every rank MUST enter
     # the FULL_STATE_DICT context together, even though only rank 0 writes

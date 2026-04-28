@@ -58,6 +58,11 @@ echo "[retrain] GPUs=${GPUS[*]} (N=$N)"
 if [[ "${SKIP_COLLECT:-false}" != "true" ]]; then
     echo "[retrain] === Phase 1: 4-shard collect_value_data on GPUs ${GPUS[*]} ==="
     PIDS=()
+    PAPER_PAIRING_FLAG=""
+    if [[ "${PAPER_PAIRING:-false}" == "true" ]]; then
+        PAPER_PAIRING_FLAG="--paper-pairing"
+        echo "[retrain] paper-faithful 1-pair-per-prompt pairing enabled"
+    fi
     for i in 0 1 2 3; do
         gpu="${GPUS[$i]}"
         out="$SHARD_DIR/value_data_shard${i}.pt"
@@ -67,6 +72,7 @@ if [[ "${SKIP_COLLECT:-false}" != "true" ]]; then
             --config "$BASE_CONFIG" \
             --shard "$i/4" \
             --output "$out" \
+            $PAPER_PAIRING_FLAG \
             > "$log" 2>&1 &
         PIDS+=("$!")
     done

@@ -23,7 +23,6 @@ import yaml
 _DEPRECATED_OR_UNUSED: dict[str, str] = {
     "compile": "torch.compile is not wired up in CASPOTrainer; ignored at runtime.",
     "vllm_skip_initial_sync": "vLLM engine always inits from cfg.model_name_or_path; flag not consumed.",
-    "value_save_every": "scripts/train_value.py only writes a single 'final' checkpoint; periodic save not consumed.",
 }
 
 
@@ -163,8 +162,9 @@ class CASPOConfig:
     # raw step count instead.
     value_max_epochs: int = 3
     value_max_steps: int = 2000           # fallback when value_max_epochs == 0
-    # NOTE: value_save_every is NOT consumed by scripts/train_value.py —
-    # only the final checkpoint is written. Kept for YAML compat.
+    # Periodic save in scripts/train_value.py: every value_save_every
+    # optimizer steps, dump the current V_φ to <output_dir>/step_<N>/.
+    # Independent of value_eval_every / best/. Set to 0 to disable.
     value_save_every: int = 500
     value_log_every: int = 1
     value_grad_clip: float = 1.0
