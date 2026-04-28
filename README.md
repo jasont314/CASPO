@@ -958,6 +958,102 @@ CUDA_VISIBLE_DEVICES=4 /opt/conda/envs/scalable/bin/python \
   --output-dir /tmp/caspo_vllm_ipc_probe
 ```
 
+## fp32 Master Weights + Memory Fit (Apr 28, 2026)
+
+VinePPO upstream uses DeepSpeed BF16_Optimizer which keeps **fp32
+master weights + fp32 m/v** for AdamW even when params compute in
+bf16. Without this, AdamW updates at lr=1e-6 round to zero in bf16's
+7-bit mantissa and the policy drifts back toward init (silent
+training failure). To match, CASPO now defaults `fp32_master_weights:
+true` (in `caspo/config.py`).
+
+Two FSDP+vLLM infrastructure changes were required to make fp32
+master fit in 4×H100 80 GB:
+
+1. **CPU-load + `sync_module_states=True`**: skip per-rank
+   `.to(device)` for policy/ref/value/critic when FSDP will wrap
+   them. FSDP places only the sharded slice on GPU and broadcasts
+   from rank 0's CPU copy. Avoids ~56 GiB of transient peak (full
+   policy fp32 + ref bf16 + value bf16 on each rank's GPU before
+   sharding).
+
+2. **AdamW CPU-offload during sync**: temporarily move policy/critic/
+   value AdamW state (m, v) to pinned host memory before each
+   `_sync_vllm_weights` call, restore after. FSDP's `summon_full_
+   params` materializes ~28 GiB unsharded fp32 on each rank during
+   sync; without freeing the 14 GiB AdamW slot first, sync OOMs at
+   the step 1→2 boundary on 7B CASPO. ~400-500 ms / sync at PCIe
+   Gen5 (~10% sync-step slowdown). Default off; on for 7B configs.
+
+3. **Streaming IPC sync + per-param bf16 cast**: chunk
+   `update_weights` RPCs into 8-param batches and cast each param
+   from fp32 → bf16 on the source side (vLLM expects bf16). Caps
+   sync-time keepalive memory and halves the IPC payload at fp32
+   master.
+
+4. **Preallocate AdamW state at trainer init**: run a one-time
+   zero-grad dummy `optim.step()` after each optimizer is built, so
+   the lazy AdamW state (`m`, `v`) is allocated BEFORE vLLM grabs
+   its KV cache. Avoids spurious step-3 OOMs on tight 1B configs
+   from allocator fragmentation racing vLLM's resident weights.
+   ~50-200 ms one-time at init.
+
+5. **PPO+critic uniform R in critic train**: dropped per-microbatch
+   `R_eff` trim in `_ppo_critic_train_critic` so all microbatches
+   use the full `[mb, P+R]` shape. Variable R_eff was minting fresh
+   allocator segments per shape that `empty_cache()` released back
+   to the driver each step → linear `t_value` growth. Trades ~5-15%
+   extra padding FLOPs for constant-time per-step.
+
+### Verified configurations
+
+**1B Rho-1B-SFT-MATH (single GPU, no FSDP, fp32 master via autocast)**
+
+| Method | mb / accum | vllm_util | Multi-step |
+|---|---|---:|---|
+| GRPO            | 4 / 16 | 0.30 | ✓ 4 steps |
+| CASPO frozen-RM | 4 / 16 | 0.30 | ✓ 4 steps |
+| CASPO online    | 4 / 16 | 0.30 | ✓ 4 steps |
+| PPO+critic      | 4 / 16 | 0.30 | ✓ 4 steps¹ |
+
+¹ PPO+critic shows residual cumulative slowdown past step 2 (~+6 s/
+step) at single-GPU due to allocator pressure; OOM is gone but
+throughput regresses on long runs. Acceptable for production. 7B FSDP
+is unaffected.
+
+`scripts/_launch_rho1b_one_gpu.sh` defaults: `mb=4, accum=16` (was
+`mb=8, accum=8` before fp32 master).
+
+**7B DeepSeekMath-7B-MATH (4-GPU FSDP, hybrid_shard, colocated vLLM)**
+
+| Method | mb / accum | vllm_util | step 1 | step 2 | step 3 | Pattern |
+|---|---|---:|---:|---:|---:|---|
+| GRPO             | 2 / 8  | 0.30 | 42 s | 38 s | 33 s | flat |
+| PPO+critic       | 2 / 8  | 0.20 | 65 s | 75 s | 69 s | flat |
+| CASPO frozen-RM  | 2 / 8  | 0.20 | 44 s | 41 s | 36 s | flat |
+| CASPO online     | 2 / 8  | 0.20 | 57 s | 68 s | 66 s | flat |
+
+Sync overhead 4-5 s/step (AdamW CPU-offload + streaming IPC). All
+within 80 GB H100 budget at peak ~66 GB / rank.
+
+7B configs inherit `offload_optim_during_sync: true` from
+`configs/caspo_deepseekmath7b_math.yaml`. 1B doesn't need it.
+
+### Config knobs (defaults shown)
+
+```yaml
+fp32_master_weights: true        # fp32 AdamW state for noise floor
+fsdp_reduce_dtype: float32       # fp32 grad accumulator
+preallocate_optim_state: true    # eager AdamW state init
+save_optimizer_state: true       # save m/v alongside model.safetensors
+offload_optim_during_sync: false # 7B configs override to true
+vllm_extra_stop_strings: ["\n\n\nProblem:"]   # paper-faithful stop
+max_sequence_len: 2048           # post-rollout unfinished penalty
+```
+
+GPU 0 reserved for teammate's evaluation experiment — all CASPO runs
+default to GPUs 1-7 (override with `GPU=` or `GPU_LIST=`).
+
 ## 7B Infrastructure (Apr 2026)
 
 Full FSDP + vLLM-IPC weight-sync stack for DeepSeekMath-7B-MATH. Validated

@@ -53,18 +53,22 @@ CASPO_VLLM_MULTI_SAMPLE_MODE="${CASPO_VLLM_MULTI_SAMPLE_MODE:-${VLLM_MULTI_SAMPL
 CASPO_VLLM_MAX_NUM_SEQS="${CASPO_VLLM_MAX_NUM_SEQS:-${VLLM_MAX_NUM_SEQS:-256}}"
 CASPO_VLLM_MAX_NUM_BATCHED_TOKENS="${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-${VLLM_MAX_NUM_BATCHED_TOKENS:-}}"
 
-# Trainer batching: defaults from the 1-GPU Pareto sweep (Apr 2026).
-# mb=8, accum=8 keeps the 64-response PPO minibatch (matches paper) but runs
-# ~45% faster per step than the YAML defaults (mb=1, accum=64). Combined with
-# use_gradient_checkpointing=false (no measurable cost on Rho-1B) and
-# vllm_gpu_memory_utilization=0.30 (vLLM is not the bottleneck above ~0.30,
-# and 0.30 leaves ~3-4 GB trainer headroom for CASPO's value+adam states):
-#   GRPO/PPO: ~92s -> ~51s/step
-#   CASPO (online value): ~141s -> ~75s/step (peak ~77 GB at u=0.30)
-#   caspo-frozen-rm: ~63s/step (no value backward, frees ~13 GB)
-#   VinePPO 1-GPU: ~237s -> ~191s/step (gated by K=9 MC rollouts)
-CASPO_MICRO_BATCH_SIZE="${CASPO_MICRO_BATCH_SIZE:-${MICRO_BATCH_SIZE:-8}}"
-CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-8}}"
+# Trainer batching: defaults updated 2026-04-28 for fp32 master path.
+# Original Pareto sweep (bf16, Apr 2026) found mb=8, accum=8 optimal —
+# but fp32 master adds ~6 GB persistent at 1B (policy fp32 + AdamW
+# fp32). With vLLM at u=0.30 (24 GB) and ~50 GB trainer working set
+# at mb=8, multi-step runs hit allocator-fragmentation OOM by step
+# 3-4 even though step 1 fits. Dropping to mb=4 (accum=16 to keep
+# the 64-response PPO minibatch) costs only ~5-10% step time vs
+# mb=8 but is stable across long runs at fp32 master.
+# Verified: 1B GRPO/CASPO/CASPO-frozen/PPO+critic all complete 4-step
+# smokes at mb=4. PPO+critic still shows residual cumulative
+# slowdown (~+6s/step past step 2) — known limitation of
+# single-GPU + colocated vLLM at fp32 master, not OOM.
+# Override env: ``MICRO_BATCH_SIZE=8 GRAD_ACCUM_STEPS=8`` to revert
+# (only safe if you also disable fp32 master).
+CASPO_MICRO_BATCH_SIZE="${CASPO_MICRO_BATCH_SIZE:-${MICRO_BATCH_SIZE:-4}}"
+CASPO_GRAD_ACCUM_STEPS="${CASPO_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS:-16}}"
 CASPO_USE_GRADIENT_CHECKPOINTING="${CASPO_USE_GRADIENT_CHECKPOINTING:-${USE_GRADIENT_CHECKPOINTING:-false}}"
 
 # Round 2 knobs (Apr 2026):
