@@ -8,8 +8,8 @@
 #   RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" ./scripts/launch_rho1b_parallel.sh
 #   RUN_TAG=paper512_seed0 SAVE_EVERY=100 WANDB_MODE=offline ./scripts/launch_rho1b_parallel.sh
 #
-# Logs land in /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math${RUN_SUFFIX}/logs.
-# Outputs go to /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/.
+# Logs land in /mnt/nvme_tmp2/jason_caspo/caspo_rho1b_math${RUN_SUFFIX}/logs.
+# Outputs go to /mnt/nvme_tmp2/jason_caspo/caspo_rho1b_math_<method>${RUN_SUFFIX}/.
 # Default checkpoint cadence is save_every=250, yielding step_250, step_500,
 # step_750, and final for a 1000-step run.
 #
@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-ROOT=/mnt/nvme_tmp/jason_caspo
+ROOT=/mnt/nvme_tmp2/jason_caspo
 BASE_CONFIG=configs/caspo_rho1b_math.yaml
 RUN_TAG="${RUN_TAG:-}"
 RUN_SUFFIX=""

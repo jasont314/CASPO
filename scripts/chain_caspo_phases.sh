@@ -23,7 +23,7 @@ VALUE_GPU="${VALUE_GPU:-4}"
 CASPO_GPU="${CASPO_GPU:-7}"
 trap 'echo "[chain] ERR at line $LINENO (rc=$?)"' ERR
 
-ROOT=/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math
+ROOT=/mnt/nvme_tmp2/jason_caspo/caspo_rho1b_math
 LOGDIR="$ROOT/logs"
 mkdir -p "$LOGDIR"
 
@@ -78,7 +78,7 @@ echo "[chain] $(date) launching CASPO RL on GPU ${CASPO_GPU}"
 CUDA_VISIBLE_DEVICES="${CASPO_GPU}" nohup "$PYTHON_BIN" -u -m scripts.train_caspo \
     --config configs/caspo_rho1b_math.yaml \
     --override method=caspo \
-    --override output_dir=/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo \
+    --override output_dir=${ROOT}_caspo \
     --override wandb_run_name=rho1b_math_caspo_seed0 \
     --override wandb_project=caspo-rho1b-math \
     --override update_value_during_policy=true \

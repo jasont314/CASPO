@@ -46,7 +46,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-ROOT="${ROOT:-/mnt/nvme_tmp/jason_caspo}"
+ROOT="${ROOT:-/mnt/nvme_tmp2/jason_caspo}"
 BASE_CONFIG="${BASE_CONFIG:-configs/caspo_deepseekmath7b_math.yaml}"
 
 read -r -a GPUS <<< "${GPU_LIST:-${GPU_DEFAULT_LIST:-0 1 2 3 4 5 6 7}}"

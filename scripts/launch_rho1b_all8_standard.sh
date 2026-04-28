@@ -42,7 +42,7 @@ if (( ${#GPUS[@]} != 8 )); then
     exit 2
 fi
 
-ROOT="${ROOT:-/mnt/nvme_tmp/jason_caspo}"
+ROOT="${ROOT:-/mnt/nvme_tmp2/jason_caspo}"
 RUN_TAG="${RUN_TAG:-paper512_seed0}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 # Watchdog needs a Python interpreter to run scripts.health_check; resolve it

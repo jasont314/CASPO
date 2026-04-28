@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-ROOT=/mnt/nvme_tmp/jason_caspo
+ROOT=/mnt/nvme_tmp2/jason_caspo
 BASE_CONFIG=configs/caspo_rho1b_math.yaml
 RUN_TAG="${RUN_TAG:-}"
 RUN_SUFFIX=""

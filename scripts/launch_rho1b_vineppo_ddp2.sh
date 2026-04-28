@@ -44,7 +44,7 @@ cd "$(dirname "$0")/.."
 source ./scripts/perf_env.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/scalable/bin/python}"
-ROOT="${ROOT:-/mnt/nvme_tmp/jason_caspo}"
+ROOT="${ROOT:-/mnt/nvme_tmp2/jason_caspo}"
 BASE_CONFIG="${BASE_CONFIG:-configs/caspo_rho1b_math.yaml}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29577}"

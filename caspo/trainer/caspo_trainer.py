@@ -400,26 +400,34 @@ class CASPOTrainer:
 
         # ---- policy model (π_θ, trainable) ----
         torch_dtype = _resolve_dtype(cfg.torch_dtype)
-        # fp32 master-weights path: load fp32, FSDP MixedPrecision casts
-        # to bf16 at compute time. Only valid when the policy will be
-        # FSDP-wrapped — without FSDP MixedPrecision the params stay fp32
-        # at forward time and FlashAttention rejects fp32 inputs. Fall
-        # back to bf16 load (and emit a one-line warning) for non-FSDP
-        # configs (single-GPU, DDP) so the run still works; the user
-        # sees they're not getting fp32-master fidelity for that config.
+        # fp32 master-weights path. Two routes:
+        #   (a) FSDP: load fp32, FSDP MixedPrecision(param_dtype=bf16) casts
+        #       to bf16 at compute time. Optimizer sees fp32 master.
+        #   (b) Non-FSDP (single-GPU, DDP): load fp32, wrap forward calls in
+        #       torch.autocast(device_type="cuda", dtype=bf16) so FA3 sees
+        #       bf16 inputs. Backward auto-casts grads back to fp32. Optimizer
+        #       still sees fp32 master.
+        # Both routes keep AdamW state and updates in fp32, fixing the bf16
+        # noise floor at lr=1e-6.
         want_fp32_master = (
             cfg.fp32_master_weights and torch_dtype != torch.float32
         )
         will_fsdp_wrap = bool(cfg.distributed_backend == "fsdp")
-        if want_fp32_master and not will_fsdp_wrap:
+        # Autocast is needed when fp32-master is on but FSDP isn't (so the
+        # MixedPrecision cast at forward time isn't there to cast bf16 for us).
+        self._use_compute_autocast = want_fp32_master and not will_fsdp_wrap
+        self._compute_autocast_dtype = (
+            torch_dtype if self._use_compute_autocast else None
+        )
+        if self._use_compute_autocast:
             rank0_print(
                 self.dist,
-                "[trainer] fp32_master_weights=True ignored: requires "
-                "distributed_backend='fsdp' so MixedPrecision can cast bf16 "
-                "at forward time. Falling back to bf16 load (no fp32 master).",
+                f"[trainer] fp32_master_weights=True via autocast(dtype="
+                f"{torch_dtype}). Non-FSDP path: forward calls run under "
+                f"torch.autocast so FA3 receives bf16 while AdamW state "
+                f"and updates stay fp32.",
                 flush=True,
             )
-            want_fp32_master = False
         load_dtype = torch.float32 if want_fp32_master else torch_dtype
         model_kwargs = dict(
             torch_dtype=load_dtype,
@@ -1108,6 +1116,56 @@ class CASPOTrainer:
             return module.clip_grad_norm_(max_norm)
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
 
+    def _compute_autocast(self):
+        """Cast forward ops to bf16 for the fp32-master non-FSDP path.
+
+        When ``fp32_master_weights=True`` and the model is NOT FSDP-wrapped,
+        params live in fp32 storage but FA3 / FA2 reject fp32 inputs. We wrap
+        forwards in ``torch.autocast(device_type="cuda", dtype=bf16)`` so:
+            - inputs to autocast-eligible ops (Linear, MatMul, Conv) are
+              cast to bf16 at op entry; the model sees bf16 internally
+            - upcasts back to fp32 for stability-sensitive ops (softmax,
+              layernorm) per PyTorch's standard autocast policy
+            - backward auto-casts gradients back to param dtype = fp32
+        Optimizer state, m/v, and the param.add_ update all stay fp32.
+        Returns a no-op nullcontext when autocast isn't needed (FSDP path,
+        or fp32_master disabled).
+        """
+        if self._use_compute_autocast and self._compute_autocast_dtype is not None:
+            # cache_enabled=False is critical here: autocast caches bf16
+            # casts of fp32 leaf params for reuse. The cache is populated
+            # by upstream no_grad forwards (_rescore_old_logprobs,
+            # _precompute_ref_logprobs) and reused by the trainable
+            # forward, but the cached tensor is detached from the fp32
+            # leaf — so backward-on-cached-cast cannot accumulate into
+            # param.grad. Symptom: only Embedding + LayerNorm params
+            # get grad; Linear projections see param.grad=None and stay
+            # untrained / un-stated. Disabling the cache forces a fresh
+            # cast at the trainable-forward call site, which preserves
+            # the autograd link.
+            return torch.autocast(
+                device_type="cuda",
+                dtype=self._compute_autocast_dtype,
+                cache_enabled=False,
+            )
+        return contextlib.nullcontext()
+
+    def _no_autocast(self):
+        """Force-disable autocast for ops that must NOT be cast.
+
+        optimizer.step() is the canonical case: with autocast active around
+        a fused AdamW step(), state initialization for some param groups
+        gets skipped (only embedding + LayerNorms get state at first step,
+        Linear projections are missed) — leaving most params untrained
+        and the optimizer-state checkpoint incomplete. Wrapping
+        optimizer.step() in ``autocast(enabled=False)`` ensures every param
+        gets its first-step state initialization in the param's native
+        dtype (fp32 under fp32-master).
+        """
+        if self._use_compute_autocast:
+            return torch.autocast(device_type="cuda", enabled=False)
+        return contextlib.nullcontext()
+
     @staticmethod
     def _maybe_no_sync(module: torch.nn.Module, enabled: bool):
         # Suppress cross-rank gradient reduction during the inner accumulation
@@ -1393,6 +1451,74 @@ class CASPOTrainer:
             error_msg = None
         _raise_if_save_failed(error_msg)
 
+    def _save_optimizer_state(self, path: str) -> None:
+        """Save AdamW state + LR-scheduler state for resume after crash.
+
+        For FSDP-wrapped models, uses FSDP's full_optim_state_dict to gather
+        the sharded state to rank 0. For non-FSDP/DDP/single-GPU, calls
+        ``optimizer.state_dict()`` directly (state is already replicated).
+
+        Output layout under ``path``:
+          - optimizer.pt   : main policy AdamW state + lr_scheduler state +
+                              global_step
+          - critic_optimizer.pt   : iff method=ppo_critic
+          - value_optimizer.pt    : iff method=caspo and online value updates
+        """
+        if not self.cfg.save_optimizer_state:
+            return
+
+        try:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+            )
+            _fsdp_avail = True
+        except Exception:
+            _fsdp_avail = False
+
+        def _gather_optim_state(module, optimizer):
+            if _fsdp_avail and _is_fsdp_module(module):
+                # FullStateDictConfig is implicit; full_optim_state_dict
+                # gathers all shards to rank 0 in CPU offload mode.
+                return FSDP.full_optim_state_dict(
+                    module, optimizer, rank0_only=True,
+                )
+            return optimizer.state_dict()
+
+        policy_optim_sd = _gather_optim_state(self.model, self.optimizer)
+        critic_optim_sd = (
+            _gather_optim_state(self.critic_model, self.critic_optimizer)
+            if self.critic_optimizer is not None and self.critic_model is not None
+            else None
+        )
+        value_optim_sd = (
+            self.value_optimizer.state_dict()
+            if self.value_optimizer is not None
+            else None
+        )
+
+        if not self.dist.is_main:
+            return
+        os.makedirs(path, exist_ok=True)
+        bundle = {
+            "policy_optimizer": policy_optim_sd,
+            "lr_scheduler": self.lr_scheduler.state_dict()
+            if self.lr_scheduler is not None else None,
+            "critic_lr_scheduler": self.critic_lr_scheduler.state_dict()
+            if self.critic_lr_scheduler is not None else None,
+            "global_step": int(self.global_step),
+        }
+        torch.save(bundle, os.path.join(path, "optimizer.pt"))
+        if critic_optim_sd is not None:
+            torch.save(
+                {"critic_optimizer": critic_optim_sd},
+                os.path.join(path, "critic_optimizer.pt"),
+            )
+        if value_optim_sd is not None:
+            torch.save(
+                {"value_optimizer": value_optim_sd},
+                os.path.join(path, "value_optimizer.pt"),
+            )
+
     def _auto_run_name(self) -> str:
         cfg = self.cfg
         model_short = cfg.model_name_or_path.rsplit("/", 1)[-1]
@@ -1548,7 +1674,10 @@ class CASPOTrainer:
                 # Weight microbatch token means by their valid-token count
                 # inside each accumulation group. This matches the policy
                 # objective and avoids overweighting short responses.
-                (v_loss * grad_weight).backward()
+                # Backward must run with autocast disabled — see comment at
+                # the policy-loop backward call site.
+                with self._no_autocast():
+                    (v_loss * grad_weight).backward()
                 v_loss_terms.append(v_loss.detach() * float(micro_tokens))
                 v_loss_weight_denom += float(micro_tokens)
                 n_micro_in_epoch += 1
@@ -1562,10 +1691,11 @@ class CASPOTrainer:
                             )
                         except Exception:
                             pass
-                    self.critic_optimizer.step()
-                    if self.critic_lr_scheduler is not None:
-                        self.critic_lr_scheduler.step()
-                    self.critic_optimizer.zero_grad(set_to_none=True)
+                    with self._no_autocast():
+                        self.critic_optimizer.step()
+                        if self.critic_lr_scheduler is not None:
+                            self.critic_lr_scheduler.step()
+                        self.critic_optimizer.zero_grad(set_to_none=True)
 
         v_loss_mean = (
             float(torch.stack(v_loss_terms).sum().item() / max(v_loss_weight_denom, 1.0))
@@ -1793,7 +1923,8 @@ class CASPOTrainer:
                     micro_rows * world_size / global_total_rows
                     if global_total_rows > 0.0 else 0.0
                 )
-                (v_loss * grad_weight).backward()
+                with self._no_autocast():
+                    (v_loss * grad_weight).backward()
             stat_weight = micro_rows / total_rows if total_rows > 0.0 else 0.0
             agg["value_loss"] += v_stats["loss"] * stat_weight
             agg["value_acc"] += v_stats["acc_at_last"] * stat_weight
@@ -1813,8 +1944,9 @@ class CASPOTrainer:
                 self.value_model.phi.parameters(),
                 max_norm=cfg.value_grad_clip,
             )
-        self.value_optimizer.step()
-        self.value_optimizer.zero_grad(set_to_none=True)
+        with self._no_autocast():
+            self.value_optimizer.step()
+            self.value_optimizer.zero_grad(set_to_none=True)
         if V_x_full is not None:
             agg["adb_v_x_mean"] = float(V_x_full.mean().item())
             agg["adb_v_x_std"] = float(V_x_full.std().item())
@@ -2180,6 +2312,10 @@ class CASPOTrainer:
     # ------------------------------------------------------------------ step
 
     def step(self, examples: List[dict], *, sync_vllm: bool = True) -> dict:
+        with self._compute_autocast():
+            return self._step_inner(examples, sync_vllm=sync_vllm)
+
+    def _step_inner(self, examples: List[dict], *, sync_vllm: bool = True) -> dict:
         cfg = self.cfg
         G = int(cfg.group_size)
         t_step_start = time.time()
@@ -2599,7 +2735,17 @@ class CASPOTrainer:
                     # policy parameter sets are disjoint, so a joint
                     # backward over the same graph is not numerically
                     # different from two separate backwards).
-                    (loss * grad_weight).backward()
+                    # CRITICAL: backward() must run with autocast
+                    # DISABLED. Standard PyTorch amp recipe — running
+                    # backward under autocast breaks the cast-back
+                    # mechanism that propagates bf16 grads to fp32 leaf
+                    # params. Symptom: only Embedding + LayerNorm params
+                    # receive grad; Linear projections get param.grad
+                    # =None and are silently never trained / never
+                    # included in optimizer state. _no_autocast is a
+                    # no-op when autocast isn't active (FSDP path).
+                    with self._no_autocast():
+                        (loss * grad_weight).backward()
 
                 with torch.no_grad():
                     # Stage on-device contributions; we ``.tolist()`` the
@@ -2633,9 +2779,10 @@ class CASPOTrainer:
                         grad_norm_sum += float(grad_norm)
                         grad_norm_max = max(grad_norm_max, float(grad_norm))
                         grad_norm_count += 1
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    with self._no_autocast():
+                        self.optimizer.step()
+                        self.lr_scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
                     # Critic update is decoupled from the policy mb
                     # loop (see ``_ppo_critic_train_critic`` invoked
                     # AFTER this loop completes). Here we only step
@@ -3086,6 +3233,21 @@ class CASPOTrainer:
         self._save_policy_pretrained(
             path, safe_serialization=True, save_tokenizer=True,
         )
+        # Optimizer state (AdamW m/v + LR sched) for crash-resume. Runs
+        # collective gather across ranks for FSDP — must be called on every
+        # rank (not just rank 0). The actual file write is rank-0-only.
+        try:
+            self._save_optimizer_state(path)
+        except Exception as e:  # noqa: BLE001
+            # Optimizer save is best-effort: if it fails (e.g. disk full),
+            # the policy weights are already on disk and the run can
+            # continue. Loss is just optimizer-state-resume capability.
+            rank0_print(
+                self.dist,
+                f"[checkpoint] WARNING: optimizer-state save failed at {path}: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
         meta_error: Optional[str] = None
         if self.dist.is_main:
             try:

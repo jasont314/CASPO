@@ -300,6 +300,12 @@ class CASPOConfig:
     # was a footgun (would mis-align and only fire at LCM cadence).
     save_every: int = 200
     eval_every: int = 200
+    # When True, also save AdamW state (m/v/step) + LR-scheduler state +
+    # critic/value-model optimizer state (when present) at every save_every
+    # boundary. Required to resume mid-training without losing optimizer
+    # momentum after a crash. fp32 master adds ~3× model-bytes per save
+    # (params + m + v); disable on tight-disk runs and pay the resume cost.
+    save_optimizer_state: bool = True
     # Set to a free GPU index (e.g. CASPO_EVAL_GPU=2 in the launcher
     # env) to dispatch ``scripts/eval.py`` as a fire-and-forget
     # subprocess after each ``eval_every`` checkpoint. -1 disables.
