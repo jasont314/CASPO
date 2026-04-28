@@ -184,35 +184,31 @@ trajectory evaluation. For v6_multi with 177 steps/epoch, we used 50.
 
 ## Quick recipes
 
-### Rho-1B retrain on combined MATH + Big-Math (recommended)
+The orchestrator and one-GPU launcher both accept `DATASET_NAME` and
+`DATASET_CONFIG` env vars (forwarded as `--override` to
+`collect_value_data` / `train_caspo`). No YAML edits needed.
 
-The data loader supports concatenating multiple datasets. Patch
-`configs/caspo_rho1b_math.yaml`:
-
-```yaml
-dataset_name: open-r1/Big-Math-RL-Verified-Processed
-dataset_config: all                    # 215K rows, all difficulties
-dataset_split: train
-# Optional: filter by Llama-8B solve rate to maximize mixed-outcome yield
-# (requires a tiny patch to caspo/data/math_data.py — see "TODO" below).
-```
-
-Then:
+### Rho-1B retrain on Big-Math `level_1` (recommended, paper-grade)
 
 ```bash
 GPU_LIST="4 5 6 7" \
-OUT_ROOT=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v7_bigmath \
+OUT_ROOT=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v7_bigmath_l1 \
+DATASET_NAME=open-r1/Big-Math-RL-Verified-Processed \
+DATASET_CONFIG=level_1 \
 PAPER_PAIRING_MULTI=true \
 VALUE_LR=5e-6 \
 VALUE_MAX_EPOCHS=3 \
-VALUE_SAVE_EVERY=200 \
+VALUE_SAVE_EVERY=500 \
   bash scripts/retrain_value_rho1b_4gpu.sh
 ```
 
-ETA on 4× H100: ~2-3 hours total (rollout collection dominates at this
-scale; train is ~40-60 min for ~50K rows × 3 epochs).
+ETA on 4× H100: **~2.5 hours** (collect ~75 min on ~40K prompts ×
+K=8, train ~70 min on ~100K rows × 3 epochs, smoke ~5 min). Yields
+~25K mixed prompts at 62.5% level_1 mixed-outcome rate (16× v6_multi's
+1,575). Projected AUC: **0.68-0.71** (vs v6_multi's 0.633 on
+MATH-lighteval).
 
-### Rho-1B retrain on MATH only (current baseline, fast iteration)
+### Rho-1B retrain on MATH-lighteval (paper-faithful baseline, fast)
 
 ```bash
 GPU_LIST="4 5 6 7" \
@@ -224,20 +220,26 @@ VALUE_SAVE_EVERY=50 \
   bash scripts/retrain_value_rho1b_4gpu.sh
 ```
 
-ETA: ~20 min total.
+ETA: ~20 min total. AUC plateau: 0.633.
 
-### DeepSeekMath-7B retrain on DeepScaleR
+### DeepSeekMath-7B retrain on Big-Math `level_2` (recommended)
 
-Use `scripts/_launch_7b_value_train.sh` (currently MATH-lighteval; needs
-small patch to switch dataset):
+Use the 7B equivalent of the orchestrator (`scripts/_launch_7b_value_train.sh`)
+with the same env-var pattern:
 
-```yaml
-# in configs/caspo_deepseekmath_7b.yaml (or whichever 7B config you use)
-dataset_name: agentica-org/DeepScaleR-Preview-Dataset
-dataset_split: train
+```bash
+GPU_LIST="4 5 6 7" \
+OUT_ROOT=/mnt/nvme_tmp/jason_caspo/value_model_dsmath7b_bigmath_l2 \
+DATASET_NAME=open-r1/Big-Math-RL-Verified-Processed \
+DATASET_CONFIG=level_2 \
+PAPER_PAIRING_MULTI=true \
+VALUE_LR=5e-6 \
+VALUE_MAX_EPOCHS=3 \
+  bash scripts/_launch_7b_value_train.sh
 ```
 
-Then run the 7B value-train script. ETA: ~6-8 hours on 4 GPUs.
+ETA: ~6-8 hours on 4× H100. **Do NOT use DeepScaleR** — empirically too
+hard (only 12% mixed-outcome yield for 7B-SFT; 96% failures).
 
 ---
 
@@ -268,13 +270,16 @@ Reference baselines on v6_multi held-out:
 
 ## Known TODOs
 
-1. **Difficulty filter for Big-Math**: `caspo/data/math_data.py:_row_to_example`
-   doesn't currently filter on `llama8b_solve_rate`. Adding a check
-   `if 0.2 <= row.get("llama8b_solve_rate", 0.5) <= 0.8` would skip
-   ~70% of saturated prompts before rollout, halving the collect time.
+1. ~~**Difficulty filter for Big-Math**~~ — **resolved**: Big-Math's
+   own `level_1`..`level_5` configs (and `quintile_1`..`quintile_5`)
+   provide pre-computed difficulty buckets. Use `DATASET_CONFIG=level_1`
+   for Rho-1B and `level_2` for DeepSeekMath-7B (validated empirically
+   above).
 2. **Multi-dataset concat**: loader currently takes one `dataset_name`.
-   For "MATH + Big-Math + DeepScaleR" we'd need to extend
-   `caspo/data/__init__.py:load_train_dataset` to accept a list.
+   For "MATH + Big-Math" or "Big-Math level_1 + level_2" we'd need to
+   extend `caspo/data/__init__.py:load_train_dataset` to accept a list.
+   Workaround for now: pick a single config (level_1 alone is enough
+   for Rho-1B; level_2 alone suffices for 7B).
 3. **Per-step V_φ AUC during RL**: currently only offline AUC. Adding
    periodic AUC eval inside the RL loop would let us detect online
    drift in real time (relevant when bumping `online_value_lr`).
