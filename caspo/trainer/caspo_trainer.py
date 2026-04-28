@@ -1215,6 +1215,57 @@ class CASPOTrainer:
                 return no_sync_fn()
         return contextlib.nullcontext()
 
+    @staticmethod
+    def _offload_optim_state_to_cpu(optimizer) -> int:
+        """Move all CUDA tensors in ``optimizer.state`` to pinned host memory.
+
+        Used to free GPU AdamW state for the duration of an FSDP
+        ``summon_full_params`` (which materializes the unsharded model on
+        each rank). At 7B fp32-master + 4-rank FSDP, AdamW state takes
+        ~14 GiB/rank — without freeing it, the unsharded summon (28 GiB)
+        OOMs.
+
+        Returns the number of tensors moved (for logging/diagnostics). No-op
+        if the optimizer has no state (e.g. before the first ``optim.step()``)
+        or when ``optimizer is None``.
+        """
+        if optimizer is None:
+            return 0
+        moved = 0
+        for state in optimizer.state.values():
+            for k, v in list(state.items()):
+                if isinstance(v, torch.Tensor) and v.is_cuda:
+                    # ``pin_memory=True`` lets the matching .to(device,
+                    # non_blocking=True) below run on a copy stream concurrently
+                    # with other GPU work. Without pinning, the H2D path
+                    # synchronizes against the default stream and adds ~2×
+                    # the PCIe latency to step time.
+                    cpu_tensor = torch.empty_like(v, device="cpu", pin_memory=True)
+                    cpu_tensor.copy_(v, non_blocking=True)
+                    state[k] = cpu_tensor
+                    moved += 1
+        # Force completion of the async D2H copies before we free the GPU
+        # tensors via empty_cache; otherwise the refcount drop races with
+        # in-flight DMA.
+        torch.cuda.synchronize()
+        return moved
+
+    @staticmethod
+    def _restore_optim_state_to_gpu(optimizer, device: torch.device) -> int:
+        """Move pinned-CPU tensors back to ``device``. Inverse of offload."""
+        if optimizer is None:
+            return 0
+        moved = 0
+        for state in optimizer.state.values():
+            for k, v in list(state.items()):
+                if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                    state[k] = v.to(device, non_blocking=True)
+                    moved += 1
+        # Wait for H2D copies to complete before the next optim.step()
+        # consumes them; otherwise step() reads stale GPU memory.
+        torch.cuda.synchronize()
+        return moved
+
     def _whiten_mb_advantage(
         self,
         adv: torch.Tensor,
@@ -2885,7 +2936,25 @@ class CASPOTrainer:
         # loop passes ``sync_vllm=False`` for its final step because no later
         # rollout will consume the engine; direct callers keep the historical
         # default of syncing after every step.
-        t_sync = self._sync_vllm_weights() if self._sync_dir and sync_vllm else 0.0
+        sync_will_run = bool(self._sync_dir and sync_vllm)
+        if sync_will_run and cfg.offload_optim_during_sync:
+            # Free GPU AdamW state (m, v) for the FSDP summon_full_params
+            # materialization. Without this, 7B fp32-master + 4-rank FSDP
+            # OOMs at the 28 GiB unsharded fp32 + 14 GiB AdamW + ~20 GiB
+            # other state crosses the 80 GiB H100 budget. The offload runs
+            # asynchronously over pinned-host memory and the restore happens
+            # after the IPC push completes.
+            self._offload_optim_state_to_cpu(self.optimizer)
+            self._offload_optim_state_to_cpu(self.value_optimizer)
+            self._offload_optim_state_to_cpu(self.critic_optimizer)
+            torch.cuda.empty_cache()
+        try:
+            t_sync = self._sync_vllm_weights() if sync_will_run else 0.0
+        finally:
+            if sync_will_run and cfg.offload_optim_during_sync:
+                self._restore_optim_state_to_gpu(self.optimizer, self.device)
+                self._restore_optim_state_to_gpu(self.value_optimizer, self.device)
+                self._restore_optim_state_to_gpu(self.critic_optimizer, self.device)
 
         denom = max(1.0, token_weight_denom)
         # Average KL only over the micros that actually produced one

@@ -63,6 +63,13 @@ fsdp_forward_prefetch: true
 fsdp_limit_all_gathers: true
 fsdp_backward_prefetch: backward_pre
 
+# Required for fp32 master + colocated vLLM at 7B: AdamW state (m, v) lives
+# on GPU during training, but FSDP summon_full_params at sync time
+# materializes ~28 GiB unsharded fp32 on each rank — without freeing the
+# 14 GiB AdamW slot for the duration of the summon, we OOM at the step 1→2
+# inter-step sync boundary. ~400-500 ms/sync overhead at PCIe Gen5.
+offload_optim_during_sync: true
+
 segmentation_mode: latex_aware
 step_delimiter: "\n"
 min_step_tokens: 4

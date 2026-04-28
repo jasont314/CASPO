@@ -306,6 +306,17 @@ class CASPOConfig:
     # momentum after a crash. fp32 master adds ~3× model-bytes per save
     # (params + m + v); disable on tight-disk runs and pay the resume cost.
     save_optimizer_state: bool = True
+    # When True, temporarily move policy/critic/value AdamW state (m, v) to
+    # pinned host memory before each ``_sync_vllm_weights`` call and restore
+    # afterward. Required for 7B fp32-master + 4-rank FSDP + colocated vLLM:
+    # without offload, sync's ``summon_full_params`` materializes ~28 GiB
+    # unsharded fp32 on top of ~14 GiB AdamW state and OOMs at step 1→2
+    # transition. With offload, the AdamW slot is freed for the duration of
+    # the summon, the IPC push runs, then state is moved back. Cost:
+    # ~14 GiB × 2 (down + up) over PCIe per sync ≈ 400-500 ms/sync at PCIe
+    # Gen5 (~1% step-time slowdown at 7B). Default False — only flip on
+    # for memory-tight configs (7B fp32-master + 4-GPU).
+    offload_optim_during_sync: bool = False
     # Set to a free GPU index (e.g. CASPO_EVAL_GPU=2 in the launcher
     # env) to dispatch ``scripts/eval.py`` as a fire-and-forget
     # subprocess after each ``eval_every`` checkpoint. -1 disables.
