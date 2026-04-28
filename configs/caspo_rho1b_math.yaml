@@ -97,7 +97,7 @@ epochs_per_rollout: 2             # VinePPO: num_epochs_per_iteration=2
 max_steps: 1000                   # VinePPO: total_num_iterations=1000
 seed: 0
 log_every: 1
-save_every: 40                    # PPO repo config save_steps=40; VinePPO's repo overrides this to 10
+save_every: 200                   # 5 ckpts at 200/400/600/800/1000 — fits 4-parallel 1B in 350 GB drive
 eval_every: 40
 
 device: cuda

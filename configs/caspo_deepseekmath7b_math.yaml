@@ -123,7 +123,7 @@ epochs_per_rollout: 2
 max_steps: 1000                   # paper-faithful: VinePPO uses num_iterations=1000 for both Rho-1B and 7B.
 seed: 0
 log_every: 1
-save_every: 40
+save_every: 200
 eval_every: 40
 
 reward_workers: 4
