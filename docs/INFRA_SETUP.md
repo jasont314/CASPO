@@ -247,6 +247,13 @@ export MKL_NUM_THREADS=4
 
 ### IPVRM value model checkpoints (CASPO prerequisites)
 
+> **For the V_φ training pipeline itself** (datasets, knobs, AUC
+> validation), see [`docs/RM_TRAINING.md`](RM_TRAINING.md). Short
+> summary: Rho-1B → `open-r1/Big-Math-RL-Verified-Processed` (215K
+> rows); DeepSeekMath-7B → `agentica-org/DeepScaleR-Preview-Dataset`
+> (40K rows).
+
+
 * **Rho-1B IPVRM v6_multi** (current live, 2026-04-28 evening):
   `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v6_multi/value_final` —
   produced by `scripts/retrain_value_rho1b_4gpu.sh PAPER_PAIRING_MULTI=true
