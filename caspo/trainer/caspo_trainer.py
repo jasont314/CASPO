@@ -445,7 +445,16 @@ class CASPOTrainer:
             pass
         _apply_activation_checkpointing(self.model, cfg)
 
-        self.model.to(self.device)
+        # FSDP path: skip .to(device) here. _wrap_fsdp_if_enabled handles
+        # device placement via device_id + sync_module_states=True. Doing
+        # .to(device) on a CPU model before FSDP wrap puts the FULL model
+        # on each rank's GPU as a transient — for 7B fp32 that's 28 GiB of
+        # transient peak before sharding kicks in, and stacking policy +
+        # ref + value at load time blows the H100 80 GiB budget.
+        # Non-FSDP path (single-GPU, DDP) still needs .to(device) since
+        # the model is used as-is without sharding.
+        if not will_fsdp_wrap:
+            self.model.to(self.device)
 
         # ---- prefix value model (V_φ) — only for method="caspo" ----
         self.value_model: Optional[PrefixValueModel] = None
@@ -457,7 +466,12 @@ class CASPOTrainer:
                     "checkpoint when method=caspo. Run scripts/train_value.py first."
                 )
             self.value_model = PrefixValueModel.from_pretrained(cfg, cfg.prefix_value_path)
-            self.value_model.to(self.device)
+            # Same reasoning as policy load: skip .to(device) when FSDP
+            # will wrap value_model.phi (and value_model.ref via share_ref)
+            # so we don't materialize full bf16 V_φ + V_ref on each rank's
+            # GPU before sharding.
+            if not will_fsdp_wrap:
+                self.value_model.to(self.device)
             if cfg.update_value_during_policy:
                 self.value_model.phi.train()
             else:
@@ -479,7 +493,10 @@ class CASPOTrainer:
 
             critic_path = cfg.critic_model_name_or_path or cfg.model_name_or_path
             self.critic_model = CriticModel.from_pretrained(cfg, critic_path)
-            self.critic_model.to(self.device)
+            # Same reasoning as policy: skip .to(device) when FSDP will wrap
+            # the critic; otherwise (single-GPU, DDP) move now.
+            if not will_fsdp_wrap:
+                self.critic_model.to(self.device)
             self.critic_model.train()
             self.critic_model = self._wrap_fsdp_if_enabled(
                 self.critic_model, module_name="critic",
@@ -518,7 +535,9 @@ class CASPOTrainer:
             for p in self.ref_policy.parameters():
                 p.requires_grad_(False)
             self.ref_policy.eval()
-            self.ref_policy.to(self.device)
+            # Same reasoning as policy: skip .to(device) when FSDP will wrap.
+            if not will_fsdp_wrap:
+                self.ref_policy.to(self.device)
 
             self.ref_policy = self._wrap_fsdp_if_enabled(
                 self.ref_policy, module_name="ref_policy",
@@ -930,6 +949,18 @@ class CASPOTrainer:
             "use_orig_params": self.cfg.fsdp_use_orig_params,
             "forward_prefetch": self.cfg.fsdp_forward_prefetch,
             "limit_all_gathers": self.cfg.fsdp_limit_all_gathers,
+            # Source module is on CPU per the trainer's load path; FSDP moves
+            # only the local SHARD onto device_id, never materializing the
+            # full model on each rank's GPU. ``sync_module_states=True`` then
+            # broadcasts each parameter from rank 0's CPU copy to populate
+            # the other ranks' shards. Together they (a) cap GPU peak at
+            # full_model/N + activation_peak instead of full_model + ...,
+            # and (b) preserve byte-identical post-shard params (broadcast
+            # is bit-exact; FSDP slices deterministically from the broadcast
+            # source). Requires every rank to call FSDP collectively (already
+            # the case — _wrap_fsdp_if_enabled is called outside any
+            # rank-gating branch).
+            "sync_module_states": True,
         }
         if self.device.type == "cuda":
             kwargs["device_id"] = torch.device("cuda", self.dist.local_rank)
