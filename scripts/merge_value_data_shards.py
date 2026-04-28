@@ -43,29 +43,57 @@ def main() -> None:
               f"resp_len={blob['response_ids'].shape[1]}", flush=True)
         blobs.append(blob)
 
-    # Validate shape compatibility (left-padded fixed-length tensors).
+    # Per-shard prompt/response widths can differ because each shard pads
+    # to its own slice-max rather than cfg.max_prompt_len. Pad all shards
+    # to the global max (left-pad for prompts, right-pad for responses)
+    # before concatenating along dim 0.
+    def _left_pad_to(t: torch.Tensor, target_len: int, pad_value: int) -> torch.Tensor:
+        if t.shape[1] == target_len:
+            return t
+        pad_w = target_len - t.shape[1]
+        if pad_w < 0:
+            raise SystemExit(f"target_len={target_len} < t.shape[1]={t.shape[1]}")
+        pad = torch.full(
+            (t.shape[0], pad_w), pad_value, dtype=t.dtype, device=t.device,
+        )
+        return torch.cat([pad, t], dim=1)
+
+    def _right_pad_to(t: torch.Tensor, target_len: int, pad_value: int) -> torch.Tensor:
+        if t.shape[1] == target_len:
+            return t
+        pad_w = target_len - t.shape[1]
+        if pad_w < 0:
+            raise SystemExit(f"target_len={target_len} < t.shape[1]={t.shape[1]}")
+        pad = torch.full(
+            (t.shape[0], pad_w), pad_value, dtype=t.dtype, device=t.device,
+        )
+        return torch.cat([t, pad], dim=1)
+
+    pmax = max(b["prompt_ids"].shape[1] for b in blobs)
+    rmax = max(b["response_ids"].shape[1] for b in blobs)
+    print(f"[merge] padding all shards to prompt_len={pmax}, resp_len={rmax}",
+          flush=True)
+
+    # Pad token id: use first shard's left-pad value (which collect uses) —
+    # for prompt_ids the typical pad is the EOS token (since pad_token = eos
+    # in the tokenizer). For mask we pad with 0 (= masked-out).
     first = blobs[0]
-    for b in blobs[1:]:
-        for k in ("prompt_ids", "prompt_mask"):
-            if b[k].shape[1] != first[k].shape[1]:
-                raise SystemExit(
-                    f"prompt-length mismatch on {k}: "
-                    f"{b[k].shape[1]} vs {first[k].shape[1]}. All shards must "
-                    f"use the same max_prompt_len."
-                )
-        for k in ("response_ids", "response_mask"):
-            if b[k].shape[1] != first[k].shape[1]:
-                raise SystemExit(
-                    f"response-length mismatch on {k}: "
-                    f"{b[k].shape[1]} vs {first[k].shape[1]}. All shards must "
-                    f"use the same max_response_len."
-                )
+    prompt_pad_id = int(first["prompt_ids"][0, 0].item())  # left-pad value used
+    response_pad_id = 0  # right-pad responses with 0 (masked anyway)
 
     merged = {
-        "prompt_ids": torch.cat([b["prompt_ids"] for b in blobs], dim=0),
-        "prompt_mask": torch.cat([b["prompt_mask"] for b in blobs], dim=0),
-        "response_ids": torch.cat([b["response_ids"] for b in blobs], dim=0),
-        "response_mask": torch.cat([b["response_mask"] for b in blobs], dim=0),
+        "prompt_ids": torch.cat([
+            _left_pad_to(b["prompt_ids"], pmax, prompt_pad_id) for b in blobs
+        ], dim=0),
+        "prompt_mask": torch.cat([
+            _left_pad_to(b["prompt_mask"], pmax, 0) for b in blobs
+        ], dim=0),
+        "response_ids": torch.cat([
+            _right_pad_to(b["response_ids"], rmax, response_pad_id) for b in blobs
+        ], dim=0),
+        "response_mask": torch.cat([
+            _right_pad_to(b["response_mask"], rmax, 0) for b in blobs
+        ], dim=0),
         "outcomes": torch.cat([b["outcomes"] for b in blobs], dim=0),
         "raw_prompts": [p for b in blobs for p in b["raw_prompts"]],
         "raw_responses": [r for b in blobs for r in b["raw_responses"]],
