@@ -30,11 +30,39 @@ datasets (this doc) is the main lever before downstream RL eval.
 
 ## Recommended dataset per model
 
-| Model | Dataset | Why |
-|---|---|---|
-| **Rho-1B-SFT** | **`open-r1/Big-Math-RL-Verified-Processed`** (215,608 rows) | Curated, deduped, has Llama-8B solve-rate annotations to filter for mid-difficulty. Rho-1B's MATH solve rate ≈ 21%; we want problems where llama8b ∈ [0.2, 0.7] → most rollouts will produce mixed outcomes (the only ones useful to BCE-margin). Big enough that we never re-pass the same prompt during V_φ training. |
-| **DeepSeekMath-7B** | **`agentica-org/DeepScaleR-Preview-Dataset`** (40,315 rows) | Targeted at 7B-scale reasoning; difficulty distribution matches what DeepSeekMath produces useful mixed-outcome rollouts on. MATH-lighteval and lighter datasets are too easy for 7B — most prompts saturate to all-correct. |
-| (Both, current default) | `DigitalLearningGmbH/MATH-lighteval` (7,500 rows) | Used historically for parity with VinePPO paper; too small for V_φ to reach paper-grade AUC. Kept as a baseline / reproduction reference only. |
+**Plan: train V_φ AND policy on the same dataset (per model size), then
+eval on MATH-500 + GSM8K + AIME-2025.** This avoids cross-distribution
+shift between V_φ training and RL deployment, follows standard
+RL-for-LLM paper practice (PRM800K, DeepSeek-R1, Math-Shepherd), and
+lets MATH-500 serve as a true OOD generalization eval.
+
+| Model | RM training | RL training | Eval | Why |
+|---|---|---|---|---|
+| **Rho-1B-SFT** | **`open-r1/Big-Math-RL-Verified-Processed`** (215,608 rows) | Same (subsampled to ~15K mid-difficulty for compute) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | Curated, deduped, has Llama-8B solve-rate annotations for difficulty filtering. Rho-1B's MATH solve rate ≈ 21%; pick problems with `llama8b_solve_rate ∈ [0.2, 0.7]` → most rollouts produce mixed outcomes. |
+| **DeepSeekMath-7B** | **`agentica-org/DeepScaleR-Preview-Dataset`** (40,315 rows) | Same (subsampled if needed) | MATH-500, GSM8K, AIME-2025-I, OlympiadBench | AIME/AMC/OmniMATH/Still-Math curated for 7B-scale reasoning. MATH-lighteval saturates too easily for 7B. |
+| (paper-faithful baseline) | `DigitalLearningGmbH/MATH-lighteval` (7,500 rows) | Same | MATH-500 only (matches VinePPO paper) | Reproduction reference. Too small for V_φ to reach paper-grade AUC (we plateau at ~0.63 here vs Big-Math's projected ~0.70). Run as the "VinePPO-faithful" arm only. |
+
+### Eval-set leakage (verified 2026-04-28)
+
+Cross-checked all candidate train datasets against the eval suite:
+
+| Train | MATH-500 | GSM8K | AIME-2025-I | OlympiadBench | AIME-2024 | AMC-val | AIME-val (AI-MO) |
+|---|---|---|---|---|---|---|---|
+| Big-Math (215K) | 0/500 ✓ | 0/1319 ✓ | 0/15 ✓ | 2/674 (0.3%) ✓ | 17/30 (57%) ✗ | 47/83 (57%) ✗ | 62/90 (69%) ✗ |
+| DeepScaleR (40K) | **3/500 (0.6%)** ✗ | 0/1319 ✓ | 0/15 ✓ | 0/674 ✓ | 0/30 ✓ | 0/83 ✓ | 46/90 (51%) ✗ |
+| MATH-lighteval (7.5K) | 0/500 ✓ | 0/1319 ✓ | 0/15 ✓ | 0/674 ✓ | 0/30 ✓ | 0/83 ✓ | 0/90 ✓ |
+
+**Filter applied automatically.** `caspo.data.eval_leak` hashes all
+problems in MATH-500 + GSM8K + AIME-2025-I + OlympiadBench at training
+data load time; `_build_from_rows` drops any matching train row.
+Filtering is on by default (`cfg.filter_eval_leakage = True`); set
+False for paper-faithful baseline reproductions where the original
+dataset author's filtering should be respected verbatim.
+
+**Eval-set restrictions for paper writeup:**
+- **PRIMARY (clean for both train sets):** MATH-500, GSM8K, AIME-2025-I, OlympiadBench. Use these.
+- **DO NOT eval on with Big-Math train**: AIME-2024, AMC-val (AI-MO).
+- **DO NOT eval on with EITHER train**: AIME-val (AI-MO).
 
 **Rationale for difficulty matching:** the BCE-with-margin loss only
 trains on **mixed-outcome prompts** (some rollouts correct, some

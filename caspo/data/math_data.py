@@ -201,14 +201,43 @@ def _build_from_rows(
     ``tokenizer(text)`` calls dominate dataset-build time on big corpora
     (DeepScaleR ~40k rows). We collect the rendered examples first and run
     one ``batch_encode_plus`` (or fallback ``__call__``) at the end.
+
+    When ``cfg.filter_eval_leakage`` is True (default), drops any row whose
+    normalized problem text matches an eval-set problem (MATH-500, GSM8K,
+    AIME-2025, OlympiadBench). See ``caspo/data/eval_leak.py``.
     """
     max_len = int(cfg.max_prompt_len)
+
+    eval_hashes = None
+    is_eval_leak = None
+    if bool(getattr(cfg, "filter_eval_leakage", True)):
+        try:
+            from caspo.data.eval_leak import (
+                get_eval_leak_hashes,
+                is_eval_leak as _is_eval_leak,
+            )
+            eval_hashes = get_eval_leak_hashes()
+            is_eval_leak = _is_eval_leak
+        except Exception as _e:
+            print(f"[data] WARN: eval-leak filter init failed: {_e}", flush=True)
+            eval_hashes = None
+            is_eval_leak = None
+
     # Materialize all valid examples first (cheap: pure string ops).
     examples: List[dict] = []
+    n_dropped_leak = 0
     for row in rows:
         ex = _row_to_example(row, cfg, tokenizer)
-        if ex is not None:
-            examples.append(ex)
+        if ex is None:
+            continue
+        if eval_hashes is not None and is_eval_leak is not None:
+            if is_eval_leak(ex["raw_question"], eval_hashes):
+                n_dropped_leak += 1
+                continue
+        examples.append(ex)
+    if n_dropped_leak > 0:
+        print(f"[data] dropped {n_dropped_leak} rows with eval-set leakage "
+              f"(MATH-500/GSM8K/AIME-2025/OlympiadBench)", flush=True)
 
     # Length filter is optional (no tokenizer or max_len<=0 → keep all).
     if tokenizer is None or max_len <= 0 or not examples:

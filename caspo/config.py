@@ -114,6 +114,12 @@ class CASPOConfig:
     prompt_template: Optional[str] = None
     max_prompt_len: int = 1024
     max_response_len: int = 4096
+    # When True, the training-data loader drops any row whose normalized
+    # problem text matches a problem in our eval suite (MATH-500, GSM8K,
+    # AIME-2025, OlympiadBench). Verified necessary for DeepScaleR
+    # (3/500 MATH-500 overlap) and Big-Math (2/674 OlympiadBench
+    # incidental). See ``caspo/data/eval_leak.py``.
+    filter_eval_leakage: bool = True
     # VinePPO ``max_sequence_length=2048`` unfinished-response penalty.
     # When prompt+response token total exceeds this, the rollout is treated
     # as unfinished and reward is zeroed (matches MathEpisodeGenerator's
