@@ -1267,97 +1267,40 @@ class VLLMRolloutEngine:
         props = torch.cuda.get_device_properties(device_index)
         gpu_uuid = str(props.uuid)
 
-        # Streaming IPC sync. Two changes vs the previous "build full
-        # list then push one big update_weights" approach:
-        #
-        # (1) Per-param fp32 -> bf16 cast at handle-build time. Under
-        # ``fp32_master_weights=True``, ``summon_full_params`` returns
-        # params in storage dtype (fp32). vLLM's model is bf16, so
-        # shipping fp32 IPC handles forces vLLM to allocate bf16 buffers
-        # and cast on load — doubling transient memory on the same
-        # physical GPU during sync. Casting once on the source side
-        # to bf16 (the dtype vLLM expects) halves the IPC payload and
-        # eliminates the receiver-side fp32->bf16 cast buffer.
-        #
-        # (2) Chunked submission. The previous code held a Python ref
-        # to EVERY param's IPC-handle source tensor (the ``keepalive``
-        # list) for the duration of the SINGLE large update_weights
-        # RPC. With per-param bf16 cast, each cast tensor is a fresh
-        # allocation; if we cast all params upfront we'd peak at
-        # ~param_bytes (bf16) on top of the summon_full_params unshard.
-        # Submitting in chunks of CHUNK_SIZE caps that peak at
-        # CHUNK_SIZE × largest_param_bytes (~bytes, not GiB).
-        target_dtype = torch.bfloat16
-        CHUNK_SIZE = 8
-
-        def _flush(chunk_names, chunk_dtypes, chunk_shapes,
-                   chunk_handles, chunk_keepalive):
-            if not chunk_names:
-                return
-            pickled_handles = base64.b64encode(
-                pickle.dumps(chunk_handles)
-            ).decode("utf-8")
-            request = WeightTransferUpdateRequest(
-                update_info={
-                    "names": chunk_names,
-                    "dtype_names": chunk_dtypes,
-                    "shapes": chunk_shapes,
-                    "ipc_handles_pickled": pickled_handles,
-                    "is_checkpoint_format": True,
-                }
-            )
-            # Keep the chunk's source tensors alive on this rank for
-            # the duration of the synchronous RPC. update_weights
-            # blocks until the EngineCore has opened every IPC handle
-            # in the chunk and copied the data into vLLM's worker
-            # tensors, so once self._run returns the keepalive can
-            # be dropped.
-            self._ipc_weight_keepalive = chunk_keepalive
-            try:
-                self._run(self.engine.update_weights(request))
-            finally:
-                self._ipc_weight_keepalive = []
-
-        names_chunk: list[str] = []
-        dtypes_chunk: list[str] = []
-        shapes_chunk: list[list[int]] = []
-        handles_chunk: list = []
-        keepalive_chunk: list[torch.Tensor] = []
-
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        ipc_handles = []
+        keepalive: list[torch.Tensor] = []
         for name, tensor in model.named_parameters():
             if not tensor.is_cuda:
                 raise RuntimeError(
                     f"parameter {name!r} is on {tensor.device}; IPC sync expects CUDA"
                 )
-            # Cast to vLLM's target dtype on the source side. ``.to``
-            # with the same dtype is a no-op (returns the same tensor),
-            # so this is free for already-bf16 params (the bf16 / no
-            # fp32-master path). For fp32-master params it allocates a
-            # bf16 copy of THIS param only — held alive via
-            # keepalive_chunk until the RPC completes.
-            if tensor.dtype != target_dtype:
-                weight = tensor.detach().to(target_dtype).contiguous()
-            else:
-                weight = tensor.detach().contiguous()
-            keepalive_chunk.append(weight)
-            names_chunk.append(name)
-            dtypes_chunk.append(str(weight.dtype).split(".")[-1])
-            shapes_chunk.append(list(weight.shape))
-            handles_chunk.append({gpu_uuid: reduce_tensor(weight)})
+            weight = tensor.detach().contiguous()
+            keepalive.append(weight)
+            names.append(name)
+            dtype_names.append(str(weight.dtype).split(".")[-1])
+            shapes.append(list(weight.shape))
+            ipc_handles.append({gpu_uuid: reduce_tensor(weight)})
 
-            if len(names_chunk) >= CHUNK_SIZE:
-                _flush(names_chunk, dtypes_chunk, shapes_chunk,
-                       handles_chunk, keepalive_chunk)
-                names_chunk = []
-                dtypes_chunk = []
-                shapes_chunk = []
-                handles_chunk = []
-                keepalive_chunk = []
-
-        # Final partial chunk.
-        _flush(names_chunk, dtypes_chunk, shapes_chunk,
-               handles_chunk, keepalive_chunk)
-
+        pickled_handles = base64.b64encode(pickle.dumps(ipc_handles)).decode("utf-8")
+        request = WeightTransferUpdateRequest(
+            update_info={
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "ipc_handles_pickled": pickled_handles,
+                "is_checkpoint_format": True,
+            }
+        )
+        # Keep contiguous tensors alive until EngineCore has opened every IPC
+        # handle and copied/loaded the weights.
+        self._ipc_weight_keepalive = keepalive
+        try:
+            self._run(self.engine.update_weights(request))
+        finally:
+            self._ipc_weight_keepalive = []
         self._reset_prefix_cache_after_weight_update()
         return time.time() - t0
 
