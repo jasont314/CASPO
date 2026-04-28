@@ -13,7 +13,7 @@ calibrated to at runtime.
 import sys, time
 sys.path.insert(0, "/home/jason/experiment/CASPO")
 
-def main(vphi_path: str, label: str, data_path: str = None):
+def main(vphi_path: str, label: str, data_path: str = None, no_split: bool = False):
     import torch
     from caspo.config import CASPOConfig
     from caspo.value.prefix_value import PrefixValueModel
@@ -42,29 +42,41 @@ def main(vphi_path: str, label: str, data_path: str = None):
     # via the shared _split_train_val function. This ensures the AUC is on
     # rows the trainer held out (no train-set leak). Trailing-row "last 10%"
     # would not match what the trainer split (which seed-shuffles by prompt).
-    import sys as _sys
-    _sys.path.insert(0, "/home/jason/experiment/CASPO/scripts")
-    from train_value import _split_train_val
-    G = int(cfg.group_size)
-    prompt_idx_per_row = None
-    if n % G != 0:
-        # multi-pair / paper-pairing data: derive prompt ids from prompt tokens
-        _, _inv = torch.unique(blob["prompt_ids"], dim=0, return_inverse=True)
-        prompt_idx_per_row = _inv.cpu().tolist()
-        print(f"[{label}] n_rows={n} not divisible by G={G}; deriving prompt ids from prompt_ids tensor", flush=True)
-    _, val_idxs = _split_train_val(
-        n_rows=n,
-        group_size=G,
-        val_fraction=float(cfg.value_val_fraction),
-        seed=int(cfg.seed),
-        prompt_idx_per_row=prompt_idx_per_row,
-    )
-    idxs = val_idxs
-    val_n = len(idxs)
-    print(f"[{label}] held-out val: {val_n} rollouts "
-          f"({val_n // int(cfg.group_size)} prompts) "
-          f"via _split_train_val(seed={cfg.seed}, val_fraction={cfg.value_val_fraction})",
-          flush=True)
+    if no_split:
+        # Cross-dataset eval: V_φ never saw any of these rows during training,
+        # so use ALL rows. Used when --data points at a different distribution
+        # (e.g. MATH-500 rollouts to test transfer from Big-Math training).
+        idxs = list(range(n))
+        val_n = n
+        print(f"[{label}] no_split=True: using all {val_n} rows "
+              f"(cross-dataset / never-seen-during-training mode)", flush=True)
+    else:
+        # In-distribution eval: V_φ was trained on this data, so we MUST
+        # restrict to the trainer's held-out prompt-level val split to avoid
+        # train-set leakage. _split_train_val(seed=cfg.seed, val_fraction=...)
+        # is deterministic and matches what scripts/train_value.py used.
+        import sys as _sys
+        _sys.path.insert(0, "/home/jason/experiment/CASPO/scripts")
+        from train_value import _split_train_val
+        G = int(cfg.group_size)
+        prompt_idx_per_row = None
+        if n % G != 0:
+            _, _inv = torch.unique(blob["prompt_ids"], dim=0, return_inverse=True)
+            prompt_idx_per_row = _inv.cpu().tolist()
+            print(f"[{label}] n_rows={n} not divisible by G={G}; deriving prompt ids from prompt_ids tensor", flush=True)
+        _, val_idxs = _split_train_val(
+            n_rows=n,
+            group_size=G,
+            val_fraction=float(cfg.value_val_fraction),
+            seed=int(cfg.seed),
+            prompt_idx_per_row=prompt_idx_per_row,
+        )
+        idxs = val_idxs
+        val_n = len(idxs)
+        print(f"[{label}] held-out val: {val_n} rollouts "
+              f"({val_n // int(cfg.group_size)} prompts) "
+              f"via _split_train_val(seed={cfg.seed}, val_fraction={cfg.value_val_fraction})",
+              flush=True)
 
     pids = blob["prompt_ids"][idxs].to("cuda")
     pmask = blob["prompt_mask"][idxs].to("cuda")
@@ -121,5 +133,8 @@ if __name__ == "__main__":
     ap.add_argument("--vphi", required=True)
     ap.add_argument("--label", required=True)
     ap.add_argument("--data", default=None)
+    ap.add_argument("--no-split", action="store_true", default=False,
+                    help="use ALL rows (cross-dataset eval). Default: apply "
+                         "trainer's held-out val split (in-distribution eval).")
     args = ap.parse_args()
-    main(args.vphi, args.label, args.data)
+    main(args.vphi, args.label, args.data, no_split=args.no_split)
