@@ -142,6 +142,10 @@ def main() -> None:
                          "and waste training compute (IPVRM §C). Default ON.")
     ap.add_argument("--no-filter-mixed-outcomes", dest="filter_mixed_outcomes",
                     action="store_false")
+    ap.add_argument("--shard", type=str, default=None,
+                    help="i/N — process every N-th prompt starting from i "
+                         "(0-indexed). Used to parallelize collection across "
+                         "GPUs: each shard writes its own .pt; merge after.")
     args = ap.parse_args()
 
     cfg = CASPOConfig.from_yaml(args.config)
@@ -168,6 +172,28 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     examples = list(load_train_dataset(cfg, tokenizer=tokenizer))
+    # Apply --shard i/N BEFORE --num-prompts so all shards see disjoint
+    # prompts even when --num-prompts is set globally. Interleaved slicing
+    # (examples[i::N]) keeps prompt difficulty distribution similar across
+    # shards (vs. contiguous slicing which would bias each shard).
+    if args.shard is not None:
+        try:
+            shard_i, shard_n = (int(s) for s in args.shard.split("/"))
+        except Exception:
+            raise SystemExit(
+                f"--shard must be 'i/N' (e.g. '0/4'); got {args.shard!r}"
+            )
+        if shard_n <= 0 or not (0 <= shard_i < shard_n):
+            raise SystemExit(
+                f"--shard {args.shard!r}: need 0 <= i < N and N > 0"
+            )
+        before = len(examples)
+        examples = examples[shard_i::shard_n]
+        print(
+            f"[collect] --shard {shard_i}/{shard_n}: kept {len(examples)} "
+            f"prompts of {before} (every {shard_n}th starting at {shard_i})",
+            flush=True,
+        )
     if args.num_prompts is not None:
         if args.num_prompts > len(examples):
             print(
