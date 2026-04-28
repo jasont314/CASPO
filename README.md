@@ -1118,6 +1118,56 @@ actually works post-stabilization.
 - `reward=0.000, pass@G=0.000` for >5 consecutive steps from any
   early step (≤ step 20) → kill and bisect immediately, don't wait.
 
+### V_φ retrain after verifier + BOS changes (Apr 28, 2026)
+
+A **third** issue surfaced after fixing Bugs 1 & 2: CASPO's `v_acc` was
+running at 0.32 at step 1 of RL, vs the offline-trained V_φ baseline of
+~0.96 (from `value_train_log.jsonl`'s `acc_at_last`). Investigation
+showed V_φ is **mis-calibrated to runtime distribution**, not lost or
+broken:
+
+* **Stale outcomes**: V_φ was trained on outcomes from the pre-Minerva
+  verifier (Apr 25). Adding the Minerva-style extractor cascade in
+  `caspo/reward/math_verifier.py` flipped many rolled-out responses
+  from "wrong" to "right". V_φ trained against the old labels then
+  signs-disagrees with the new labels.
+* **Stale prompt tokenization**: V_φ's training data (`value_data.pt`)
+  was collected before Patch A added explicit BOS prepending in
+  `VLLMRolloutEngine`. Inspection: `prompt_ids[i, first_nonpad] == 518`
+  ('[' from `[MATH_TASK]`), no BOS token id 1 anywhere. Runtime now
+  prepends BOS, shifting per-token log-ratios.
+
+**Fix**: re-collect + retrain V_φ with current code (no patches needed
+since `collect_value_data.py` uses the live `VLLMRolloutEngine` and
+`MathRewardFn` — both Patch A + Minerva are inherited automatically):
+
+```bash
+GPU_LIST="4 5 6 7" bash scripts/retrain_value_rho1b_4gpu.sh
+```
+
+The orchestrator does:
+1. **4-shard collect** in parallel (one shard per GPU; merged after) —
+   uses `--shard i/N` in `collect_value_data.py` (interleaved slicing).
+2. **Merge** the 4 `.pt` files via `scripts/merge_value_data_shards.py`
+   (left-pads prompts and right-pads responses to global max-len before
+   concatenating along dim 0).
+3. **FSDP=4 train_value** with `value_micro_batch_size=16,
+   value_grad_accum_steps=1` (same effective batch as paper-faithful
+   `mb=1, accum=16` but ~3.7× faster wall-clock at 1B because kernel
+   launches amortize).
+4. **Smoke-validate** new V_φ on a 1-step CASPO rollout; passes if
+   `v_acc >= 0.7`.
+
+End-to-end ~30-45 min on 4 H100s. Output: a new V_φ at
+`/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final` with
+runtime `v_acc=0.74` (vs 0.32 with the stale Apr 25 V_φ).
+
+To deploy in a CASPO RL run, set
+`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final`
+in the launcher env (the 1B per-GPU launcher in
+`scripts/_launch_rho1b_one_gpu.sh` accepts this env override and
+forwards it as `--override prefix_value_path=...`).
+
 ### 4-method parallel launcher (Rho-1B, four NVMe drives)
 
 `scripts/launch_rho1b_4method_split.sh` runs GRPO + PPO+Critic +

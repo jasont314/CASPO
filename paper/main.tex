@@ -5,6 +5,10 @@
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage[numbers,sort&compress]{natbib}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,shapes.geometric}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
 
 \title{CASPO: Learned Prefix Value Modeling for\\
        Stepwise Credit Assignment in Reasoning RL}
@@ -13,6 +17,7 @@
 
 \newcommand{\caspo}{\textsc{CASPO}}
 \newcommand{\ppo}{PPO}
+\newcommand{\ppocritic}{PPO+Critic}
 \newcommand{\grpo}{GRPO}
 \newcommand{\ipvrm}{IPVRM}
 \newcommand{\vineppo}{VinePPO}
@@ -32,10 +37,17 @@ online during policy training under an ADB+DLW correction. The result is a
 strict drop-in for \vineppo{} that uses the same PPO clipped objective, the
 same KL penalty, the same response segmentation, and the same global PPO
 minibatch, but eliminates the per-step Monte Carlo expansion that dominates
-\vineppo{}'s wall-clock cost. We compare four methods (\ppo{}, \grpo{},
-\vineppo{}, \caspo{}) under one trainer, one verifier, one rollout engine, and
-one set of hyperparameters, and report wall-clock and accuracy on the MATH
-benchmark for both Rho-1B and DeepSeekMath-7B. Throughout we keep the
+\vineppo{}'s wall-clock cost. We compare four methods (\grpo{}, \ppocritic{},
+\vineppo{}, \caspo{}) under one trainer, one verifier, one rollout engine,
+and one set of hyperparameters, and report wall-clock and accuracy on the
+MATH benchmark for both Rho-1B and DeepSeekMath-7B. \ppocritic{} is the
+canonical Schulman-2017 \ppo{} with a learned scalar value head on a
+stripped-LM-head backbone copy and GAE; we use it rather than bare \ppo{}
+(uniform sequence-broadcast advantages with no value baseline) because
+\grpo{} already covers the value-free case via its per-prompt
+group-relative baseline. \ppocritic{} provides a per-token learned baseline
+that contrasts with \caspo{}'s per-step learned baseline and with
+\vineppo{}'s on-policy Monte-Carlo step values. Throughout we keep the
 algorithmic contract identical except for the source of the per-step value
 $V(s_t)$, isolating the credit-signal change from confounders. Empirical
 results are reported in Section~\ref{sec:results} after the corresponding
@@ -90,12 +102,16 @@ correctness probability, or its log) and motivated by a different
 bias--variance regime;
 (iii) a frozen reward-model variant (\caspo{}-frozen-RM) that disables online
 value updates and isolates the cost/benefit of online value drift correction;
-(iv) a unified comparison stack that implements \ppo{}, \grpo{}, \vineppo{},
-and \caspo{} under one trainer, one verifier, and one rollout engine,
-controlling everything except the algorithmic credit-signal choice; and
+(iv) a unified comparison stack that implements \grpo{}, \ppocritic{},
+\vineppo{}, and \caspo{} under one trainer, one verifier, and one rollout
+engine, controlling everything except the algorithmic credit-signal choice; and
 (v) implementation infrastructure for full-finetune 7B-scale RL with
-FSDP-sharded trainer and rank-local vLLM generation, including a CUDA-IPC
-weight-sync path that is collective with \texttt{summon\_full\_params}.
+FSDP-sharded trainer and rank-local vLLM generation, including a streaming
+CUDA-IPC weight-sync path that is collective with
+\texttt{summon\_full\_params}, fp32 master weights with on-demand AdamW
+CPU-offload during the sync window to fit the unsharded fp32 materialization,
+and per-method ckpt sharding across multiple NVMe drives so each of the four
+1B methods runs to completion in parallel without disk contention.
 
 \paragraph{Implementation provenance.} The codebase is an adaptation and
 extension of the public \vineppo{} setup \citep{vineppo2024,vineppocode}. The
@@ -148,13 +164,26 @@ setting uses LoRA adapters on a 7B base; we adopt the same parameterization
 but perform full-model updates, with corresponding adjustments to the online
 learning rate.
 
+\paragraph{Per-token learned-critic baselines.}
+The classical PPO-with-critic recipe \citep{schulman2017ppo} uses a learned
+scalar value head $V_\psi(s, t)$ trained jointly with the policy on the
+value loss $(V_\psi - \hat R)^2$ and folded into the advantage via
+generalized advantage estimation (GAE). We include this recipe as a baseline
+(\ppocritic{}) so that \caspo{}'s learned \emph{step-level} prefix value can
+be compared not only against the value-free baselines (\ppo{}, \grpo{}) and
+the on-policy Monte Carlo step value (\vineppo{}), but also against an
+in-line per-token learned baseline trained from the same trajectories under
+the same PPO objective.
+
 \paragraph{Generation backends and weight sync.}
 We use vLLM \citep{kwon2023vllm} for high-throughput rollout and prefix
 caching. The implementation uses CUDA-IPC weight transfer between trainer
 ranks and rank-local vLLM engines; for the FSDP-sharded 7B trainer, the IPC
 sync is implemented as a collective \texttt{summon\_full\_params} block over
-the FSDP-wrapped policy followed by per-tensor IPC handle exchange with each
-rank's vLLM \texttt{EngineCore}.
+the FSDP-wrapped policy followed by streaming per-tensor IPC handle exchange
+with each rank's vLLM \texttt{EngineCore}, in chunks of 8 parameters with
+per-parameter bf16 casting to bound transient host memory during the sync
+window.
 
 \section{Background}
 \label{sec:bg}
@@ -213,12 +242,84 @@ estimator:
 \right], \quad
 \delta_t = \log \pi_{\mathrm{ref}}(y_t) - \log \pi_\theta(y_t).
 \end{equation}
-The advantages $A_t$ in \eqref{eq:ppo} are (a) terminal-broadcast for
-\ppo{}/\grpo{} and (b) the step-TD advantages of \eqref{eq:adv} broadcast over
-the tokens in each step span for \vineppo{}/\caspo{}.
+The advantages $A_t$ in \eqref{eq:ppo} are (a) terminal-broadcast group-relative
+advantages for \grpo{}; (b) GAE per-token advantages from a learned scalar
+value head for \ppocritic{}; or (c) the step-TD advantages of \eqref{eq:adv}
+broadcast over the tokens in each step span for \vineppo{}/\caspo{}.
 
 \section{Method: \caspo{}}
 \label{sec:method}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    font=\footnotesize,
+    node distance=4mm,
+    box/.style={rectangle, rounded corners=2pt, draw, thick, minimum width=20mm, minimum height=8mm, align=center, inner sep=2pt},
+    src/.style={box, fill=black!8},
+    valbox/.style={box, fill=black!4, minimum width=33mm},
+    arr/.style={->, >=Stealth, thick},
+    grp/.style={rectangle, draw, dashed, rounded corners=3pt, inner sep=4mm},
+]
+% Shared rollout column on the left
+\node[src] (resp) {response $y$\\(rollout)};
+\node[src, below=of resp] (split) {LaTeX-aware\\step splitter};
+\node[src, below=of split] (verif) {verifier\\$R(x,y)\!\in\!\{0,1\}$};
+\draw[arr] (resp) -- (split);
+\draw[arr] (split) -- (verif);
+
+% Four method columns, anchored on the value-source step
+\node[valbox, right=12mm of resp.east] (vgrpo)
+    {\grpo{}\\
+     $V(s_t)\!\equiv\!0$\\
+     group-relative terminal\\broadcast};
+\node[valbox, below=of vgrpo] (vpc)
+    {\ppocritic{}\\
+     $V_\psi(s,t)$ scalar head\\
+     per-token GAE};
+\node[valbox, below=of vpc] (vvine)
+    {\vineppo{}\\
+     $K\!=\!9$ MC continuations\\
+     $V(s_t)=\bar R_K$};
+\node[valbox, below=of vvine] (vcaspo)
+    {\caspo{}\\
+     $V_\phi(s_t)\!=\!\beta\!\sum\!\log\!\frac{\pi_\phi}{\pi_{\mathrm{ref}}}$\\
+     learned prefix value};
+
+% Step-TD / advantage column
+\node[box, right=18mm of vpc.east, minimum width=33mm, fill=black!4] (adv)
+    {step-TD advantage\\$A_t = r_t + \gamma V(s_{t\!+\!1}) - V(s_t)$};
+\node[box, below=of adv, minimum width=33mm, fill=black!4] (clip)
+    {PPO clipped objective\\$+ k_3$ KL penalty};
+
+% Arrows from each method to the advantage box
+\draw[arr] (vgrpo.east) -- (adv.west);
+\draw[arr] (vpc.east) -- (adv.west);
+\draw[arr] (vvine.east) -- (adv.west);
+\draw[arr] (vcaspo.east) -- (adv.west);
+\draw[arr] (adv) -- (clip);
+
+% Source-of-value annotation bracket
+\node[draw=none, fit=(vgrpo)(vcaspo), label={[anchor=south]above:\textbf{value source} $V(s_t)$}] {};
+\end{tikzpicture}
+\caption{Four compared methods, anchored on the source of the per-step
+value $V(s_t)$. Rollout, segmenter, verifier, advantage form, PPO clipped
+objective, and KL penalty are identical across all rows; the only difference
+is which black box produces $V(s_t)$ used in
+$A_t = r_t + \gamma V(s_{t\!+\!1}) - V(s_t)$. \grpo{} uses no value
+($V \equiv 0$) with a per-prompt group-relative terminal broadcast.
+\ppocritic{} (the canonical Schulman-2017 \ppo{}) learns a scalar per-token
+value head trained on $(V_\psi - \hat R)^2$ with GAE. \vineppo{} estimates
+$V(s_t)$ by averaging $K{=}9$ on-policy continuations from each prefix.
+\caspo{} replaces those continuations with an \ipvrm{}-style
+cumulative-log-ratio prefix value model $V_\phi$.}
+\label{fig:methods}
+\end{figure}
+
+Figure~\ref{fig:methods} summarizes the comparison axis: rollout, step
+splitter, verifier, advantage form, PPO objective, and KL penalty are held
+identical across all four methods. Only the source of the per-step value
+$V(s_t)$ differs.
 
 \subsection{Prefix value model}
 Following \ipvrm{} \citep{ipvrm2026}, we define
@@ -393,6 +494,41 @@ under reparameterization of $\pi_\phi$.
 We treat these three as a contributed family of step-TD formulations and
 report all three on MATH-500 pass@$16$ in Section~\ref{sec:results}.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\linewidth, height=58mm,
+    xlabel={cumulative log-ratio $V_\phi(s_t)$},
+    ylabel={transformed value},
+    xmin=-6, xmax=6, ymin=-5.0, ymax=5.0,
+    grid=both,
+    grid style={black!12},
+    legend style={font=\footnotesize, at={(0.02,0.98)}, anchor=north west, draw=black!50},
+    axis line style={->},
+    xtick={-6,-4,-2,0,2,4,6},
+    ytick={-4,-2,0,2,4},
+    samples=121,
+]
+\addplot[thick, dashed]                {x};                                                  \addlegendentry{\emph{value} $V_\phi$}
+\addplot[thick]                        {1/(1+exp(-x))};                                      \addlegendentry{\emph{prob} $\sigma(V_\phi)$}
+\addplot[thick, dotted, line width=1pt] {ln(1/(1+exp(-x)))};                                 \addlegendentry{\emph{logprob} $\log\sigma(V_\phi)$}
+\addplot[thin, gray] coordinates {(-6,0)(6,0)};
+\end{axis}
+\end{tikzpicture}
+\caption{The three step-TD transforms of the prefix value $V_\phi$.
+\emph{value} (dashed) is the identity: linear sensitivity, unbounded tails.
+\emph{prob} (solid) is bounded in $[0,1]$ but saturates symmetrically, so
+prefixes the model is highly confident about contribute near-zero gradient.
+\emph{logprob} (dotted) is the smooth interpolation: linear in the
+negative-$V_\phi$ regime where most early-training signal lives, soft
+saturation toward zero in the positive-$V_\phi$ regime that compresses
+overconfident prefixes. The TD difference
+$A^*(s_t) = r_t + \gamma\,f(V_\phi(s_{t+1})) - f(V_\phi(s_t))$
+inherits the regime of $f$.}
+\label{fig:transforms}
+\end{figure}
+
 \subsection{Step advantage normalization and clipping}
 Let $\mathcal{A} = \{A(s_t)\}$ over all valid step boundaries in the outer
 PPO step. We standardize over the entire batch
@@ -421,12 +557,18 @@ OlympiadBench (math-only configuration). All settings use the prompt template
 and the LaTeX-aware step splitter from the upstream codebase.
 
 \subsection{Methods}
-We compare four methods:
+We compare four methods (Figure~\ref{fig:methods}):
 \begin{description}
-\item[\ppo{}] Terminal-reward, sequence-level advantages broadcast across
-response tokens.
 \item[\grpo{}] Per-prompt group-relative terminal-reward advantages with
-$G=8$.
+$G=8$. Stands in for the value-free baseline; bare \ppo{} (uniform
+sequence-broadcast advantages, no group baseline, no value head) is
+strictly weaker on this evaluation regime and is omitted.
+\item[\ppocritic{}] Schulman-2017 \ppo{} with a learned scalar value head
+$V_\psi$ on a stripped-LM-head backbone copy, trained jointly with the
+policy under a clipped value loss
+$\max\!\big[(V_\psi - \hat R)^2,\, (\mathrm{clip}(V_\psi, V_\psi^{\mathrm{old}} \pm \epsilon_v) - \hat R)^2\big]$
+with $\epsilon_v = 0.2$ and $\lambda_{\mathrm{GAE}} = 1.0$, value-loss
+coefficient $1.0$, critic LR $10^{-6}$.
 \item[\vineppo{}] $K=9$ Monte Carlo continuations from each non-terminal step
 boundary; step-TD advantages.
 \item[\caspo{}] \ipvrm{} prefix value model with online updates; step-TD
@@ -445,7 +587,9 @@ summarizes the key knobs.
 \centering
 \caption{Shared training hyperparameters (Rho-1B and DeepSeekMath-7B). All
 fields are matched to the upstream \vineppo{} configuration for the
-respective scale; the only deliberate difference is the model.}
+respective scale; the only deliberate difference is the model. Values
+reflect the paper-faithful alignment after the upstream-divergence audit
+(Section~\ref{sec:infra}).}
 \label{tab:hp}
 \begin{tabular}{lll}
 \toprule
@@ -458,15 +602,20 @@ Global PPO minibatch & 64 & 64 \\
 PPO epochs per rollout & 2 & 2 \\
 Policy LR & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Online value LR (\caspo{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
+Critic LR (\ppocritic{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Value $\beta$, $m$ & $10$, $5$ & $10$, $5$ \\
 PPO clip $\epsilon$ & $0.2$ & $0.2$ \\
-KL coefficient & $10^{-4}$ ($k_3$) & $10^{-4}$ ($k_3$) \\
+Value clip $\epsilon_v$ (\ppocritic{}) & $0.2$ & $0.2$ \\
+GAE $\lambda$ (\ppocritic{}) & $1.0$ & $1.0$ \\
+KL coefficient & $10^{-2}$ ($k_3$) & $10^{-2}$ ($k_3$) \\
 Advantage clip & $3.0$ & $3.0$ \\
 Advantage standardization & batch & batch \\
 Rollout sampling & temp $0.6$, top-$p$ $0.9$ & temp $0.6$, top-$p$ $0.9$ \\
-Max prompt / response & 1024 / 1024 & 1024 / 1024 \\
+Max prompt / response & 1024 / 1024 & 1512 / 1024 \\
+Max sequence length & 2048 & 2499 \\
+Warmup steps & 480 & 480 \\
 Outer steps & 1000 & 1000 \\
-Checkpoints & step\_250/500/750/final & step\_250/500/750/final \\
+Checkpoint cadence & every 100 (steps 100--1000) & every 200 (steps 200--1000) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -489,21 +638,188 @@ dedicated GPU. Sample evaluation at intermediate checkpoints uses
 visibility; the full benchmark suite is run at the final checkpoint.
 
 \subsection{Infrastructure}
-Both scales share a single PyTorch trainer plus rank-local vLLM rollout. The
-1B configuration uses a single H100 per method; the 7B configuration uses
-FSDP=4 (full\_shard, use\_orig\_params) for \ppo{}/\grpo{}/\caspo{} and FSDP=8
-for \vineppo{}, with vLLM colocated rank-local in both layouts. Trainer-to-vLLM
-weight synchronization uses CUDA IPC: at 1B with a single-rank trainer, the
-IPC handle exchange is direct; at 7B under FSDP, the trainer enters
-\texttt{FSDP.summon\_full\_params(writeback=False)} collectively before
-issuing per-tensor IPC pushes through each rank's vLLM
-\texttt{EngineCore.collective\_rpc("update\_weights", \dots)}.
+\label{sec:infra}
 
-For numerical stability under the FSDP layout, the trainer co-trains policy
-and (for \caspo{}) value model in bf16 with fp32 master weights; the
-reference policy is shared between the KL term and \caspo{}'s value-model ref
-to avoid a duplicate forward. Rollout, old-logprob rescore, ref-logprob
-precompute, and policy/value forward use FlashAttention-3 on Hopper.
+\paragraph{Trainer + colocated rollout.}
+Both scales share a single PyTorch trainer plus rank-local vLLM rollout. The
+1B configuration uses a single H100 per method (Figure~\ref{fig:sysarch},
+left); the 7B configuration uses FSDP=4 (full\_shard, use\_orig\_params) for
+\grpo{}/\ppocritic{}/\caspo{} and FSDP=8 for \vineppo{}, with vLLM
+colocated rank-local in both layouts (Figure~\ref{fig:sysarch}, right).
+
+\paragraph{Streaming CUDA-IPC weight sync.}
+At 1B with a single-rank trainer, the IPC handle exchange is direct. At 7B
+under FSDP, the trainer enters
+\texttt{FSDP.summon\_full\_params(writeback=False)} collectively, then
+streams parameters to each rank's vLLM
+\texttt{EngineCore.collective\_rpc("update\_weights", \dots)} in chunks of 8
+tensors with per-parameter bf16 cast inside the IPC push. Streaming bounds
+peak host-side staging memory and avoids materializing the entire
+unsharded fp32 policy on host before transfer.
+
+\paragraph{fp32 master weights with on-demand AdamW offload.}
+Both methods co-train policy (and \caspo{}'s value model, or \ppocritic{}'s
+critic) in bf16 compute with fp32 master weights. Under FSDP, the master
+copy lives in the AdamW optimizer state and is materialized into bf16
+shards through \texttt{MixedPrecision(param\_dtype=bf16,
+reduce\_dtype=fp32)}. At sync time the
+\texttt{summon\_full\_params} block briefly materializes a $\sim$28~GiB
+unsharded fp32 buffer per rank for the 7B policy. To fit alongside the
+already-resident $\sim$14~GiB of AdamW state and the
+$\sim$24~GiB vLLM KV cache reservation per H100, the trainer offloads the
+AdamW state to pinned host memory before entering the summon block and
+restores it after IPC push, costing $\sim$400--500\,ms per sync at PCIe Gen5
+but freeing the GPU memory required for the unsharded fp32 materialization.
+
+\paragraph{1B fp32 master via autocast.}
+At 1B (single-GPU, no FSDP) the trainer wraps each forward in
+\texttt{torch.autocast(dtype=bfloat16, cache\_enabled=False)} so the fp32
+parameters cast to bf16 for compute on every op. The non-cached cast is
+required for AdamW optimizer-state coverage to include all parameters; with
+caching enabled, the autocast layer holds bf16 tensor wrappers that are not
+written through to the underlying fp32 parameters during the optimizer step.
+
+\paragraph{Multi-drive checkpoint sharding for parallel 1B training.}
+Each method's 1B run produces $\sim$15--29~GB per checkpoint
+(model in bf16, plus the AdamW master+momentum bundles for policy, plus
+either \caspo{}'s value-model AdamW or \ppocritic{}'s critic AdamW). At
+$\mathtt{save\_every}{=}100$ over 1000 outer steps that is roughly
+150--290~GB per method-run. To run all four 1B method-runs (\grpo{},
+\ppocritic{}, \caspo{}, \caspo{}-\emph{prob}) concurrently on four GPUs of
+the same node at the $\mathtt{save\_every}{=}100$ cadence, each method's
+outputs are routed to a dedicated 350~GB NVMe volume, so the four runs
+neither compete for disk bandwidth nor cross-fill each other's drives.
+
+\paragraph{Reference-policy sharing.}
+The frozen reference policy is shared between the KL term and \caspo{}'s
+value-model ref to avoid a duplicate forward. Rollout, old-logprob rescore,
+ref-logprob precompute, and policy/value forward all use FlashAttention-3 on
+Hopper.
+
+\paragraph{Paper-faithful alignment with upstream \vineppo{}.}
+A targeted audit against the upstream \vineppo{} reference repository
+\citep{vineppocode} produced a set of small but consequential alignment
+fixes that we include in the comparison stack so that our \vineppo{}
+baseline reproduces the upstream numerics:
+prepending the BOS token at both rollout and training,
+per-microbatch advantage whitening,
+adding the prompt-style stop string \texttt{"\textbackslash n\textbackslash n\textbackslash nProblem:"} for vLLM,
+clamping per-token KL into $[0,10]$ before reduction,
+penalizing unfinished sequences via the max-sequence-length policy in
+\eqref{eq:ppo}, an explicit PPO ratio safety skip at $10\times$,
+and uniform grad-accumulation per outer step. With these in place,
+the \vineppo{} baseline in our stack matches the upstream
+configuration field-for-field at the respective scale.
+
+\paragraph{Stabilization deviations from upstream
+(\ppocritic{}/\caspo{} only).}
+Two deliberate departures from upstream-faithful numerics were required
+to keep the online-value methods (\ppocritic{}, \caspo{}, \caspo{}-Δp)
+stable at 1B. Empirically, with upstream's $\mathrm{kl\_coef}=10^{-4}$
+and no advantage clip, both \ppocritic{} and \caspo{} drift to KL$\to
+\infty$ within $\sim 20$ outer steps in our reimplementation; \grpo{}
+remains stable. The fix was a stronger ref-anchor and an outlier safety
+net:
+\begin{itemize}
+\item $\mathrm{kl\_coef} = 10^{-2}$ (100$\times$ upstream's $10^{-4}$,
+  midway between InstructGPT's $0.02$ and DeepSeek-Math GRPO's $0.04$).
+  This is roughly the standard RLHF range; upstream \vineppo{}'s unusually
+  small value is paired with $K{=}9$ Monte Carlo step values that absorb
+  V-noise we do not have.
+\item Standardized advantage clip $\pm 3\sigma$ retained as an outlier
+  safety net (the upstream-faithful no-clip choice survives at \vineppo{}
+  but causes \caspo{} to occasionally take large policy steps that
+  destabilize online $V_\phi$).
+\end{itemize}
+\grpo{} and \vineppo{} are unaffected by these knobs at runtime since
+they have no learned baseline to drift; we hold the same values across
+methods for stack consistency.
+
+\paragraph{$V_\phi$ retrain after verifier and tokenization changes.}
+$V_\phi$'s offline training data was collected before two upstream-aligned
+patches (Minerva-style answer-extraction cascade in the verifier;
+explicit BOS prepending in the rollout engine). At RL time, this leaves
+$V_\phi$ scoring \emph{prefixes that begin with a different first token}
+(\texttt{<s>} vs.~\texttt{[}) against \emph{outcomes from a verifier that
+accepts a broader set of answer formats}. The offline-trained $V_\phi$
+reaches step-1 \texttt{v\_acc}$=0.32$ against runtime, well below its
+offline-train accuracy of $\sim 0.96$. Re-running the data-collection
+pipeline with the live verifier and rollout engine, then retraining
+$V_\phi$ for three epochs at the same paper-faithful $5{\times}10^{-7}$
+offline learning rate, lifts step-1 \texttt{v\_acc} to $0.74$ at
+runtime --- a $2.3\times$ recovery from the stale-label/shifted-prompt
+mismatch. We use this retrained $V_\phi$ for all reported \caspo{} runs.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    font=\footnotesize,
+    box/.style={rectangle, rounded corners=2pt, draw, thick, align=center, inner sep=3pt, minimum height=8mm},
+    pol/.style={box, fill=black!10, minimum width=18mm},
+    vllm/.style={box, fill=black!3, minimum width=18mm},
+    ipc/.style={<->, >=Stealth, thick, dashed},
+    arr/.style={->, >=Stealth, thick},
+    hdr/.style={font=\footnotesize\bfseries},
+]
+% =========================================================
+% Top row: 1B per-method colocated layout
+% =========================================================
+\node[hdr] (hdr1) at (0,0) {(a) 1B per method (single H100, four methods $\to$ four GPUs)};
+\node[pol, below=3mm of hdr1] (p1) {Trainer\\(policy + AdamW)\\fp32 master};
+\node[vllm, right=14mm of p1] (v1) {vLLM rollout\\KV $u{=}0.30$};
+\draw[ipc] (p1) -- node[above, font=\scriptsize]{CUDA IPC} (v1);
+
+\node[font=\scriptsize, below=2mm of p1, align=center] (cap1)
+    {fp32 master via\\\texttt{autocast(cache\_enabled=False)}};
+\node[font=\scriptsize, below=2mm of v1, align=center] (capv1)
+    {single-rank IPC\\handle exchange};
+
+% =========================================================
+% Bottom row: 7B FSDP + per-rank vLLM
+% =========================================================
+\node[hdr, below=12mm of cap1.south west, anchor=west] (hdr7)
+    {(b) 7B FSDP=4 (or 8 for \vineppo{}) + rank-local colocated vLLM};
+
+% Four trainer ranks (top sub-row of the 7B section)
+\node[pol, below=4mm of hdr7.south west, anchor=north west] (p7a) {rank 0\\policy shard};
+\node[pol, right=2mm of p7a] (p7b) {rank 1\\shard};
+\node[pol, right=2mm of p7b] (p7c) {rank 2\\shard};
+\node[pol, right=2mm of p7c] (p7d) {rank 3\\shard};
+
+% FSDP all-gather brace above
+\draw[<->, thick] (p7a.north) ++(0,3mm) -- ++(0,2mm) -| node[pos=0.25, above, font=\scriptsize]{FSDP \texttt{summon\_full\_params}} (p7d.north);
+
+% Four vLLM engines (bottom sub-row)
+\node[vllm, below=8mm of p7a] (v7a) {vLLM\\engine 0};
+\node[vllm, below=8mm of p7b] (v7b) {vLLM\\engine 1};
+\node[vllm, below=8mm of p7c] (v7c) {vLLM\\engine 2};
+\node[vllm, below=8mm of p7d] (v7d) {vLLM\\engine 3};
+
+% Per-rank IPC arrows (vertical)
+\draw[ipc] (p7a) -- (v7a);
+\draw[ipc] (p7b) -- (v7b);
+\draw[ipc] (p7c) -- (v7c);
+\draw[ipc] (p7d) -- (v7d);
+
+% Caption strip below the 7B layout
+\node[font=\scriptsize, below=2mm of v7b.south, align=center, xshift=8mm] (cap7)
+    {streaming IPC push, chunks of 8 with bf16 cast \quad{}\textbar{}\quad{}
+     AdamW state CPU-offloaded across the \texttt{summon} window};
+\end{tikzpicture}
+\caption{Trainer/rollout topology. \emph{(a)} Each 1B run colocates trainer
+and vLLM on a single H100 (four methods $\to$ four GPUs of the same node);
+fp32 master is maintained via \texttt{autocast(cache\_enabled=False)} so
+AdamW covers all parameters, and the IPC handle exchange between the
+single-rank trainer and its vLLM engine is direct. \emph{(b)} Each 7B run
+uses FSDP=4 (FSDP=8 for \vineppo{}) with one rank-local vLLM engine per
+rank. Trainer-to-vLLM weight sync streams parameters in chunks of 8 with
+per-tensor bf16 cast inside an
+\texttt{FSDP.summon\_full\_params(writeback=False)} block; AdamW state is
+offloaded to pinned host memory across the summon window so the
+$\sim$28~GiB unsharded fp32 materialization fits alongside the vLLM KV
+cache reservation.}
+\label{fig:sysarch}
+\end{figure}
 
 \section{Results}
 \label{sec:results}
@@ -514,20 +830,28 @@ evaluation runs complete. The intended structure is:
 \begin{itemize}
 \item Per-method MATH-500 pass@1 and pass@$16$ at \texttt{final}, with
 seed-level error bars over a small number of seeds (target: 3 seeds per
-method per scale).
+method per scale). Methods include all four compared rows: \grpo{},
+\ppocritic{}, \vineppo{}, and the three \caspo{} step-TD formulations plus
+\caspo{}-frozen-RM.
 \item Per-method full-suite (MATH, College Math, OlympiadBench) pass@$16$ at
 \texttt{final}.
-\item Training curves on MATH-500 sample evaluation at \texttt{step\_250},
-\texttt{step\_500}, \texttt{step\_750}, and \texttt{final}, summarizing
-sample efficiency.
+\item Training curves on MATH-500 sample evaluation at intermediate
+checkpoints (1B: every 100 outer steps; 7B: every 200 outer steps) plus
+\texttt{final}, summarizing sample efficiency.
 \item Per-formulation comparison of the three step-TD advantage variants
 (\caspo{}-\emph{value} vs.\ \caspo{}-\emph{prob} vs.\ \caspo{}-\emph{logprob})
 on MATH-500 pass@$16$, mapping the empirical winner to the calibration
-regime predicted in Section~\ref{sec:transforms}.
+regime predicted in Section~\ref{sec:transforms} and visualized in
+Figure~\ref{fig:transforms}.
 \item \caspo{}-frozen-RM vs.\ \caspo{} (default, online value updates on)
 to quantify the contribution of the online update path.
-\item Wall-clock summary: per-method step time, per-method 1500-step ETA,
-and the implied GPU-hour cost of the four-method comparison.
+\item \ppocritic{} vs.\ \caspo{}: contrast a per-token learned scalar
+baseline against a per-step learned prefix value, both under the same
+PPO objective and the same global PPO minibatch.
+\item Wall-clock summary: per-method step time, per-method 1000-step ETA,
+and the implied GPU-hour cost of the four-method comparison, with the
+breakdown by phase (rollout, old-logprob rescore, value/critic forward,
+ref-logprob precompute, policy update, IPC sync).
 \end{itemize}
 
 We report all numbers under the same training contract: identical SFT
@@ -536,8 +860,10 @@ group/response budget, identical PPO clipped objective, identical KL
 coefficient, identical advantage standardization, identical max sequence
 length, and identical evaluation sampling parameters. The only intended
 difference between rows is the source of the per-step value $V(s_t)$ in
-\eqref{eq:adv}: zero (\ppo{}/\grpo{} terminal broadcast), Monte Carlo
-continuations (\vineppo{}), or learned prefix value $V_\phi$ (\caspo{}).
+\eqref{eq:adv}: zero with a per-prompt group baseline (\grpo{}), a learned
+per-token scalar value $V_\psi(s,t)$ (\ppocritic{}), Monte Carlo
+continuations (\vineppo{}), or a learned prefix value $V_\phi(s_t)$
+(\caspo{}).
 
 \section{Analysis}
 \label{sec:analysis}
@@ -604,9 +930,9 @@ RL that replaces \vineppo{}'s on-policy Monte Carlo prefix rollouts with an
 update. \caspo{} fits cleanly into the same PPO clipped objective, the same
 KL constraint, and the same step-TD advantage construction used by
 \vineppo{}, isolating the credit-signal change from confounders. By unifying
-\ppo{}, \grpo{}, \vineppo{}, and \caspo{} under one trainer, one verifier,
-and one rollout engine, we make it possible to compare these four methods
-under identical conditions on Rho-1B and DeepSeekMath-7B. Empirical results
+\grpo{}, \ppocritic{}, \vineppo{}, and \caspo{} under one trainer, one
+verifier, and one rollout engine, we make it possible to compare these four
+methods under identical conditions on Rho-1B and DeepSeekMath-7B. Empirical results
 in Section~\ref{sec:results} will quantify whether the learned value model
 recovers \vineppo{}'s reasoning-credit signal at a fraction of its
 generation cost, or whether step-level Monte Carlo remains uniquely
