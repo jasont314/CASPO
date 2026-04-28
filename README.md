@@ -1142,7 +1142,18 @@ since `collect_value_data.py` uses the live `VLLMRolloutEngine` and
 `MathRewardFn` — both Patch A + Minerva are inherited automatically):
 
 ```bash
+# Default: keep all G rollouts per mixed-outcome prompt (~7-8k rows,
+#          ~25% positive rate)
 GPU_LIST="4 5 6 7" bash scripts/retrain_value_rho1b_4gpu.sh
+
+# IPVRM-faithful 1-pair-per-prompt (PAPER_PAIRING=true, ~2.4k rows, 50/50)
+PAPER_PAIRING=true GPU_LIST="4 5 6 7" \
+  bash scripts/retrain_value_rho1b_4gpu.sh
+
+# IPVRM generalization: min(n_pos, n_neg) DISJOINT pairs per prompt
+# (PAPER_PAIRING_MULTI=true, ~4-6k rows, 50/50, no rollout reused)
+PAPER_PAIRING_MULTI=true GPU_LIST="4 5 6 7" \
+  bash scripts/retrain_value_rho1b_4gpu.sh
 ```
 
 The orchestrator does:
@@ -1154,16 +1165,28 @@ The orchestrator does:
 3. **FSDP=4 train_value** with `value_micro_batch_size=16,
    value_grad_accum_steps=1` (same effective batch as paper-faithful
    `mb=1, accum=16` but ~3.7× faster wall-clock at 1B because kernel
-   launches amortize).
+   launches amortize). Honors `cfg.value_save_every` (env
+   `VALUE_SAVE_EVERY`) to save per-epoch checkpoints into `step_<N>/`
+   subdirs for AUC-trajectory analysis.
 4. **Smoke-validate** new V_φ on a 1-step CASPO rollout; passes if
    `v_acc >= 0.7`.
 
-End-to-end ~30-45 min on 4 H100s. Output: a new V_φ at
-`/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final` with
-runtime `v_acc=0.74` (vs 0.32 with the stale Apr 25 V_φ).
+End-to-end ~15-30 min on 4 H100s (multi-pair / paper-pairing) or
+~30-45 min (default). Output (current Apr 28 retrain set):
+* `caspo_rho1b_math_v2/value_final/` — keep-all-rollouts mode
+* `caspo_rho1b_math_v5_multi/value_final/` — multi-pair 5-epoch retrain (current)
+
+**Caveat — `v_acc` is class-imbalance-sensitive**: at runtime the rollout
+class balance is ~80% incorrect / ~20% correct, so the *naive
+predict-incorrect* baseline already scores `v_acc ≈ 0.80`. A V_φ at
+`v_acc = 0.77` is therefore *below* the naive baseline by ~3pp; the
+useful signal lives in `ROC-AUC` (~0.55-0.60) and `score-conditioned
+margins`, not in raw accuracy. Run AUC eval over the trainer's
+held-out val split via
+`python scripts/eval_vphi_auc.py --vphi <path> --label <tag>`.
 
 To deploy in a CASPO RL run, set
-`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final`
+`PREFIX_VALUE_PATH=/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v5_multi/value_final`
 in the launcher env (the 1B per-GPU launcher in
 `scripts/_launch_rho1b_one_gpu.sh` accepts this env override and
 forwards it as `--override prefix_value_path=...`).

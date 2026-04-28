@@ -59,7 +59,10 @@ if [[ "${SKIP_COLLECT:-false}" != "true" ]]; then
     echo "[retrain] === Phase 1: 4-shard collect_value_data on GPUs ${GPUS[*]} ==="
     PIDS=()
     PAPER_PAIRING_FLAG=""
-    if [[ "${PAPER_PAIRING:-false}" == "true" ]]; then
+    if [[ "${PAPER_PAIRING_MULTI:-false}" == "true" ]]; then
+        PAPER_PAIRING_FLAG="--paper-pairing-multi"
+        echo "[retrain] paper-faithful min(p,n) disjoint-pair pairing enabled"
+    elif [[ "${PAPER_PAIRING:-false}" == "true" ]]; then
         PAPER_PAIRING_FLAG="--paper-pairing"
         echo "[retrain] paper-faithful 1-pair-per-prompt pairing enabled"
     fi

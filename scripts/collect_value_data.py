@@ -153,6 +153,13 @@ def main() -> None:
                          "exactly 2 rows per kept prompt and a 50/50 "
                          "balanced dataset. Default OFF (keep all G rollouts "
                          "per prompt).")
+    ap.add_argument("--paper-pairing-multi", action="store_true", default=False,
+                    help="generalization of --paper-pairing: for each "
+                         "mixed-outcome prompt, sample min(n_pos, n_neg) "
+                         "DISJOINT (correct, incorrect) pairs (each rollout "
+                         "used at most once). Yields 2-G rows per prompt, "
+                         "50/50 balanced, with low within-prompt correlation. "
+                         "Mutually exclusive with --paper-pairing.")
     args = ap.parse_args()
 
     cfg = CASPOConfig.from_yaml(args.config)
@@ -354,28 +361,40 @@ def _run_collection(*, cfg, args, sampler, tokenizer, examples, prompts_per_step
         n_correct = (grouped >= 0.5).sum(dim=1)
         mixed_prompts = (n_correct > 0) & (n_correct < G)  # [n_prompts_seen]
 
-        if args.paper_pairing:
+        if args.paper_pairing and args.paper_pairing_multi:
+            raise SystemExit("--paper-pairing and --paper-pairing-multi are mutually exclusive")
+
+        if args.paper_pairing or args.paper_pairing_multi:
             # Paper-faithful (IPVRM §4.1): for each mixed-outcome prompt,
-            # randomly select ONE correct rollout + ONE incorrect rollout.
-            # Result: exactly 2 rows per kept prompt; dataset is 50/50
-            # positive/negative by construction.
+            # randomly select ONE correct + ONE incorrect rollout (--paper-pairing)
+            # OR sample min(n_pos, n_neg) DISJOINT pairs (--paper-pairing-multi).
+            # Both produce a 50/50 balanced dataset; multi-mode keeps more rows.
             import random as _random
             _rng = _random.Random(int(getattr(cfg, "seed", 0)))
             row_keep = torch.zeros(n_total, dtype=torch.bool)
+            total_pairs = 0
             for p in range(n_prompts_seen):
                 if not mixed_prompts[p].item():
                     continue
                 pos_local = (grouped[p] >= 0.5).nonzero(as_tuple=True)[0].tolist()
                 neg_local = (grouped[p] < 0.5).nonzero(as_tuple=True)[0].tolist()
-                pos_pick = _rng.choice(pos_local)
-                neg_pick = _rng.choice(neg_local)
-                row_keep[p * G + pos_pick] = True
-                row_keep[p * G + neg_pick] = True
+                if args.paper_pairing:
+                    n_pairs = 1
+                else:
+                    n_pairs = min(len(pos_local), len(neg_local))
+                _rng.shuffle(pos_local)
+                _rng.shuffle(neg_local)
+                for k in range(n_pairs):
+                    row_keep[p * G + pos_local[k]] = True
+                    row_keep[p * G + neg_local[k]] = True
+                total_pairs += n_pairs
             n_kept = int(mixed_prompts.sum().item())
+            mode = "1-pair" if args.paper_pairing else "min(p,n) disjoint pairs"
             print(
-                f"[collect] paper-faithful pairing: kept {n_kept}/{n_prompts_seen} prompts "
+                f"[collect] paper-faithful pairing ({mode}): kept "
+                f"{n_kept}/{n_prompts_seen} prompts "
                 f"({100*n_kept/max(n_prompts_seen,1):.1f}%) → "
-                f"{n_kept * 2} rollouts (1 pos + 1 neg per prompt)",
+                f"{2*total_pairs} rollouts ({total_pairs} pairs)",
                 flush=True,
             )
         else:
