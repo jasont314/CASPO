@@ -118,6 +118,11 @@ fi
 if [[ -n "${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-}" ]]; then
     COMMON_OVERRIDES+=(--override "vllm_max_num_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS}")
 fi
+# Allow caller to override prefix_value_path via env (used to swap in a
+# freshly-retrained V_φ without editing the YAML).
+if [[ -n "${PREFIX_VALUE_PATH:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "prefix_value_path=${PREFIX_VALUE_PATH}")
+fi
 
 echo "[rho1b-onegpu] ${RUN_METHOD_TAG} method=${METHOD} gpu=${SELECTED_GPU} out=${OUTDIR}"
 echo "[rho1b-onegpu] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
