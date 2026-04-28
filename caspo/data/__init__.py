@@ -75,6 +75,7 @@ def _dataset_cache_hash(
     dataset_split: str = "",
     system_prompt: Optional[str] = None,
     filter_eval_leakage: bool = True,
+    dataset_config: Optional[str] = None,
 ) -> str:
     """Hash the cache-key inputs into a stable filename component.
 
@@ -95,8 +96,9 @@ def _dataset_cache_hash(
     template = prompt_template if prompt_template is not None else ""
     sysp = system_prompt if system_prompt is not None else ""
     leak = "leakfilter" if filter_eval_leakage else "noleakfilter"
+    cfgname = dataset_config if dataset_config is not None else ""
     key = (
-        f"{tokenizer_name}|{dataset_name}|{dataset_split}|"
+        f"{tokenizer_name}|{dataset_name}|{cfgname}|{dataset_split}|"
         f"{int(max_prompt_len)}|{template}|{sysp}|{leak}"
     )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:_HASH_LEN]
@@ -175,6 +177,7 @@ def load_train_dataset(cfg: Any, tokenizer: Any = None) -> Iterable[dict]:
 
     tokenizer_key = _resolve_tokenizer_key(cfg, tokenizer)
     dataset_name = getattr(cfg, "dataset_name", "<unknown>")
+    dataset_config = getattr(cfg, "dataset_config", None)
     dataset_split = str(getattr(cfg, "dataset_split", "") or "")
     max_prompt_len = int(getattr(cfg, "max_prompt_len", 0) or 0)
     prompt_template = getattr(cfg, "prompt_template", None)
@@ -189,6 +192,7 @@ def load_train_dataset(cfg: Any, tokenizer: Any = None) -> Iterable[dict]:
         dataset_split=dataset_split,
         system_prompt=system_prompt,
         filter_eval_leakage=bool(getattr(cfg, "filter_eval_leakage", True)),
+        dataset_config=dataset_config,
     )
     cache_path = cache_dir / f"{cache_hash}.pt"
 
@@ -199,7 +203,8 @@ def load_train_dataset(cfg: Any, tokenizer: Any = None) -> Iterable[dict]:
         # Cache present but unreadable — fall through and rebuild it.
 
     # Cold path: same as the legacy uncached loader, then persist.
-    raw = _load_hf(dataset_name, getattr(cfg, "dataset_split", "train"))
+    raw = _load_hf(dataset_name, getattr(cfg, "dataset_split", "train"),
+                   config=dataset_config)
     examples = _build_from_rows(raw, cfg, tokenizer)
     _save_dataset_cache(cache_path, examples)
     return examples

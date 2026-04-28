@@ -273,9 +273,17 @@ def _build_from_rows(
     return out
 
 
-def _load_hf(name: str, split: str):
-    """Lazy import of ``datasets``; returns the raw HF Dataset."""
+def _load_hf(name: str, split: str, config: Optional[str] = None):
+    """Lazy import of ``datasets``; returns the raw HF Dataset.
+
+    ``config`` is the HF dataset config name, required by multi-config
+    repos like ``open-r1/Big-Math-RL-Verified-Processed`` (which has
+    ``level_1``..``level_5``, ``quintile_1``..``quintile_5``, ``all``).
+    None for single-config datasets.
+    """
     from datasets import load_dataset  # type: ignore
+    if config is not None:
+        return load_dataset(name, config, split=split)
     return load_dataset(name, split=split)
 
 
@@ -298,7 +306,8 @@ def load_train_dataset(cfg: CASPOConfig, tokenizer: Any = None) -> Iterable[dict
     is provided, examples whose tokenized prompt exceeds ``cfg.max_prompt_len``
     are dropped.
     """
-    raw = _load_hf(cfg.dataset_name, cfg.dataset_split)
+    raw = _load_hf(cfg.dataset_name, cfg.dataset_split,
+                   config=getattr(cfg, "dataset_config", None))
     return _build_from_rows(raw, cfg, tokenizer)
 
 

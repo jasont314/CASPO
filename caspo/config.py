@@ -120,6 +120,12 @@ class CASPOConfig:
     # (3/500 MATH-500 overlap) and Big-Math (2/674 OlympiadBench
     # incidental). See ``caspo/data/eval_leak.py``.
     filter_eval_leakage: bool = True
+    # Optional HF dataset config name. Required by multi-config datasets
+    # like ``open-r1/Big-Math-RL-Verified-Processed`` which expose
+    # `level_1`, `level_2`, ..., `quintile_5`, `all`. Forwarded as the
+    # ``name`` arg to ``datasets.load_dataset(repo, name, split=...)``.
+    # None => single-config dataset (e.g. MATH-lighteval, DeepScaleR).
+    dataset_config: Optional[str] = None
     # VinePPO ``max_sequence_length=2048`` unfinished-response penalty.
     # When prompt+response token total exceeds this, the rollout is treated
     # as unfinished and reward is zeroed (matches MathEpisodeGenerator's

@@ -66,6 +66,15 @@ if [[ "${SKIP_COLLECT:-false}" != "true" ]]; then
         PAPER_PAIRING_FLAG="--paper-pairing"
         echo "[retrain] paper-faithful 1-pair-per-prompt pairing enabled"
     fi
+    DATASET_OVERRIDES=()
+    if [[ -n "${DATASET_NAME:-}" ]]; then
+        DATASET_OVERRIDES+=(--override "dataset_name=${DATASET_NAME}")
+        echo "[retrain] dataset_name override: ${DATASET_NAME}"
+    fi
+    if [[ -n "${DATASET_CONFIG:-}" ]]; then
+        DATASET_OVERRIDES+=(--override "dataset_config=${DATASET_CONFIG}")
+        echo "[retrain] dataset_config override: ${DATASET_CONFIG}"
+    fi
     for i in 0 1 2 3; do
         gpu="${GPUS[$i]}"
         out="$SHARD_DIR/value_data_shard${i}.pt"
@@ -76,6 +85,7 @@ if [[ "${SKIP_COLLECT:-false}" != "true" ]]; then
             --shard "$i/4" \
             --output "$out" \
             $PAPER_PAIRING_FLAG \
+            "${DATASET_OVERRIDES[@]}" \
             > "$log" 2>&1 &
         PIDS+=("$!")
     done

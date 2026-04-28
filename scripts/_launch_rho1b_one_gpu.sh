@@ -130,6 +130,15 @@ fi
 if [[ -n "${ONLINE_VALUE_LR:-}" ]]; then
     COMMON_OVERRIDES+=(--override "online_value_lr=${ONLINE_VALUE_LR}")
 fi
+# Allow caller to override the training dataset (e.g. swap from MATH-lighteval
+# to Big-Math level_1 / level_2). DATASET_CONFIG is required for multi-config
+# datasets like open-r1/Big-Math-RL-Verified-Processed.
+if [[ -n "${DATASET_NAME:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "dataset_name=${DATASET_NAME}")
+fi
+if [[ -n "${DATASET_CONFIG:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "dataset_config=${DATASET_CONFIG}")
+fi
 
 echo "[rho1b-onegpu] ${RUN_METHOD_TAG} method=${METHOD} gpu=${SELECTED_GPU} out=${OUTDIR}"
 echo "[rho1b-onegpu] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
