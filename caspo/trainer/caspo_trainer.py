@@ -512,6 +512,8 @@ class CASPOTrainer:
                 weight_decay=cfg.critic_weight_decay,
                 fused=_fused_adamw_supported(self.device),
             )
+            if cfg.preallocate_optim_state:
+                self._preallocate_optim_state(self.critic_optimizer)
             self.critic_lr_scheduler = _build_lr_schedule(
                 self.critic_optimizer, cfg.critic_warmup_steps,
             )
@@ -616,6 +618,8 @@ class CASPOTrainer:
                     weight_decay=cfg.value_weight_decay,
                     fused=_fused_adamw_supported(self.device),
                 )
+                if cfg.preallocate_optim_state:
+                    self._preallocate_optim_state(self.value_optimizer)
 
         # ---- optimizer + schedule ----
         self.optimizer = AdamW(
@@ -624,6 +628,8 @@ class CASPOTrainer:
             weight_decay=cfg.weight_decay,
             fused=_fused_adamw_supported(self.device),
         )
+        if cfg.preallocate_optim_state:
+            self._preallocate_optim_state(self.optimizer)
         # Total optimizer.step() calls over the run for linear-decay-to-zero
         # schedule. ``cfg.max_steps`` outer iterations × ``cfg.epochs_per_rollout``
         # epochs over each rollout × (rollout_size / (mb × accum)) optim steps
@@ -1214,6 +1220,41 @@ class CASPOTrainer:
             if callable(no_sync_fn):
                 return no_sync_fn()
         return contextlib.nullcontext()
+
+    @staticmethod
+    def _preallocate_optim_state(optimizer) -> int:
+        """Force lazy AdamW state allocation by running a zero-grad dummy
+        step. Used at trainer init to allocate ``m, v`` BEFORE vLLM
+        engines grab their KV-cache memory; without preallocation, the
+        first real ``optim.step()`` has to find a contiguous
+        ~param_bytes × 2 fp32 block in an allocator that's already
+        fragmented around vLLM's resident weights. Result: spurious OOMs
+        on tight configs (1B single-GPU fp32-master + colocated vLLM).
+
+        Returns the number of params that received state. No-op when
+        ``optimizer is None``. Called after each optimizer construction
+        in the trainer's __init__.
+        """
+        if optimizer is None:
+            return 0
+        # Attach a zero-filled grad to every trainable param; this is the
+        # only mechanism that makes AdamW's per-param state entries
+        # populate. ``set_to_none=False`` after the dummy step keeps the
+        # grad buffers live so the first real backward writes in-place
+        # rather than reallocating.
+        n = 0
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    p.grad = torch.zeros_like(p)
+                    n += 1
+        if n == 0:
+            return 0
+        optimizer.step()
+        # Leave grads live (set_to_none=False) so backward can write
+        # in-place on step 1 without reallocating.
+        optimizer.zero_grad(set_to_none=False)
+        return n
 
     @staticmethod
     def _offload_optim_state_to_cpu(optimizer) -> int:
@@ -2531,14 +2572,40 @@ class CASPOTrainer:
             # So the value window for response tokens is
             # ``critic_full[:, P-1:P-1+R]`` (length R), aligning V(s_t)
             # with response token t.
+            #
+            # MICROBATCHED: at fp32 master + B=prompts_per_step×G, running
+            # the no-grad GAE forward on the full B exhausts the MLP
+            # intermediate-activation budget (e.g., B=32×P+R=2048 at 1B
+            # blew 7.6 GiB on a single MLP allocation). Chunk the forward
+            # over ``logprob_micro_batch_size`` to cap per-batch peak.
+            # No autograd graph is built (no_grad), so memory between
+            # chunks is ``critic_values_chunk`` only — small.
+            P = tiled_prompt_ids.shape[1]
+            gae_mb = max(1, _configured_logprob_micro_batch_size(cfg))
+            critic_value_chunks: List[torch.Tensor] = []
             with torch.no_grad():
-                full_ids = torch.cat([tiled_prompt_ids, response_ids], dim=1)
-                full_mask = torch.cat([tiled_prompt_mask, response_mask], dim=1)
-                P = tiled_prompt_ids.shape[1]
-                critic_full = self.critic_model(
-                    input_ids=full_ids, attention_mask=full_mask,
-                )
-                critic_values = critic_full[:, P - 1 : P - 1 + R_local].contiguous()
+                for _gs in range(0, B_local, gae_mb):
+                    _ge = min(_gs + gae_mb, B_local)
+                    _full_ids = torch.cat(
+                        [tiled_prompt_ids[_gs:_ge], response_ids[_gs:_ge]],
+                        dim=1,
+                    )
+                    _full_mask = torch.cat(
+                        [tiled_prompt_mask[_gs:_ge], response_mask[_gs:_ge]],
+                        dim=1,
+                    )
+                    _critic_full = self.critic_model(
+                        input_ids=_full_ids, attention_mask=_full_mask,
+                    )
+                    critic_value_chunks.append(
+                        _critic_full[:, P - 1 : P - 1 + R_local].contiguous()
+                    )
+                    # Drop the full-sequence tensor before next chunk so its
+                    # MLP/attention activations are reclaimed by the
+                    # allocator.
+                    del _critic_full, _full_ids, _full_mask
+                critic_values = torch.cat(critic_value_chunks, dim=0)
+                del critic_value_chunks
             # Mask values past the response end so GAE doesn't propagate
             # through padding.
             critic_values = critic_values * response_mask.to(critic_values.dtype)
@@ -2900,6 +2967,14 @@ class CASPOTrainer:
         # for granularity; runs cfg.epochs_per_rollout passes over the
         # batch (matching the policy loop's effective compute count).
         if method == "ppo_critic" and self.critic_model is not None:
+            # Free the policy backward's allocator fragments before the
+            # critic's forward+backward starts. Without this, per-step
+            # `t_value` grows linearly (~10s/step at 1B fp32-master+mb=4)
+            # because each step's policy backward leaves reserved-but-
+            # unallocated blocks that the critic's varying-shape forward
+            # (different ``R_eff`` per micro) can't reuse, fragmenting the
+            # pool further and accumulating across steps until OOM.
+            torch.cuda.empty_cache()
             t_value_extra, v_loss_avg = self._ppo_critic_train_critic(
                 tiled_prompt_ids, tiled_prompt_mask,
                 response_ids, response_mask,

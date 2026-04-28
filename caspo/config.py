@@ -317,6 +317,17 @@ class CASPOConfig:
     # Gen5 (~1% step-time slowdown at 7B). Default False — only flip on
     # for memory-tight configs (7B fp32-master + 4-GPU).
     offload_optim_during_sync: bool = False
+    # When True, run a one-time dummy ``optimizer.step()`` with zero grads
+    # right after each optimizer is constructed at trainer init, to force
+    # AdamW state (m, v) allocation BEFORE vLLM grabs its KV cache. With
+    # lazy init, the first real step has to find a contiguous ~param_bytes
+    # × 2 block on a GPU already 30%+ filled with vLLM — at fp32 master +
+    # tight configs (1B single-GPU) this races allocator fragmentation and
+    # OOMs. Eager allocation gets a clean address space. One-time cost
+    # ~50-200 ms (kernel launches + zero-fill); zero per-step overhead
+    # since state is already populated by step 1. Default True (small
+    # cost, real benefit on tight configs).
+    preallocate_optim_state: bool = True
     # Set to a free GPU index (e.g. CASPO_EVAL_GPU=2 in the launcher
     # env) to dispatch ``scripts/eval.py`` as a fire-and-forget
     # subprocess after each ``eval_every`` checkpoint. -1 disables.
