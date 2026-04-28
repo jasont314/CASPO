@@ -1745,53 +1745,43 @@ class CASPOTrainer:
                     ((n_micro_in_epoch + 1) % accum == 0)
                     or (micro_idx == n_micros_total - 1)
                 )
+                # NO per-microbatch padding trim: keep ``[mb, P+R]`` uniform
+                # across all microbatches and steps. Trimming to ``R_eff``
+                # changed tensor shapes per-mb (different attention/MLP
+                # intermediate sizes), forcing the CUDA caching allocator to
+                # mint fresh segments for each shape. With ``empty_cache``
+                # called once per step + many distinct shapes per step, the
+                # driver's segment table bloated linearly across steps and
+                # ``cudaMalloc`` walks slowed proportionally → ``t_value``
+                # grew ~+10s per step (24→47s over 4 steps). Uniform shape
+                # trades ~5-15% extra attention FLOPs on padding for
+                # constant per-step time. The mb_resp_mask still zeros loss
+                # contributions from padded tokens, so correctness is
+                # unchanged. (CASPO online's ``_train_value_online`` uses
+                # the same uniform-shape pattern and shows constant t_value
+                # — this just brings PPO+critic in line.)
                 mb_resp_mask = response_mask[start:end]
-                # Per-microbatch padding trim: shrink R to the longest
-                # actual response in this slice. Mirrors the policy mb
-                # loop's per-mb trim and saves attention compute on
-                # short responses.
-                R_eff = int(mb_resp_mask.sum(dim=1).max().item())
-                if R_eff == 0:
-                    n_micro_in_epoch += 1
-                    if will_step:
-                        if cfg.critic_grad_clip and cfg.critic_grad_clip > 0:
-                            try:
-                                self._clip_grad_norm(
-                                    self.critic_model,
-                                    self.critic_model.parameters(),
-                                    max_norm=cfg.critic_grad_clip,
-                                )
-                            except Exception:
-                                pass
-                        self.critic_optimizer.step()
-                        if self.critic_lr_scheduler is not None:
-                            self.critic_lr_scheduler.step()
-                        self.critic_optimizer.zero_grad(set_to_none=True)
-                    continue
-                mb_resp_mask_eff = mb_resp_mask[:, :R_eff]
+                R_full = response_ids.shape[1]
                 full_ids = torch.cat(
-                    [
-                        tiled_prompt_ids[start:end],
-                        response_ids[start:end, :R_eff],
-                    ],
+                    [tiled_prompt_ids[start:end], response_ids[start:end]],
                     dim=1,
                 )
                 full_mask = torch.cat(
-                    [tiled_prompt_mask[start:end], mb_resp_mask_eff],
+                    [tiled_prompt_mask[start:end], mb_resp_mask],
                     dim=1,
                 )
                 crit_full = self.critic_model(
                     input_ids=full_ids, attention_mask=full_mask,
                 )
                 P = tiled_prompt_ids[start:end].shape[1]
-                crit_values = crit_full[:, P - 1 : P - 1 + R_eff]
-                crit_values = crit_values * mb_resp_mask_eff.to(
+                crit_values = crit_full[:, P - 1 : P - 1 + R_full]
+                crit_values = crit_values * mb_resp_mask.to(
                     crit_values.dtype,
                 )
-                old_v_mb = old_values[start:end, :R_eff]
-                ret_mb = returns[start:end, :R_eff]
+                old_v_mb = old_values[start:end]
+                ret_mb = returns[start:end]
                 v_loss = clipped_value_loss(
-                    crit_values, old_v_mb, ret_mb, mb_resp_mask_eff,
+                    crit_values, old_v_mb, ret_mb, mb_resp_mask,
                     cliprange=cliprange,
                 )
                 # Weight microbatch token means by their valid-token count
