@@ -985,11 +985,20 @@ master fit in 4×H100 80 GB:
    the step 1→2 boundary on 7B CASPO. ~400-500 ms / sync at PCIe
    Gen5 (~10% sync-step slowdown). Default off; on for 7B configs.
 
-3. **Streaming IPC sync + per-param bf16 cast**: chunk
-   `update_weights` RPCs into 8-param batches and cast each param
-   from fp32 → bf16 on the source side (vLLM expects bf16). Caps
-   sync-time keepalive memory and halves the IPC payload at fp32
-   master.
+3. **Single-RPC IPC sync + per-param bf16 cast** (replaced earlier
+   "streaming" version): cast each param from fp32 → bf16 on the
+   source side (vLLM expects bf16) and submit ALL params in one
+   `update_weights` RPC. We initially tried chunking the RPC into
+   8-param batches, but vLLM's `_reload_weights_in_place` calls
+   `initialize_layerwise_reload` + `load_weights` + `finalize_
+   layerwise_reload` PER RPC when `is_checkpoint_format=True`, so
+   each chunk re-initialized the layerwise-reload state and only a
+   small fraction of params actually persisted. Symptom: thousands
+   of "<Module>: Failed to load weights" warnings per sync, and
+   step 2+ rollouts producing garbage (no `\boxed{...}`), reward=0
+   instant collapse. Reverted to single-RPC in commit `b34dd80`
+   (2026-04-28). For 7B fp32 master memory pressure, AdamW
+   CPU-offload (item 2) carries the load instead.
 
 4. **Preallocate AdamW state at trainer init**: run a one-time
    zero-grad dummy `optim.step()` after each optimizer is built, so
@@ -1055,10 +1064,78 @@ save_optimizer_state: true       # save m/v alongside model.safetensors
 offload_optim_during_sync: false # 7B configs override to true
 vllm_extra_stop_strings: ["\n\n\nProblem:"]   # paper-faithful stop
 max_sequence_len: 2048           # post-rollout unfinished penalty
+advantage_clip: 3.0              # ±3σ clip post-whitening (outlier safety)
+kl_coef: 1.0e-2                  # 100× upstream's 1e-4 — see stabilization below
+online_value_lr: 1.0e-6          # CASPO V_φ online update LR (full-FT)
+critic_lr: 1.0e-6                # PPO+critic V_ψ LR (matches policy LR)
 ```
 
 GPU 0 reserved for teammate's evaluation experiment — all CASPO runs
 default to GPUs 1-7 (override with `GPU=` or `GPU_LIST=`).
+
+### 4-method stabilization recipe (Apr 28, 2026)
+
+A bisection on Apr 28 surfaced **two compounding bugs** that made the
+4-method 1B parallel run (GRPO + PPO+Critic + CASPO + CASPO Δp)
+collapse to reward=0 within ~20 outer steps. Documented here so
+future-you doesn't recreate the trap.
+
+**Bug 1 — Streaming IPC sync corrupted vLLM** (commit `a28099d`,
+reverted in `b34dd80`). Detail above (Single-RPC IPC sync). Headline
+symptom: instant collapse — step 2 rollouts produce garbage, reward
+drops to 0 across all 4 methods because vLLM's policy is half-loaded
+after the first weight sync.
+
+**Bug 2 — Online-value drift collapsed CASPO/PPO+Critic** (multiple
+commits `f149966 → 21cbd41`). After fixing Bug 1, CASPO still
+collapsed by step 17-20 with KL → 100s and `steps/r 8 → 45` (mode
+collapse to long degenerate responses). Root cause: VinePPO upstream
+absorbs V_φ noise via K=9 MC continuations per step boundary; we
+have a single learned V_φ forward (no MC averaging), so the policy
+update sees noisier advantages and drifts faster than the KL
+penalty can pull it back at upstream's `kl_coef=1e-4`. Fix stack:
+
+| # | Knob | Was | Now | Why |
+|---|---|---|---|---|
+| F1 | `advantage_clip` | 0 (Patch H removed) | 3.0 | outlier safety net |
+| F2 | `kl_coef` | 1e-4 (upstream) | 1e-2 | 100× anchor against learned-value drift |
+| F3 | `online_value_lr` | 1e-6 → 1e-7 → **1e-6** | 1e-6 | dropped during weak-KL phase, restored when KL anchor took over |
+| F4 | `critic_lr` | 1e-6 → 1e-7 → **1e-6** | 1e-6 | same path as F3 |
+| F5 | `launch_rho1b_ppo_critic.sh` | hardcoded `kl_coef=1e-4` override | inherits YAML | silent launcher override was bypassing F2 for PPO+Critic only |
+
+Verification: `fixed_v6` (F1+F2+F3=1e-7+F4=1e-7+F5) reached step 100
+with reward stable ~0.20 and KL bounded < 2 across all 4 methods.
+Held-out eval at step_100 vs SFT init on MATH-500 (k=8, n=100) shows
+GRPO `avg@k 0.199 → 0.236` (+19%) — first clean signal that learning
+actually works post-stabilization.
+
+**Detection signals** for future debugging:
+- vLLM "Failed to load weights" warnings count: healthy ~hundreds at
+  startup, broken ~tens of thousands per sync (Bug 1 signature).
+- `steps/r` (mean response length / step count) rising sharply over
+  ~5 outer steps from init values to ~max-cap → policy is mode-
+  collapsing to long degenerate responses (Bug 2 signature).
+- `reward=0.000, pass@G=0.000` for >5 consecutive steps from any
+  early step (≤ step 20) → kill and bisect immediately, don't wait.
+
+### 4-method parallel launcher (Rho-1B, four NVMe drives)
+
+`scripts/launch_rho1b_4method_split.sh` runs GRPO + PPO+Critic +
+CASPO + CASPO Δp concurrently on GPUs 4-7 (or the user's
+`GPU_LIST`). Each method writes its checkpoints to its own NVMe
+drive so 10 ckpts/run × 4 runs (save_every=100 × 1000 steps) all
+fit without disk contention:
+
+| GPU | Method | Drive | ckpts | Footprint |
+|---|---|---|---|---|
+| 4 | GRPO | `/mnt/nvme_tmp2` | 10 | ~153 GB |
+| 5 | PPO+Critic | `/mnt/nvme_tmp4` | 10 | ~270 GB |
+| 6 | CASPO | `/mnt/nvme_tmp3` | 10 | ~285 GB |
+| 7 | CASPO Δp | `/mnt/nvme_tmp5` | 10 | ~285 GB |
+
+Pre-launch validates all 4 drives mounted + writable. Live status
+via `RUN_TAG=<tag> watch -n 10 bash scripts/watch_4method.sh` —
+shows per-method step / t_step / t_avg10 / ETA / mem_alloc.
 
 ## 7B Infrastructure (Apr 2026)
 
