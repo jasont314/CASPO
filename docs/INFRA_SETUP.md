@@ -247,14 +247,45 @@ export MKL_NUM_THREADS=4
 
 ### IPVRM value model checkpoints (CASPO prerequisites)
 
-* **Rho-1B IPVRM** at `/mnt/nvme_tmp/jason_caspo/value_model_rho1b/final/`
-  — produced by `scripts/launch_rho1b_value_train.sh` (3 epochs over
-  ~17.5K mixed-outcome rollouts, ~30 min on 1× H100).
+* **Rho-1B IPVRM v2** (current, 2026-04-28):
+  `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final` —
+  produced by `scripts/retrain_value_rho1b_4gpu.sh` (4-shard parallel
+  collect + merge + FSDP=4 train_value, ~30-45 min on 4× H100). Step-1
+  runtime `v_acc=0.74` against current verifier + Patch-A BOS prompts.
+* **Rho-1B IPVRM v1** (deprecated, 2026-04-25):
+  `/mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final` — kept for
+  reproducing pre-Apr-28 numbers. Step-1 runtime `v_acc=0.32` against
+  current verifier (label drift from Minerva extractor cascade) + no-BOS
+  prompts (predates Patch A).
 * **DeepSeekMath-7B IPVRM** at `/mnt/nvme_tmp/jason_caspo/value_model_dsmath7b/final/`
   — produced by `scripts/_launch_7b_value_train.sh` on 4 GPUs, ~6 hours.
+  Uses pre-Apr-28 verifier and tokenization; **needs retrain when
+  switching to Apr-28+ stack**.
 
-YAML configs hard-code these paths via `prefix_value_path`. Re-train
-before any CASPO run if base SFT model changes.
+`configs/caspo_rho1b_math.yaml` defaults `prefix_value_path` to v2.
+Override per-run via the `PREFIX_VALUE_PATH` env var (read by
+`scripts/_launch_rho1b_one_gpu.sh` and forwarded as
+`--override prefix_value_path=...` to the trainer). Re-run the retrain
+pipeline whenever:
+1. `caspo/reward/math_verifier.py` answer-extraction logic changes,
+2. `caspo/rollout/vllm_engine.py` prompt-tokenization changes (e.g.
+   adding/removing BOS prepending),
+3. base SFT model changes.
+
+The **end-to-end retrain** is one command:
+
+```bash
+GPU_LIST="4 5 6 7" bash scripts/retrain_value_rho1b_4gpu.sh
+```
+
+which runs (1) 4-shard `collect_value_data.py` in parallel, (2) merge
+with `scripts/merge_value_data_shards.py`, (3) FSDP=4 `train_value.py`
+at `value_micro_batch_size=16, value_grad_accum_steps=1` (same effective
+batch as paper-faithful `mb=1, accum=16` but ~3.7× faster on H100), and
+(4) smoke-validate via a 1-step CASPO rollout (passes if `v_acc≥0.7`).
+
+ROC-AUC of the value model (over the held-out 10% of `value_data.pt`)
+is the right offline-quality metric — see `eval_vphi_auc.py`.
 
 ## 7. Network / NCCL setup
 
