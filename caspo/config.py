@@ -249,7 +249,11 @@ class CASPOConfig:
     # actor + critic in their DeepSpeed setup; verified 2026-04-27).
     critic_lr: float = 1e-6
     critic_weight_decay: float = 0.0
-    critic_warmup_steps: int = 0
+    # VinePPO upstream warms actor and critic with the same ratio
+    # (warmup_ratio=0.03 of total optimizer steps). Default 0 here was
+    # a cold start; set to 480 to match the actor's 1000×2×8=16000-step
+    # × 3% schedule. PPO+critic launchers can override per-config.
+    critic_warmup_steps: int = 480
     critic_grad_clip: float = 1.0
     # Value-loss coefficient in the joint objective. The full PPO loss is
     # ``policy_pg_loss + value_loss_coef * value_loss``. VinePPO upstream's

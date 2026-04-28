@@ -21,8 +21,9 @@ eval_dataset_name: HuggingFaceH4/MATH-500
 eval_split: test
 prompt_template: "[MATH_TASK] Problem:\n{query}\n\nSolution:"
 
-max_prompt_len: 1024
+max_prompt_len: 1512                  # match VinePPO's max_question_length=1512 (was 1024)
 max_response_len: 1024
+max_sequence_len: 2499                # match VinePPO 7B (was 2048; 7B context = 4096)
 
 group_size: 8
 rollout_temperature: 0.6
@@ -99,7 +100,7 @@ adb_dlw_eps: 0.05
 gamma: 1.0
 standardize_step_advantage: true
 standardize_advantage_scope: batch
-advantage_clip: 3.0
+advantage_clip: 0.0                   # paper-faithful: VinePPO does NOT σ-clip after whitening (was 3.0; truncating ±3σ silently nuked terminal-success advantages)
 
 clip_eps_low: 0.20
 clip_eps_high: 0.20
@@ -111,7 +112,10 @@ lr: 1.0e-6                        # paper-faithful: VinePPO Table 2 uses lr=1e-6
                                   # (same as Rho-1B). Earlier 2e-6 was a guess; reverted for
                                   # apples-to-apples comparison with the upstream baseline.
 weight_decay: 0.0
-warmup_steps: 60
+# warmup_steps: 480 = 0.03 (VinePPO upstream warmup_ratio) × 16000 total
+# optimizer steps (1000 outer × 2 epochs × 8 mb-per-epoch). Was 60
+# = effectively no warmup (~0.4% of steps); fixed to match upstream.
+warmup_steps: 480
 grad_clip: 1.0
 micro_batch_size: 2               # Apr 2026: mb=2 cuts step time 41s → 30s vs mb=1 (~27% faster)
 grad_accum_steps: 8               # FSDP=4: 4 ranks × 2 mb × 8 accum = 64-episode global minibatch

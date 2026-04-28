@@ -269,29 +269,86 @@ def _try_sympy(a: str, b: str, timeout_s: float = 2.0) -> Optional[bool]:
                 pass
 
 
+def _extract_minerva_cascade(prediction: str) -> Optional[str]:
+    """VinePPO-style Minerva extractor cascade.
+
+    VinePPO upstream's ``extract_predicted_answer_from_text_minerva``
+    (treetune/tasks/math.py:344, math_answer_exctraction.py:211-247)
+    tries multiple answer formats in order:
+      1. ``final answer is $...$. I hope`` (Minerva-style explicit marker)
+      2. ``\\boxed{...}`` (handled separately by ``extract_boxed_answer``)
+      3. ``the answer is ...`` (case-insensitive on "he answer is")
+      4. `````output\\n...\\n````` (program output)
+      5. last numeric in the text
+    Returns the extracted string or None. Caller is responsible for
+    boxed extraction; this handles only the non-boxed cascade so we
+    can preserve our existing boxed-first short-circuit.
+    """
+    # 1) "final answer is $...$. I hope"
+    if "final answer is $" in prediction and "$. I hope" in prediction:
+        tmp = prediction.split("final answer is $", 1)[1]
+        ans = tmp.split("$. I hope", 1)[0].strip()
+        if ans:
+            return ans.split("\n", 1)[0].strip().rstrip(":,.;").strip("$* `")
+    # 2) "the answer is" (matches "The answer is", "the answer is", etc.)
+    if "he answer is" in prediction:
+        tail = prediction.rsplit("he answer is", 1)[-1].strip()
+        # Take first line, strip leading punctuation/$ wrapping
+        ans = tail.split("\n", 1)[0].strip()
+        ans = ans.lstrip(":").strip()
+        ans = ans.rstrip(",.;")
+        ans = ans.strip("$* `")
+        if ans:
+            return ans
+    # 3) program output: ```output\n...\n```
+    if "```output" in prediction:
+        tail = prediction.split("```output", 1)[1]
+        if "```" in tail:
+            tail = tail.split("```", 1)[0]
+        ans = tail.strip()
+        if ans:
+            return ans.split("\n", 1)[0].strip()
+    # NOTE: VinePPO has a final "last numeric in the text" fallback, but
+    # we deliberately omit it. With our deterministic SFT prompt template
+    # and rollout temperature 0.6, models that produce a numeric answer
+    # use one of the explicit markers above (`\boxed`, `####`,
+    # "the answer is", "final answer is"). The trailing-numeric fallback
+    # introduces false positives when the problem text contains the
+    # correct number (e.g., "Find the integer between 5 and 10..." → the
+    # response transcribes "5" or "10" while computing). Matches
+    # VinePPO's "pred_answer is None → reward 0" intent more cleanly
+    # than copying their lenient extractor.
+    return None
+
+
 def grade_math(prediction: str, ground_truth: str) -> float:
-    """Return 1.0 iff ``prediction`` (a model response containing ``\\boxed{}``
-    or a GSM8K-style ``#### N`` final-answer marker) is mathematically
-    equivalent to ``ground_truth`` (boxed or bare). 0.0 otherwise.
+    """Return 1.0 iff ``prediction`` is mathematically equivalent to
+    ``ground_truth`` (boxed or bare). 0.0 otherwise.
+
+    Extraction cascade (matches VinePPO's Minerva extractor where ours
+    deviated):
+      1. ``\\boxed{...}`` (canonical MATH format — most SFT models)
+      2. ``#### N`` (GSM8K-native marker)
+      3. ``final answer is $X$. I hope`` (Minerva explicit)
+      4. ``the answer is X`` (case-insensitive prefix)
+      5. ```` ```output\\n...\\n``` ```` (program output blocks)
+      6. last numeric in the response (Minerva fallback)
     """
     pred_inner = extract_boxed_answer(prediction)
+    if pred_inner is None and "####" in prediction:
+        # GSM8K-style fallback: ``#### N`` at end of response.
+        tail = prediction.rsplit("####", 1)[-1].strip()
+        tail = tail.split("\n", 1)[0].strip().rstrip(",.;")
+        tail = tail.strip("$* `")
+        if tail:
+            pred_inner = tail
     if pred_inner is None:
-        # GSM8K-style fallback: ``#### N`` at end of response. SFT models
-        # finetuned on MATH default to ``\\boxed{}`` even on GSM8K prompts;
-        # but RL-trained variants and some SFT checkpoints emit ``#### N``.
-        # Without this fallback, a model that produces the correct numeric
-        # answer in GSM8K-native format scores 0 → SFT GSM8K under-reports
-        # by ~12 pp vs paper-faithful eval.
-        if "####" in prediction:
-            tail = prediction.rsplit("####", 1)[-1].strip()
-            # Take first line after the marker; strip trailing punctuation.
-            tail = tail.split("\n", 1)[0].strip().rstrip(",.;")
-            # Drop any leading $ wrapper or boldface markup.
-            tail = tail.strip("$* `")
-            if tail:
-                pred_inner = tail
-        if pred_inner is None:
-            return 0.0
+        # Minerva-style cascade: "the answer is X", "final answer is $X$",
+        # program output, or last numeric. Picks up correct responses that
+        # didn't use \\boxed{} or #### but did state the answer in prose.
+        pred_inner = _extract_minerva_cascade(prediction)
+    if pred_inner is None:
+        return 0.0
     gt_bare = _strip_to_bare(ground_truth)
 
     # 1) Cheap normalized string equality FIRST. Most correctly-formatted

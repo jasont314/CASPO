@@ -507,7 +507,12 @@ class CASPOTrainer:
             self.critic_optimizer = AdamW(
                 (p for p in self.critic_model.parameters() if p.requires_grad),
                 lr=cfg.critic_lr,
-                betas=(0.9, 0.95),
+                # VinePPO upstream's DeepSpeed config sets adam_beta2=0.999
+                # (the torch AdamW default). The previous (0.9, 0.95)
+                # mirrored OpenAI's GPT recipe and is more aggressive on
+                # the value head's noisy targets — visible drift relative
+                # to upstream's reference. Match (0.9, 0.999).
+                betas=(0.9, 0.999),
                 eps=1e-8,
                 weight_decay=cfg.critic_weight_decay,
                 fused=_fused_adamw_supported(self.device),
