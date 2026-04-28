@@ -1168,6 +1168,65 @@ in the launcher env (the 1B per-GPU launcher in
 `scripts/_launch_rho1b_one_gpu.sh` accepts this env override and
 forwards it as `--override prefix_value_path=...`).
 
+### Teammate handoff: CASPO ablation runs (Rho-1B, single GPU each)
+
+To distribute CASPO ablations across collaborators' machines, each
+ablation is one self-contained launcher that takes one H100 and runs
+1000 outer steps in ~16 hours. Each writes ~150-285 GB of checkpoints
+across 10 saves (`save_every=100`).
+
+**Required inputs** (one-time copy):
+- SFT model: HuggingFace `realtreetune/rho-1b-sft-MATH` (~2 GB; auto-downloaded)
+- V_φ checkpoint: rsync from
+  `/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final/` (~4 GB).
+  All CASPO methods use the same V_φ; only `caspo_frozen_rm` keeps it
+  fixed during RL, the others fine-tune online.
+
+**Five CASPO ablations** (each its own thin launcher in `scripts/`):
+
+| Variant | Launcher | Ablation knob |
+|---|---|---|
+| CASPO frozen-RM | `launch_rho1b_caspo_frozen_rm.sh` | `update_value_during_policy=false` |
+| CASPO logprob | `launch_rho1b_caspo_delta_log_prob.sh` | `caspo_advantage_transform=logprob` |
+| CASPO Δp (default LR) | `launch_rho1b_caspo_delta_prob.sh` | `caspo_advantage_transform=prob`, `online_value_lr=1e-6` |
+| CASPO Δp (LR=1e-5) | `launch_rho1b_caspo_delta_prob_lr1e5.sh` | as Δp + `online_value_lr=1e-5` |
+| CASPO Δp (LR=1e-4) | `launch_rho1b_caspo_delta_prob_lr1e4.sh` | as Δp + `online_value_lr=1e-4` (paper-faithful for LoRA, untested at full-FT under post-Apr-28 stack) |
+
+**Standard invocation** (override any defaults via env):
+
+```bash
+# Required env: ROOT (output drive root), GPU (single id)
+# Optional env: PREFIX_VALUE_PATH (default: YAML's path = v2 retrained V_φ)
+#               ONLINE_VALUE_LR (default: YAML's value_lr = 1e-6 except 1e5/1e4 launchers)
+#               KL_COEF (default: YAML's kl_coef = 1e-2)
+#               RUN_TAG (suffix appended to output dir)
+
+# Example: friend's box, GPU 0, run tag "ablation_seed0"
+ROOT=/path/to/output GPU=0 RUN_TAG=ablation_seed0 \
+  bash scripts/launch_rho1b_caspo_frozen_rm.sh
+
+# If V_φ checkpoint isn't at the YAML default path on friend's box:
+ROOT=/path/to/output GPU=0 RUN_TAG=ablation_seed0 \
+PREFIX_VALUE_PATH=/path/to/local/value_final \
+  bash scripts/launch_rho1b_caspo_delta_log_prob.sh
+```
+
+**Required pre-flight**: the YAML's `prefix_value_path` defaults to a
+local NVMe path (`/mnt/nvme_tmp4/jason_caspo/caspo_rho1b_math_v2/value_final`)
+that won't exist on a teammate's machine. Either:
+1. Copy V_φ to the same absolute path on their box, OR
+2. Pass `PREFIX_VALUE_PATH=<their_path>` via env (recommended).
+
+Per-method disk footprint at `save_every=100` × 1000 steps × ckpts
+(model.safetensors + AdamW optimizer.pt for policy + value):
+
+| Variant | Per-ckpt | × 10 ckpts |
+|---|---|---|
+| frozen-RM | ~17 GB | ~170 GB (no value optim → smaller) |
+| logprob / Δp (any LR) | ~28 GB | ~285 GB (full V_φ + AdamW) |
+
+Each variant takes ~16 hours on a single H100 80GB.
+
 ### 4-method parallel launcher (Rho-1B, four NVMe drives)
 
 `scripts/launch_rho1b_4method_split.sh` runs GRPO + PPO+Critic +

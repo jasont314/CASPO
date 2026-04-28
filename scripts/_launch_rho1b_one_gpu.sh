@@ -123,6 +123,13 @@ fi
 if [[ -n "${PREFIX_VALUE_PATH:-}" ]]; then
     COMMON_OVERRIDES+=(--override "prefix_value_path=${PREFIX_VALUE_PATH}")
 fi
+# Allow caller to override online_value_lr (CASPO V_φ online update LR).
+# Default in YAML is 1e-6 (full-FT scaled from paper's 1e-4 LoRA setting).
+# Useful sweep values: 1e-7 (very conservative), 1e-5 (closer to paper),
+# 1e-4 (paper-faithful for LoRA — full-FT may diverge).
+if [[ -n "${ONLINE_VALUE_LR:-}" ]]; then
+    COMMON_OVERRIDES+=(--override "online_value_lr=${ONLINE_VALUE_LR}")
+fi
 
 echo "[rho1b-onegpu] ${RUN_METHOD_TAG} method=${METHOD} gpu=${SELECTED_GPU} out=${OUTDIR}"
 echo "[rho1b-onegpu] vllm_util=${CASPO_VLLM_GPU_MEMORY_UTILIZATION} vllm_mode=${CASPO_VLLM_MULTI_SAMPLE_MODE} max_seqs=${CASPO_VLLM_MAX_NUM_SEQS} max_batched_tokens=${CASPO_VLLM_MAX_NUM_BATCHED_TOKENS:-auto}"
