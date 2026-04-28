@@ -3250,6 +3250,24 @@ class CASPOTrainer:
             f"t_step={t_step:.1f}s "
             f"elapsed={elapsed:.1f}s"
         )
+        # Per-step CUDA memory snapshot — used to diagnose cumulative
+        # growth issues (allocator fragmentation, leaks). Lightweight:
+        # ``memory_stats()`` dict access, no synchronize.
+        if torch.cuda.is_available():
+            try:
+                ms = torch.cuda.memory_stats()
+                alloc_gb = ms.get("allocated_bytes.all.current", 0) / 1e9
+                reserved_gb = ms.get("reserved_bytes.all.current", 0) / 1e9
+                num_alloc = ms.get("active.all.current", 0)
+                num_segments = ms.get("segment.all.current", 0)
+                msg += (
+                    f" mem_alloc={alloc_gb:.1f}G "
+                    f"mem_reserved={reserved_gb:.1f}G "
+                    f"n_alloc={num_alloc} "
+                    f"n_seg={num_segments}"
+                )
+            except Exception:
+                pass
         print(msg, flush=True)
 
         # Wandb log: namespace metrics by category
