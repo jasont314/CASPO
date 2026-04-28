@@ -1182,15 +1182,16 @@ across 10 saves (`save_every=100`).
   All CASPO methods use the same V_φ; only `caspo_frozen_rm` keeps it
   fixed during RL, the others fine-tune online.
 
-**Five CASPO ablations** (each its own thin launcher in `scripts/`):
+**Four CASPO ablations** (each its own thin launcher in `scripts/`).
+The default `caspo_prob` at `online_value_lr=1e-6` is owned by the host
+machine; teammates run the four below as ablations:
 
 | Variant | Launcher | Ablation knob |
 |---|---|---|
 | CASPO frozen-RM | `launch_rho1b_caspo_frozen_rm.sh` | `update_value_during_policy=false` |
 | CASPO logprob | `launch_rho1b_caspo_delta_log_prob.sh` | `caspo_advantage_transform=logprob` |
-| CASPO Δp (default LR) | `launch_rho1b_caspo_delta_prob.sh` | `caspo_advantage_transform=prob`, `online_value_lr=1e-6` |
-| CASPO Δp (LR=1e-5) | `launch_rho1b_caspo_delta_prob_lr1e5.sh` | as Δp + `online_value_lr=1e-5` |
-| CASPO Δp (LR=1e-4) | `launch_rho1b_caspo_delta_prob_lr1e4.sh` | as Δp + `online_value_lr=1e-4` (paper-faithful for LoRA, untested at full-FT under post-Apr-28 stack) |
+| CASPO Δp (LR=1e-5) | `launch_rho1b_caspo_delta_prob_lr1e5.sh` | `caspo_advantage_transform=prob`, `online_value_lr=1e-5` |
+| CASPO Δp (LR=1e-4) | `launch_rho1b_caspo_delta_prob_lr1e4.sh` | as above + `online_value_lr=1e-4` (paper-faithful for LoRA; ablation at full-FT — was unstable pre-Apr-28-stack, may now be safe with strong KL anchor) |
 
 **Standard invocation** (override any defaults via env):
 
