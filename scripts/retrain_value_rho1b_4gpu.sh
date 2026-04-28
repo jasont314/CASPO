@@ -46,6 +46,7 @@ VALUE_MICRO_BATCH_SIZE="${VALUE_MICRO_BATCH_SIZE:-1}"
 VALUE_GRAD_ACCUM_STEPS="${VALUE_GRAD_ACCUM_STEPS:-16}"
 VALUE_MAX_EPOCHS="${VALUE_MAX_EPOCHS:-3}"
 VALUE_LR="${VALUE_LR:-5e-7}"
+VALUE_SAVE_EVERY="${VALUE_SAVE_EVERY:-0}"  # 0 = use cfg default (500); set to control ckpt cadence
 USE_GRADIENT_CHECKPOINTING="${USE_GRADIENT_CHECKPOINTING:-false}"
 
 echo "[retrain] OUT_ROOT=$OUT_ROOT"
@@ -119,6 +120,7 @@ if [[ "${SKIP_TRAIN:-false}" != "true" ]]; then
             --override "value_grad_accum_steps=$VALUE_GRAD_ACCUM_STEPS" \
             --override "value_max_epochs=$VALUE_MAX_EPOCHS" \
             --override "value_lr=$VALUE_LR" \
+            $( (( VALUE_SAVE_EVERY > 0 )) && echo "--override value_save_every=$VALUE_SAVE_EVERY" ) \
             --override "use_gradient_checkpointing=$USE_GRADIENT_CHECKPOINTING" \
             > "$log" 2>&1 &
         PIDS+=("$!")
