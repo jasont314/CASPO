@@ -66,7 +66,12 @@ value_data_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_data.pt
 # at 1e-6 to avoid the saturation seen in earlier runs.
 prefix_value_path: /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math/value_final
 update_value_during_policy: true
-online_value_lr: 1.0e-6
+online_value_lr: 1.0e-7              # Lowered 10× from 1e-6 (2026-04-28).
+                                     # At 1e-6 with fixed IPC sync + adv_clip=3,
+                                     # CASPO online value updates drove KL→48 by
+                                     # step 20 and reward to 0 (value chases
+                                     # policy → degenerate). 1e-7 slows value
+                                     # drift to a rate the policy can track.
 use_adb: true
 use_dlw: true
 adb_dlw_eps: 0.05
