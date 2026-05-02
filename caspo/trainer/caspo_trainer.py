@@ -530,8 +530,12 @@ class CASPOTrainer:
             # doesn't apply — load directly in compute dtype to save memory.
             ref_kwargs = dict(model_kwargs)
             ref_kwargs["torch_dtype"] = torch_dtype
+            # Use cfg.ref_model_path if set (for resume-from-trained-ckpt where
+            # we want pi_ref to stay as base SFT, not roll to the trained
+            # policy weights). Falls back to model_name_or_path for fresh runs.
+            _ref_path = getattr(cfg, "ref_model_path", None) or cfg.model_name_or_path
             self.ref_policy = AutoModelForCausalLM.from_pretrained(
-                cfg.model_name_or_path, **ref_kwargs,
+                _ref_path, **ref_kwargs,
             )
             # Mirror policy: never cache KV (we always run a fresh
             # full-sequence forward) and never train (frozen reference).
@@ -567,7 +571,7 @@ class CASPOTrainer:
             if (
                 self.value_model is not None
                 and getattr(self.value_model, "_ref_model_path", None)
-                    == cfg.model_name_or_path
+                    == _ref_path
             ):
                 try:
                     self.value_model.share_ref(self.ref_policy)
@@ -821,6 +825,14 @@ class CASPOTrainer:
         # ---- bookkeeping ----
         self.global_step = 0
         os.makedirs(cfg.output_dir, exist_ok=True)
+
+        # ---- optional resume of optimizer + lr_scheduler + global_step ----
+        # Mirrors `_save_optimizer_state` (line ~1582). Required when restarting
+        # training from a saved policy ckpt — without it, fresh Adam moments +
+        # warmup-from-zero combined with already-tuned policy weights can blow
+        # up the policy in the first 30-60 steps. See feedback_resume_optimizer_state.
+        if getattr(cfg, "resume_from", None):
+            self._load_optimizer_state(cfg.resume_from)
 
         # ---- wandb ----
         self._wandb = None
@@ -1647,6 +1659,80 @@ class CASPOTrainer:
                 os.path.join(path, "value_optimizer.pt"),
             )
 
+    def _load_optimizer_state(self, path: str) -> None:
+        """Load AdamW state + lr_scheduler state + global_step from a saved ckpt.
+
+        Inverse of `_save_optimizer_state`. For FSDP-wrapped policy, uses
+        `FSDP.optim_state_dict_to_load` to scatter rank0-gathered state back to
+        local shards. Silently no-ops if the ckpt dir lacks `optimizer.pt`.
+        Also loads `critic_optimizer.pt` and `value_optimizer.pt` if present
+        and the corresponding optimizers exist.
+        """
+        optim_pt = os.path.join(path, "optimizer.pt")
+        if not os.path.exists(optim_pt):
+            if self.dist.is_main:
+                print(f"[resume] no optimizer.pt at {path} — fresh optimizer")
+            return
+
+        try:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+            )
+            _fsdp_avail = True
+        except Exception:
+            _fsdp_avail = False
+
+        bundle = torch.load(optim_pt, map_location="cpu", weights_only=False)
+        policy_optim_sd = bundle.get("policy_optimizer")
+
+        def _load_optim(module, optimizer, sd):
+            if sd is None:
+                return
+            if _fsdp_avail and _is_fsdp_module(module):
+                local_sd = FSDP.optim_state_dict_to_load(
+                    model=module, optim=optimizer, optim_state_dict=sd,
+                )
+                optimizer.load_state_dict(local_sd)
+            else:
+                optimizer.load_state_dict(sd)
+
+        _load_optim(self.model, self.optimizer, policy_optim_sd)
+
+        if bundle.get("lr_scheduler") is not None and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(bundle["lr_scheduler"])
+        if bundle.get("critic_lr_scheduler") is not None and self.critic_lr_scheduler is not None:
+            self.critic_lr_scheduler.load_state_dict(bundle["critic_lr_scheduler"])
+        if bundle.get("global_step") is not None:
+            self.global_step = int(bundle["global_step"])
+
+        # Critic optimizer
+        critic_pt = os.path.join(path, "critic_optimizer.pt")
+        if (
+            os.path.exists(critic_pt)
+            and getattr(self, "critic_optimizer", None) is not None
+            and getattr(self, "critic_model", None) is not None
+        ):
+            cb = torch.load(critic_pt, map_location="cpu", weights_only=False)
+            _load_optim(self.critic_model, self.critic_optimizer, cb.get("critic_optimizer"))
+
+        # Value optimizer (caspo online value updates)
+        value_pt = os.path.join(path, "value_optimizer.pt")
+        if (
+            os.path.exists(value_pt)
+            and getattr(self, "value_optimizer", None) is not None
+        ):
+            vb = torch.load(value_pt, map_location="cpu", weights_only=False)
+            vsd = vb.get("value_optimizer")
+            if vsd is not None:
+                self.value_optimizer.load_state_dict(vsd)
+
+        if self.dist.is_main:
+            print(
+                f"[resume] loaded optimizer.pt from {path} → "
+                f"global_step={self.global_step}, "
+                f"lr={self.optimizer.param_groups[0]['lr']:.2e}"
+            )
+
     def _auto_run_name(self) -> str:
         cfg = self.cfg
         model_short = cfg.model_name_or_path.rsplit("/", 1)[-1]
@@ -1883,8 +1969,31 @@ class CASPOTrainer:
                     return name
 
                 def named_parameters(self, *_, **__):  # type: ignore[override]
+                    embed_param = None
+                    saw_lm_head = False
                     for raw_name, p in self._src.named_parameters():
-                        yield self._clean(raw_name), p
+                        clean = self._clean(raw_name)
+                        if clean.endswith("model.embed_tokens.weight"):
+                            embed_param = p
+                        if clean.endswith("lm_head.weight"):
+                            saw_lm_head = True
+                        yield clean, p
+                    # When the HF config sets ``tie_word_embeddings=True`` (e.g.
+                    # Qwen2.5-Math-1.5B, Qwen3-1.7B) ``lm_head.weight`` and
+                    # ``model.embed_tokens.weight`` share storage; PyTorch's
+                    # ``named_parameters`` dedupes by tensor identity and only
+                    # yields the embedding. vLLM's Qwen2ForCausalLM still
+                    # expects an explicit ``lm_head.weight`` in the IPC update,
+                    # and silently drops every module load otherwise (118
+                    # "Failed to load weights" warnings per sync on 1.5B).
+                    # Re-emit the alias so vLLM populates LogitsProcessor.
+                    if (
+                        embed_param is not None
+                        and not saw_lm_head
+                        and bool(getattr(getattr(self._src, "config", None),
+                                         "tie_word_embeddings", False))
+                    ):
+                        yield "lm_head.weight", embed_param
 
             view = _FsdpStrippedParamsView(base)
             # Push directly through the IPC kernel — it iterates
@@ -1961,9 +2070,22 @@ class CASPOTrainer:
             )
 
         if self.value_optimizer is None:
+            # No-grad forward path: forward-only doesn't need backward
+            # activation storage, so we can use a larger microbatch than
+            # the policy update's mb. Defaults to 4× the policy mb (capped
+            # at 16) to halve the FSDP all_gather collective overhead
+            # without blowing memory. Override via ``cfg.value_micro_batch_size``.
+            v_mb = int(getattr(cfg, "value_micro_batch_size", 0) or 0)
+            if v_mb <= 0:
+                # No-grad forward + frozen value: v_mb=16 is the Pareto sweet
+                # spot on Qwen2.5-Math-1.5B FSDP=4. Bumping to 32 didn't help
+                # (t_value stuck at 14-16s, same as v_mb=16) — we hit the
+                # FSDP collective overhead floor at v_mb=16. Going lower
+                # (v_mb=4) gave 47-58s. Full sweep results 2026-04-30.
+                v_mb = min(16, max(mb * 4, mb))
             out_chunks: List[torch.Tensor] = []
-            for start in range(0, B, mb):
-                end = min(start + mb, B)
+            for start in range(0, B, v_mb):
+                end = min(start + v_mb, B)
                 with torch.no_grad():
                     out = self.value_model(
                         prompt_ids[start:end], prompt_mask[start:end],

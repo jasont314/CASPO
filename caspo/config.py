@@ -322,6 +322,20 @@ class CASPOConfig:
     # momentum after a crash. fp32 master adds ~3× model-bytes per save
     # (params + m + v); disable on tight-disk runs and pay the resume cost.
     save_optimizer_state: bool = True
+    # Path to a saved checkpoint dir from which to resume training: loads
+    # optimizer state (AdamW m,v + lr_scheduler step counter + global_step) so
+    # that "warm Adam + decaying lr" semantics carry over to the new run.
+    # Policy weights themselves come from ``model_name_or_path`` as usual; set
+    # both to the same dir for a true resume. Loading is a no-op if dir lacks
+    # ``optimizer.pt``. See ``feedback_resume_optimizer_state`` (2026-05-01).
+    resume_from: Optional[str] = None
+    # When set, load the KL reference policy (pi_ref) from a SEPARATE path
+    # instead of `model_name_or_path`. Required when resuming from a trained
+    # ckpt: model_name_or_path needs to be the resume ckpt (so weights load),
+    # but pi_ref should remain the original SFT base so KL anchors don't roll
+    # forward with the policy. Default None = behave as before (ref =
+    # model_name_or_path). See `feedback_resume_optimizer_state` for context.
+    ref_model_path: Optional[str] = None
     # When True, temporarily move policy/critic/value AdamW state (m, v) to
     # pinned host memory before each ``_sync_vllm_weights`` call and restore
     # afterward. Required for 7B fp32-master + 4-rank FSDP + colocated vLLM:
