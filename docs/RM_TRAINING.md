@@ -301,3 +301,376 @@ If we wanted to push AUC above ~0.7 cheaply, the closest we'd get is
 **MC-pretraining a small portion of V_φ on step labels, then
 fine-tuning on the IPVRM objective**. We haven't tried this; would
 cost a few hundred GPU-h.
+
+---
+
+## Selected Refresh Recipe (v1 paper, 2026-05-01)
+
+After axis A (recipe), axis C (warmstart vs scratch), axis D (LoRA vs
+full-FT), and the val_loss-vs-ρ disagreement findings, the recommended
+refresh recipe is:
+
+**For each refresh trigger** (e.g., Spearman ρ drops 25% from peak):
+
+1. **Snapshot** current policy checkpoint.
+2. **Collect** MC labels on the current policy:
+   - N=300 prompts (held out from any prior probe sets)
+   - K=16 base rollouts × J=8 MC continuations × 5 step-boundary samples
+   - max_response_len=1536, temp=1.0, top_p=1.0
+   - 8-shard parallel: ~17 min on 8×A100
+3. **Train V_φ from scratch** (NOT from previous PRM):
+   - Init: `Qwen/Qwen2.5-Math-1.5B` (base SFT)
+   - 3 epochs, lr=5e-6, mb=8 per rank, FSDP=4
+   - β=10, BCE on continuous p_hat
+   - ~136 min on 4×A100
+4. **Pick ckpt by Spearman ρ on a fixed held-out 500-prompt probe** (NOT
+   val_loss — see "val_loss/ρ disagreement" below). For full-FT, the
+   `final/` ckpt is usually right; for LoRA (not recommended) it's
+   step_1000.
+5. **Resume CASPO** Δp from the policy snapshot with the new V_φ.
+
+**Refresh budget:** ~2.5h wall-clock total per refresh, ~13 GPU-hours
+on 8 GPUs (collection) + 4 GPUs (training). Well under VinePPO K=9's
+~22 GPU-hour MC overhead per 150 RL steps.
+
+### Why scratch (not warmstart, not LoRA)
+
+Measured on a step_150 holdout 500-prompt probe (cross-policy):
+
+| recipe | ρ | within-AUC | trajectory |
+|---|---|---|---|
+| pre_refresh (no refresh) | 0.540 | 0.724 | (baseline) |
+| **full-FT scratch** | **0.630** | **0.805** | improves with steps |
+| full-FT warmstart | 0.627 | 0.719 | improves with steps |
+| LoRA-on-step_150 (peak) | 0.523 | 0.729 | peaks step_1000, regresses |
+| LoRA-on-base (peak) | 0.383 | 0.680 | peaks step_1000, collapses |
+
+- **Scratch beats warmstart** on within-AUC by 8.6pp; the val_loss
+  best of warmstart slightly tied scratch on ρ but lost on within-AUC.
+- **Scratch is operationally simpler** — no state to carry across
+  refreshes; bias does not compound across iterated refreshes.
+- **LoRA loses by 0.11 ρ at peak** and by 0.17 ρ at final
+  (regression). LoRA's val_loss decreases throughout training but ρ
+  drops past step_1000 — the cumulative-log-ratio architecture (β=10)
+  amplifies LoRA's small delta into V swings that overfit
+  in-distribution but don't transfer cross-policy.
+
+### val_loss / ρ disagreement (critical for selection)
+
+Both for full-FT and LoRA, the val_loss-best ckpt is NOT the ρ-best:
+
+| | full-FT scratch | full-FT warmstart | LoRA-step150 | LoRA-base |
+|---|---|---|---|---|
+| best (val_loss) ρ | 0.585 | 0.604 | 0.450 | 0.190 |
+| **final** ρ | **0.630** | **0.627** | 0.461 | 0.133 |
+| **ρ-peak** ρ | 0.630 (final) | 0.627 (final) | **0.523 (step_1000)** | **0.383 (step_1000)** |
+
+For full-FT, taking `final/` is safe (val_loss-best is conservative,
+final usually has higher ρ). For LoRA, ρ peaks at step_1000 and val_loss
+keeps improving past that — selecting by val_loss gives systematically
+worse PRMs.
+
+**Engineering action**: add an in-loop Spearman-ρ-on-probe eval to
+`train_value_mc.py` (axis M of the matrix). Trigger best-ckpt save on
+ρ improvement, not val_loss. This generalizes the selection criterion
+to be correct for both full-FT and LoRA.
+
+### Why "from base SFT" not "from current policy backbone"
+
+Tested LoRA-on-step_150 (backbone init = step_150 ckpt) vs LoRA-on-base
+(backbone init = base SFT). The step_150 backbone gives slightly better
+LoRA quality (ρ=0.52 vs 0.38) — but full-FT from base wins both at 0.63.
+
+For full-FT scratch on step_150 data with backbone=base, the model has
+to learn step quality from scratch — but the BCE-on-p_hat loss
+provides the right signal regardless of starting point. Using base SFT
+keeps the recipe stateless across refreshes.
+
+---
+
+## PRM Refresh Experimental Matrix (2026-04-30)
+
+Empirical observation (CASPO Δp on Qwen2.5-Math-1.5B, dsr_sub):
+**step_150 is the dual-peak — best math500 (66.4%) and best PRM
+Spearman ρ (0.54). Both collapse together by step_250 (math500 61.4%,
+ρ=0.27).** This motivates the refresh experimental program: at the
+peak step, refresh the PRM on fresh policy rollouts and continue.
+
+### Per-refresh budget envelope (iso-VinePPO-K=9)
+
+VinePPO at K=9 adds ~21.7 GPU-hours of MC overhead per 150 RL steps.
+This is the ceiling for one CASPO refresh cycle. Current N=300, K=16,
+J=8, 3-epoch refresh measured at **~8.6 GPU-hours** (40% of envelope).
+Headroom of ~13 GPU-hours per refresh.
+
+Per-component costs (Qwen2.5-Math-1.5B, 8×A100 collection, 4-rank FSDP train):
+- 1 GPU-h Phase B ≈ 54K MC continuations
+- 1 GPU-h training ≈ 600 train-steps over 40K prefixes (≈ 0.5 epochs)
+- Phase B is ~95% of collection cost; scales linearly in **N × K × J**.
+
+### Primary axes to sweep
+
+**A. Refresh data recipe (N, K, J, epochs, budget) — optimize useful-window, NOT single-point ρ**
+
+The metric of interest is **NOT** "ρ on a fixed probe set" but the
+**decay curve of ρ as the policy drifts post-refresh**. Define:
+
+```
+useful_window = ∫ max(0, ρ(policy_at_step_t) − τ) dt over RL steps t
+                from refresh_step until ρ first drops below τ
+```
+
+Where τ ≈ 0.4 (empirically: original PRM crossed 0.4 at the same step
+that policy collapse started in original CASPO trajectory). The
+quantity to maximize at fixed GPU-hour budget is the integrated
+useful-window, **not** single-point initial ρ.
+
+The four data-recipe knobs likely affect initial ρ vs decay rate
+asymmetrically:
+
+| axis | initial ρ effect | decay-rate effect | rationale |
+|---|---|---|---|
+| **N** (prompts) | mild | **strong slowdown** | More prompt diversity → better OOD generalization to drifted policy |
+| **K** (base rollouts/prompt) | mild | mild slowdown | More rollout diversity per prompt |
+| **J** (MC continuations/prefix) | **strong (lower noise)** | mild | Lifts initial ρ; doesn't help OOD generalization much |
+| **epochs** | strong up then plateau | possibly accelerates decay | More epochs = better in-dist fit but may overfit → faster OOD decay |
+
+**Empirical from 2026-05-01 v3 measurement** (refreshed PRM ρ vs RL
+steps post-refresh, on (300, 16, 8, 3) recipe):
+
+| RL steps post-refresh | refreshed PRM ρ |
+|---|---|
+| 0 (training dist) | 0.630 |
+| 50 (step_200) | 0.613 |
+| 100 (step_250) | 0.518 |
+| 150 (step_300) | 0.527 |
+| 200 (step_350) | 0.357 ← τ=0.4 cliff |
+| 250 (step_400) | 0.443 |
+| 300 (step_450) | 0.287 |
+
+Useful window for current recipe ≈ **150-200 RL steps** (until ρ first
+drops below 0.4 reliably).
+
+**Sweep design — iso-budget, full decay-curve probe:**
+
+| budget | candidate recipes (N, K, J, epochs) | hypothesis |
+|---|---|---|
+| ~5 GPU-h | (200, 16, 8, 3) · (300, 16, 4, 3) · (300, 16, 8, 1) | minimum-viable refresh |
+| ~10 GPU-h | **(300, 16, 8, 3) — current** · (400, 16, 8, 3) · (300, 16, 16, 3) · (300, 16, 8, 6) | decay-rate sensitivity |
+| ~10 GPU-h NEW | **(600, 16, 4, 3) — N-heavy** · (200, 16, 12, 3) — J-heavy | iso-budget N vs J shootout |
+| ~17 GPU-h | (600, 16, 8, 3) · (300, 16, 24, 3) · (300, 16, 8, 9) · (400, 16, 16, 3) | scaling each knob |
+| ~22 GPU-h | (600, 16, 16, 6) — iso-VinePPO ceiling | best PRM money can buy |
+
+**Probe protocol — two-tier (cheap shortlist + expensive validation):**
+
+Different PRMs produce **different policy trajectories** (empirically:
+v3's refreshed-PRM trajectory diverges from orig's pre_refresh PRM
+trajectory after ~50 RL steps even from same starting weights). So a
+PRM's "decay" is path-dependent: PRM A scoring its own trajectory ≠
+PRM A scoring some canonical trajectory. The cheap protocol below
+factors this away to enable scalable ranking; the expensive validation
+catches path-dependent effects for top candidates.
+
+**Tier 1 — cheap protocol** (intrinsic OOD generalization, ~3 min/recipe):
+
+Probe each candidate PRM against a **fixed canonical policy
+trajectory** (orig CASPO step_150, 200, 250, 300, 350, 400 ckpts —
+already saved at `caspo_dsr_full/`). Holds policy distribution
+constant; isolates PRM OOD generalization.
+
+**MC labels already collected** at
+`/mnt/nvme_tmp7/jason_caspo/caspo_prm_probe_hires/step_{50,100,150,200,250,300,350,400}_probe_labels.pt`.
+Generated 2026-04-30 with K=4, J=8 on 500-prompt holdout (same policy
+ckpts as orig CASPO trajectory, same seed). Reusable across all
+future recipe sweeps. **No additional collection needed.**
+
+```
+PER RECIPE (~3 min on 6 GPUs):
+  for ckpt in {step_150, step_200, step_250, step_300, step_350, step_400}:
+    eval_mcprm_auc_v2.py recipe_PRM/best labels_$ckpt.pt
+    → cross-AUC, within-AUC, ρ
+  Plot ρ(t) decay curve. Compute integrated useful-window.
+```
+
+Caveat: prefix count decreases at later ckpts (step_50 has 93 MB of
+prefixes; step_400 only 24 MB) because more prompts saturate as
+all-correct after RL training, leaving fewer mixed-outcome rollouts.
+ρ measurement at step_350-400 is noisier (~960 prefixes vs ~3000 at
+step_150). Consider adding step_450/500 labels later if those
+trajectory points become important.
+
+Use Tier 1 to **rank all candidate recipes** by useful-window. Cheap
+because the policy MC labels are collected once and reused.
+
+**Tier 2 — expensive validation** (downstream RL for top-2 winners,
+~4-5h/recipe):
+
+```
+for top-2 winners from Tier 1:
+  Run continuation CASPO from step_150 with that PRM, 250 RL steps
+    (use existing v3 launcher, swap prefix_value_path)
+  Save policy ckpts every 50 steps
+  Probe the same PRM against ITS OWN policy ckpts (NOT canonical)
+    → recipe-specific decay curve
+  Greedy eval each policy ckpt on math500/gsm8k/olympiad
+  Report: peak math500, useful-window from PRM perspective, math500 trajectory
+```
+
+Tier 2 catches path-dependent effects: a PRM with great Tier-1 score
+might still drive policy in a counterproductive direction (or vice
+versa). **Both numbers go in the paper.**
+
+**Per-recipe cost:**
+- Tier 1: recipe_GPU-h training + ~3 min probing
+- Tier 2 (if top-2): recipe_GPU-h + ~5h downstream RL + eval
+
+**5-recipe sweep total:** ~100 min one-time + 5 × recipe_GPU-h + 2 × 5h
+≈ 14-17h depending on recipe budgets. Vs 5 × full RL = 25-30h.
+
+Hypotheses to test:
+- **At iso-budget, more N (with smaller J or fewer epochs to compensate)
+  yields longer useful-window** — predicts (600, 16, 4, 3) >
+  (300, 16, 8, 3) on the integrated metric, even if initial ρ is lower.
+- **More epochs accelerate decay** — predicts (300, 16, 8, 6) starts
+  with higher initial ρ but decays faster than (300, 16, 8, 3).
+- **J has diminishing returns past J=8** — most of the noise reduction
+  is already captured; J=16 may not justify 2× cost.
+
+This is the right framing for the paper — single-point ρ is a metric
+proxy, useful-window is what determines refresh frequency in
+production deployment.
+
+**B. Steps-per-response (boundary count per rollout)**
+
+Currently 5. Sweep {3, 5, 10, 15}. More boundaries = more prefixes
+per Phase A generation (cheap), but Phase B grows linearly. Test
+whether RL benefits more from boundary-density or prompt-diversity.
+
+**C. Initialization: warm-start vs from-scratch — IN FLIGHT 2026-04-30**
+
+Currently running side-by-side, 4 GPUs each:
+- warm-start: GPUs 0-3, init from `qwen_mc_prm_15b_dsr_sub/best`
+- from-scratch: GPUs 4-7, init from `Qwen/Qwen2.5-Math-1.5B`
+- shared collected data (N=300, K=16, J=8, step_150 policy rollouts)
+- 3 epochs each, output at `mc_prm_refresh_step150/{warmstart,scratch}`
+
+Compare:
+- val_loss curve shape (does warm-start descend faster?)
+- step-to-best (warm-start should converge in fewer steps)
+- final Spearman ρ on probe (does warm-start inherit bias?)
+- after multiple refresh iterations: does warm-start drift compound?
+
+**D. LoRA vs full FT**
+
+LoRA on PRM backbone (rank 16-32, attn+mlp targets) for 3-5× cheaper
+training. Open question: does LoRA-PRM hit same ρ as full-FT, or does
+the value-head calibration require dense backbone updates?
+
+**E. Advantage transform: prob vs logprob**
+
+- `prob`: A_t = sigmoid(V_{t+1}) − sigmoid(V_t) (probability
+  difference; current default)
+- `logprob`: A_t = logsigmoid(V_{t+1}) − logsigmoid(V_t)
+  (log-probability difference)
+
+`prob` bounds A_t to [-1, 1] but saturates near V≈±∞ (advantage
+collapses for very-confident-correct or very-confident-wrong
+prefixes). `logprob` doesn't saturate at the failure tail but is
+unbounded — long failure chains accumulate large negative advantages.
+
+Compare on: gradient magnitude stability, sign coherence with
+ground-truth credit, downstream eval impact.
+
+### Refresh-cadence axes
+
+**F. Refresh interval (RL steps between refreshes)**
+
+Sweep {50, 100, 150, 200}. Trades: tight = less drift + more
+amortization cost; loose = more drift (we already saw collapse at
+250). The Spearman drop is the natural trigger. Could measure
+**ρ-vs-step** in a single long run to identify the inflection.
+
+**G. Number of refreshes (drift compounding)**
+
+Single refresh → multiple-refresh comparison. After 3+ iterations:
+does PRM stay calibrated, or does small bias compound?
+
+**H. Refresh-from-which-checkpoint**
+
+Default: from step_150 (peak). Alternatives:
+- earlier (step_100 — preempt peak)
+- collapse point (step_250 — see if PRM recovers)
+- delayed (step_400 — late catch-up)
+
+### Architecture / objective axes
+
+**I. PRM backbone size**
+
+Current 1.5B (matches policy). Sweep {0.5B, 1.5B, 7B}. Smaller =
+faster + cheaper; bigger = better ρ ceiling. Open: does PRM benefit
+from being LARGER than the policy (richer features)?
+
+**J. Cumulative log-ratio architecture vs direct scalar value head**
+
+Current: V is the cumulative log-ratio between policy and a frozen
+reference (architectural inheritance from IPVRM, even though training
+is now MC-BCE). Inference requires 2× forward pass (π_φ AND π_ref).
+
+Alternative: scalar value head on frozen backbone with V predicting
+p_hat directly via sigmoid output. 1× forward, simpler. Compare
+inference cost, training cost, ρ ceiling. If ρ matches, drop
+log-ratio architecture for simpler/faster scoring.
+
+**K. Training objective**
+
+Current: BCE on continuous p_hat (with `--phi_init_path`-warmstart or
+from-scratch). Alternatives: MSE on p_hat; asymmetric loss weighting
+near-0/near-1 prefixes (where Δp matters most).
+
+### Evaluation axes
+
+**L. Probe set design**
+
+Need a fixed test set across all sweeps for apples-to-apples. Today:
+step_150 rollouts on held-out 500 dsr_sub prompts. Decisions:
+- Same 500 every refresh? (controls difficulty)
+- Re-sample each time? (controls memorization)
+- Add OOD (Big-Math level_3)?
+- Multiple policies (step_50, step_150, step_250) → cross-policy AUC
+  matrix as primary metric
+
+**M. Early-stop criterion in PRM training**
+
+Current: val_loss + patience. Better: Spearman ρ on held-out probe
+during training (the metric we actually care about). Needs new
+in-loop probe in `train_value_mc.py`.
+
+**N. Downstream RL eval per recipe**
+
+For each PRM, run 50 RL steps from step_150 and report:
+- math500 pass@1 at step_200
+- KL drift, Δp magnitude stats
+- whether eval keeps climbing past step_200
+
+This is the only ground-truth metric. AUC/ρ are proxies.
+
+### Suggested ordering (cheapest first)
+
+1. **L** — probe set design (lock first, before any sweep, so all
+   sweeps use same eval target)
+2. **A** — recipe sweep at fixed budget, pick winner triple (~20 GPU-h)
+3. **C** — warm-start vs scratch (in flight, ~13 GPU-h)
+4. **E** — value/prob/logprob advantage (~8 GPU-h, needs short downstream RL)
+5. **D** — LoRA vs full FT on winner from A (~10 GPU-h)
+6. **F** — refresh interval sweep (~40 GPU-h, full RL trajectories)
+7. **G** — multiple refreshes (~30 GPU-h, after F picks interval)
+8. **B, K, M** — secondary, time permitting
+9. **J** — log-ratio vs scalar value head (architectural simplification)
+10. **I** — backbone size, only if 1.5B saturates badly
+
+### Explicitly out of scope
+
+- PRM ensembles (M models combined) — orthogonal direction
+- Per-token PRM (vs per-step) — paper scope is step-level
+- Off-policy MC labeling (use prior CASPO ckpts as MC source) —
+  plausible but adds confounds; revisit if budget permits
