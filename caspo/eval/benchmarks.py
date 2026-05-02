@@ -479,22 +479,28 @@ def evaluate_vllm(
                 except Exception:
                     pass
                 engine = None
-            try:
-                pending = [
-                    t for t in asyncio.all_tasks(loop=loop) if not t.done()
-                ]
-                if pending:
-                    for t in pending:
-                        t.cancel()
-                    try:
-                        loop.run_until_complete(
-                            asyncio.gather(*pending, return_exceptions=True)
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Pending-task cleanup is ONLY safe when we own the loop —
+            # otherwise we'd cancel the shared engine's background tasks
+            # (output handler, etc.) and the next benchmark in a sweep
+            # gets a kneecapped engine returning empty completions.
+            # Bug confirmed 2026-04-30: math500 worked, gsm8k+olympiadbench
+            # both returned 0 generations after the cleanup ran.
             if owns_loop:
+                try:
+                    pending = [
+                        t for t in asyncio.all_tasks(loop=loop) if not t.done()
+                    ]
+                    if pending:
+                        for t in pending:
+                            t.cancel()
+                        try:
+                            loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 loop.close()
     except BaseException:
         # If generation fails mid-flight, still try to release the AsyncLLM

@@ -280,8 +280,19 @@ def _load_hf(name: str, split: str, config: Optional[str] = None):
     repos like ``open-r1/Big-Math-RL-Verified-Processed`` (which has
     ``level_1``..``level_5``, ``quintile_1``..``quintile_5``, ``all``).
     None for single-config datasets.
+
+    Local file support: if ``name`` ends in ``.jsonl``/``.json``/``.parquet``,
+    we treat it as a local file and load via the corresponding HF
+    streaming loader (``json`` or ``parquet``). Used for one-shot RLVR
+    replication where the dataset is provided as a parquet/jsonl file
+    rather than a Hub repo.
     """
     from datasets import load_dataset  # type: ignore
+    # Local file fast-path
+    if name.endswith(".jsonl") or name.endswith(".json"):
+        return load_dataset("json", data_files=name, split="train")
+    if name.endswith(".parquet"):
+        return load_dataset("parquet", data_files=name, split="train")
     if config is not None:
         return load_dataset(name, config, split=split)
     return load_dataset(name, split=split)
