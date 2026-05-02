@@ -176,6 +176,92 @@ The key experiment is whether CASPO's learned prefix values recover enough
 step-level credit assignment to be competitive with VinePPO while avoiding
 VinePPO's expensive MC continuation phase.
 
+## Qwen2.5-Math-1.5B + dsr_sub Setup (May 2026)
+
+The Rho-1B-MATH setup below is the original VinePPO-replication target.
+The **current paper setup uses Qwen2.5-Math-1.5B + dsr_sub** (the 1209-prompt
+DeepScaleR subset from One-Shot-RLVR), 4-GPU FSDP. Same trainer code, same
+config file (`configs/caspo_rho1b_math.yaml`), but different
+`model_name_or_path`, `dataset_name`, `prompts_per_step`, `max_response_len`,
+`epochs_per_rollout`. The Rho-1B section retains the original numbers for
+infrastructure-level reference.
+
+| Field | Qwen2.5-Math-1.5B value |
+|---|---|
+| Base policy | `Qwen/Qwen2.5-Math-1.5B` |
+| Dataset | `dsr_sub.jsonl` (1209 DeepScaleR prompts; One-Shot-RLVR subset) |
+| Eval | `math500`, `gsm8k`, `olympiadbench` (greedy, k=1, T=0) |
+| Prompt template | `{query}\nLet's think step by step and output the final answer within \boxed{}.` |
+| Response budget | **3072 tokens** (Qwen2.5-Math produces longer CoTs than Rho-1B) |
+| Rollout group | `group_size=8` |
+| Prompts per step | `128` (= 1024 responses per outer step at G=8) |
+| Topology | **FSDP=4 + colocated vLLM**, `vllm_gpu_memory_utilization=0.45` (CASPO) or `0.35` (PPO+critic, leaves room for critic) |
+| PPO minibatch | `micro_batch_size=4`, `grad_accum_steps=8` (= 32 effective batch / rank) |
+| Policy LR | `1e-6` |
+| KL coefficient | `0.001` for CASPO/GRPO, `0.01` for PPO+critic (1B-stable; 1e-4 diverges) |
+| Steps | `500` (CASPO original); `500` (PPO+critic baseline); resume runs add 250-350 more |
+| Save cadence | `save_every=50` |
+
+### Method launchers (Qwen2.5-Math-1.5B + dsr_sub, 4-GPU FSDP)
+
+| Method | Launcher | `epochs_per_rollout` | `kl_coef` | Other notable |
+|---|---|---|---|---|
+| GRPO | `launch_grpo_full.sh` (in-tree) or analogous | 1 | 0.001 | no critic, group baseline |
+| CASPO Δp | `launch_caspo_full.sh` | 1 | 0.001 | `caspo_advantage_transform=prob` |
+| CASPO Δlogp | (override `caspo_advantage_transform=logprob`) | 1 | 0.001 | logsigmoid asymmetry |
+| **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | **2** | **0.01** | **VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6`** |
+
+### PPO+critic recipe — exact config
+
+The portable launcher at `scripts/launch_qwen_ppo_critic.sh` matches
+VinePPO upstream's PPO baseline (`lam1.jsonnet` + `ppo_MATH.jsonnet`).
+Configurable via env vars (`CONDA_ENV`, `GPU_LIST`, `DSR_SUB`,
+`OUT_DIR`, `MAX_STEPS`, `KL_COEF`).
+
+```
+method=ppo_critic
+epochs_per_rollout=2          # VinePPO upstream uses 2 (NOT 1)
+ppo_gae_lambda=1.0            # VinePPO lam1.jsonnet — terminal-only verifier reward
+value_loss_coef=1.0           # VinePPO + textbook
+cliprange_value=0.2           # VinePPO + textbook
+clip_eps_low/high=0.2         # VinePPO + textbook
+critic_lr=1e-6                # = policy_lr; matches VinePPO
+critic_weight_decay=0.0       # VinePPO
+critic_grad_clip=1.0          # VinePPO
+kl_coef=0.01                  # 1B-stable. VinePPO uses 1e-4 at 7B; at 1B with our config, 1e-4 diverges. See "F5" lesson below.
+```
+
+### F5 lesson — kl_coef at 1B
+
+`launch_rho1b_ppo_critic.sh` previously hardcoded `kl_coef=1e-4`,
+which silently bypassed the YAML's `1e-2` default. PPO+critic
+diverged at 1B while CASPO/Δp/GRPO trained stably (because they
+inherit from YAML and don't override). Fix: do NOT hardcode
+`kl_coef` in PPO+critic launchers; inherit YAML's stronger
+ref-anchor or set explicitly to ≥0.01.
+
+ETA on 4×A100 80GB: ~150-180s/step × 500 steps ≈ **~22-25h** for
+PPO+critic. Slower than CASPO Δp (~80s/step × 500 ≈ 11h) primarily
+because of `epochs_per_rollout=2`.
+
+### CASPO refresh (May 2026 result)
+
+The "v3" experiment (resume CASPO Δp from step_150 with a freshly-
+trained PRM, with proper Adam/lr_scheduler/base-ref resume) lifted
+peak math500 from 0.664 → 0.680 (+1.6pp) and peak gsm8k from
+0.770 → 0.829 (+5.9pp). See `docs/RM_TRAINING.md` for the selected
+recipe + the full 14-axis experimental matrix (decay-curve probing,
+LoRA vs full-FT, refresh interval sweep, etc.).
+
+Resume requires loading optimizer state + lr_scheduler state +
+global_step (added in `caspo/trainer/caspo_trainer.py:_load_optimizer_state`)
+AND setting `cfg.ref_model_path` to the original SFT base (so KL
+doesn't anchor to the rolling policy). Without these, refresh
+collapses (math500 −28pp). See
+`feedback_resume_optimizer_state.md` in session memory.
+
+---
+
 ## Current Rho-1B MATH Setup
 
 Main config: `configs/caspo_rho1b_math.yaml`
