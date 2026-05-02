@@ -23,6 +23,9 @@
 #   SAVE_EVERY=50               # ckpt every 50 steps
 #   KL_COEF=0.01                # 1B-stable; VinePPO upstream uses 1e-4 at 7B
 #                               # (1e-4 caused divergence at 1B in our runs)
+#   RUN_EVAL=true               # auto-eval all saved ckpts after training
+#                               # on math500/gsm8k/olympiadbench. Set false
+#                               # to skip eval and just train.
 #
 # ---- Prerequisites ----
 #
@@ -169,21 +172,76 @@ echo "${PIDS[*]}" > "$LOG_DIR/pids.txt"
 
 fail=0
 for pid in "${PIDS[@]}"; do wait "$pid" || fail=$((fail+1)); done
-echo "[ppo-critic] $(date +%H:%M:%S) DONE ($fail failures) — ckpts at $OUT_DIR/"
+echo "[ppo-critic] $(date +%H:%M:%S) TRAINING DONE ($fail failures) — ckpts at $OUT_DIR/"
 
-# ---- Greedy eval helper (run after training) ----
+# ---- Post-training greedy eval (math500/gsm8k/olympiadbench) ----
 #
-# Eval each saved ckpt on math500/gsm8k/olympiadbench:
-#
-#   for step in $(ls $OUT_DIR | grep ^step_); do
-#     CUDA_VISIBLE_DEVICES=0 $PYBIN -u scripts/eval.py \
-#       --config configs/caspo_rho1b_math.yaml \
-#       --override "model_name_or_path=$OUT_DIR/$step" \
-#       --override "prompt_template={query}\nLet's think step by step and output the final answer within \\boxed{}." \
-#       --override "max_response_len=3072" \
-#       --benchmarks "math500,gsm8k,olympiadbench" \
-#       --k 1 --temperature 0.0 --top-p 1.0 \
-#       --max-new-tokens 3072 \
-#       --backend vllm --gpu-memory-utilization 0.85 \
-#       --output "$OUT_DIR/${step}_eval.json"
-#   done
+# Default: ON. Set RUN_EVAL=false to skip.
+# Evals each saved step_* ckpt + final/ on all 3 math benchmarks at
+# greedy decoding (k=1, T=0). Output: $OUT_DIR/eval/${ckpt}.json.
+# Uses up to 4 GPUs in parallel for speed.
+RUN_EVAL="${RUN_EVAL:-true}"
+if [[ "$RUN_EVAL" == "true" && "$fail" -eq 0 ]]; then
+  EVAL_DIR="$OUT_DIR/eval"
+  mkdir -p "$EVAL_DIR"
+  echo "[ppo-critic] $(date +%H:%M:%S) === POST-TRAIN EVAL ==="
+  echo "[ppo-critic] eval out: $EVAL_DIR"
+
+  CKPTS=()
+  for d in "$OUT_DIR"/step_* "$OUT_DIR/final"; do
+    [[ -d "$d" ]] && CKPTS+=("$(basename "$d")")
+  done
+  echo "[ppo-critic] eval ckpts: ${CKPTS[*]}"
+
+  eval_one() {
+    local gpu="$1" ckpt="$2"
+    local out="$EVAL_DIR/${ckpt}.json"
+    local elog="$EVAL_DIR/${ckpt}.log"
+    if [[ -f "$out" ]]; then echo "[$ckpt] skip — exists"; return; fi
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYBIN" -u scripts/eval.py \
+      --config configs/caspo_rho1b_math.yaml \
+      --override "model_name_or_path=$OUT_DIR/$ckpt" \
+      --override "prompt_template={query}\nLet's think step by step and output the final answer within \\boxed{}." \
+      --override "max_response_len=3072" \
+      --benchmarks "math500,gsm8k,olympiadbench" \
+      --k 1 --temperature 0.0 --top-p 1.0 \
+      --max-new-tokens 3072 \
+      --backend vllm --gpu-memory-utilization 0.85 \
+      --output "$out" \
+      > "$elog" 2>&1 \
+    && echo "[$ckpt] $(date +%H:%M:%S) done" \
+    || echo "[$ckpt] FAILED — see $elog"
+  }
+
+  i=0
+  while (( i < ${#CKPTS[@]} )); do
+    EPIDS=()
+    for ((j=0; j<N_GPUS && i+j<${#CKPTS[@]}; j++)); do
+      gpu="${GPUS[$j]}"
+      ( eval_one "$gpu" "${CKPTS[$((i+j))]}" ) &
+      EPIDS+=("$!")
+    done
+    for ep in "${EPIDS[@]}"; do wait "$ep"; done
+    i=$((i + ${#EPIDS[@]}))
+  done
+
+  echo ""
+  echo "=== EVAL SUMMARY (greedy pass@1) ==="
+  printf "%-12s %-10s %-10s %-13s\n" "ckpt" "math500" "gsm8k" "olympiad"
+  for ckpt in "${CKPTS[@]}"; do
+    f="$EVAL_DIR/${ckpt}.json"
+    [[ -f "$f" ]] || continue
+    m=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d['math500']['pass@k']:.3f}\")" 2>/dev/null || echo "?")
+    g=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d.get('gsm8k',{}).get('pass@k',0):.3f}\")" 2>/dev/null || echo "?")
+    o=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d.get('olympiadbench',{}).get('pass@k',0):.3f}\")" 2>/dev/null || echo "?")
+    printf "%-12s %-10s %-10s %-13s\n" "$ckpt" "$m" "$g" "$o"
+  done
+  echo ""
+  echo "[ppo-critic] $(date +%H:%M:%S) === ALL DONE ==="
+else
+  if [[ "$fail" -gt 0 ]]; then
+    echo "[ppo-critic] skipping eval due to training failures"
+  else
+    echo "[ppo-critic] eval skipped (RUN_EVAL=false)"
+  fi
+fi
