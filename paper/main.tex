@@ -115,15 +115,13 @@ token logits and amplifies rescue signal on the failure tail;
 (iii) an iterated-refresh configuration that periodically retrains
 $V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the current
 policy, converting the credit model from a single drifting model into a
-sequence of in-distribution snapshots, at amortized wall-clock cost well
-below one \vineppo{} outer-step budget;
-(iv) a frozen-RM variant (\caspo{}-frozen-RM) that disables refresh and
-uses the Phase-1 PRM unchanged, isolating the contribution of the refresh
-path;
-(v) a unified comparison stack that implements \grpo{}, \ppocritic{},
+sequence of in-distribution snapshots at amortized wall-clock cost well
+below one \vineppo{} outer-step budget; we ablate refresh against the
+no-refresh default that holds the Phase-1 $V_\phi$ fixed throughout RL;
+(iv) a unified comparison stack that implements \grpo{}, \ppocritic{},
 \vineppo{}, and \caspo{} under one trainer, one verifier, and one rollout
 engine, controlling everything except the algorithmic credit-signal choice; and
-(vi) implementation infrastructure for full-finetune 7B-scale RL with
+(v) implementation infrastructure for full-finetune 7B-scale RL with
 FSDP-sharded trainer and rank-local vLLM generation, including a streaming
 CUDA-IPC weight-sync path that is collective with
 \texttt{summon\_full\_params}, fp32 master weights with on-demand AdamW
@@ -454,19 +452,19 @@ A single refresh on Qwen2.5-Math-1.5B + dsr_sub takes
 $\approx 91$ minutes on $4 \times$H100 80GB ($\approx 41$~min for MC
 collection at $K{=}16$, $J{=}8$ on $N{=}300$ prompts, plus
 $\approx 50$~min for FSDP=4 PRM training). At $k = 150$ this amortizes
-to $\approx 36$~s of refresh overhead per RL outer step, which is
-below the per-step difference between \caspo{} and \ppocritic{} and
-well under the per-step cost of one extra \vineppo{} MC continuation
-($K{=}9 \to K{=}10$). Total \caspo{}-refresh wall-clock for a
-600-step RL run thus exceeds frozen-RM by roughly $5{-}6$~h, but
-remains an order of magnitude below \vineppo{} K=9.
+to $\approx 36$~s of refresh overhead per RL outer step, well under
+the per-step cost of one extra \vineppo{} MC continuation
+($K{=}9 \to K{=}10$). Total \caspo{}+refresh wall-clock for a
+600-step RL run thus exceeds the no-refresh \caspo{} baseline by
+roughly $5{-}6$~h, but remains an order of magnitude below
+\vineppo{} K=9.
 
-\paragraph{Variants.}
-The \caspo{}-frozen-RM variant disables refresh entirely and uses the
-Phase-1 $V_\phi$ throughout; \caspo{}-refresh applies the schedule
-above. The two variants share every other component (PPO objective,
-KL, advantage transform, segmenter), isolating the refresh
-contribution to a single ablation.
+\paragraph{Ablation.}
+We report \caspo{} both with and without refresh: \caspo{} (the
+no-refresh default holds the Phase-1 $V_\phi$ fixed throughout RL)
+and \caspo{}+refresh (the schedule above). The two variants share
+every other component (PPO objective, KL, advantage transform,
+segmenter), isolating the refresh contribution to a single ablation.
 
 \subsection{Step-TD advantage formulations from $V_\phi$}
 \label{sec:transforms}
@@ -622,10 +620,10 @@ $V_\phi(s_t) \approx P(\text{success} \mid s_t)$, a sigmoid-head
 network trained on Monte Carlo step labels (Section~\ref{sec:phase1}),
 plugged into the step-TD advantage. We report two step-TD formulations
 (Section~\ref{sec:transforms}): \caspo{}-$\Delta p$ (default) and
-\caspo{}-$\Delta\log p$ (ablation). We additionally report
-\caspo{}-frozen-RM, which uses the Phase-1 PRM unchanged across all RL
-training, and \caspo{}-refresh, which periodically retrains the PRM
-from scratch on current-policy rollouts (Section~\ref{sec:refresh}).
+\caspo{}-$\Delta\log p$ (ablation). Each is reported with and without
+the iterated PRM-refresh schedule of Section~\ref{sec:refresh},
+labeled \caspo{} and \caspo{}+refresh respectively, where the
+no-refresh default holds the Phase-1 $V_\phi$ fixed throughout RL.
 \end{description}
 
 \subsection{Hyperparameters}
@@ -910,9 +908,9 @@ evaluation runs complete. The intended structure is:
 \item Per-method MATH-500 pass@1 and pass@$16$ at \texttt{final}, with
 seed-level error bars over a small number of seeds (target: 3 seeds per
 method per scale). Methods include \grpo{} ($\mu{=}1$ canonical and
-$\mu{=}2$ iso-budget), \ppocritic{}, \vineppo{}, \caspo{}-$\Delta p$
-(default), \caspo{}-$\Delta\log p$ (ablation), \caspo{}-frozen-RM, and
-\caspo{}-refresh.
+$\mu{=}2$ iso-budget), \ppocritic{}, \vineppo{}, and the four \caspo{}
+configurations: \caspo{}-$\Delta p$, \caspo{}-$\Delta\log p$,
+\caspo{}-$\Delta p$+refresh, and \caspo{}-$\Delta\log p$+refresh.
 \item Per-method full-suite (MATH-500, GSM8K, OlympiadBench) pass@$1$
 greedy and pass@$16$ at \texttt{final}.
 \item Training curves on MATH-500 sample evaluation at intermediate
@@ -922,9 +920,10 @@ sample efficiency.
 MATH-500 pass@$16$, mapping the empirical winner to the saturation
 regime predicted in Section~\ref{sec:transforms} and visualized in
 Figure~\ref{fig:transforms}.
-\item \caspo{}-frozen-RM vs.\ \caspo{}-refresh to quantify the
-contribution of the iterated PRM refresh path
-(Section~\ref{sec:refresh}).
+\item \caspo{} vs.\ \caspo{}+refresh: with the no-refresh default
+isolating the value of the Phase-1 PRM and \caspo{}+refresh
+quantifying the additional contribution of the iterated PRM-refresh
+path (Section~\ref{sec:refresh}).
 \item \ppocritic{} vs.\ \caspo{}: contrast a per-token learned scalar
 baseline against a per-step learned prefix value, both under the same
 PPO objective and the same global PPO minibatch.
@@ -955,10 +954,10 @@ intended structure is:
 \begin{itemize}
 \item \emph{Step-credit calibration}: do step advantages from $V_\phi$ rank
 correct vs.\ incorrect step continuations consistently with on-policy MC?
-\item \emph{Online value drift}: does the online update preserve the
-phase-1 calibration, or does it collapse to constant predictions? We monitor
-$\bar V^+$ and $\bar V^-$ (mean prefix value at correct vs.\ incorrect step
-continuations) over outer steps to detect drift.
+\item \emph{PRM decay vs. refresh}: how quickly does the Phase-1
+$V_\phi$ lose calibration as the policy drifts (Spearman $\rho$ vs.\
+fresh MC labels per outer step), and how much of that decay does the
+\caspo{}+refresh schedule recover at each refresh trigger?
 \item \emph{Wall-clock per accuracy point}: the practical question \caspo{}
 is asked to answer is whether learned prefix values can match \vineppo{}'s
 accuracy at a fraction of the wall-clock cost. We report this as
@@ -974,24 +973,20 @@ accuracy/wall-clock trade-off.
 \label{sec:limitations}
 
 \paragraph{Reward-model drift.}
-A frozen $V_\phi$ trained on the SFT distribution drifts out of
-calibration as the policy optimizes; the prefixes encountered later in
-training are no longer drawn from the SFT marginal. \caspo{}-frozen-RM
-isolates this risk by holding the Phase-1 PRM fixed across all RL
-training, at the cost of distribution-shift bias. \caspo{}-refresh
-(Section~\ref{sec:refresh}) addresses it directly by periodically
-retraining $V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the
-current policy: every $k$ outer steps the trainer pauses RL, collects a
-new MC corpus, retrains $V_\phi$ from the SFT init, and resumes RL with
-the new model. We use $k{=}150$ for the $\Delta p$ transform and
-$k{=}200$ for $\Delta\log p$. Per-refresh wall-clock is approximately
-one-tenth of one \vineppo{} outer-step budget at $K{=}9$, so the
-method remains dominated by RL rollout cost rather than refresh
-overhead. Neither variant is a complete defense against pathological
-feedback loops (e.g.\ a value head that learns to predict policy
-surface form rather than correctness); we report both
-\caspo{}-frozen-RM and \caspo{}-refresh to quantify the contribution
-of the refresh path.
+A $V_\phi$ trained on the SFT distribution decays in calibration as
+the policy optimizes; the prefixes encountered later in training are
+no longer drawn from the SFT marginal, and Spearman $\rho$ vs. fresh
+MC labels falls monotonically (Section~\ref{sec:refresh}).
+\caspo{}+refresh addresses this by periodically retraining $V_\phi$
+from scratch on Monte-Carlo-labeled rollouts of the current policy
+(every $k{=}150$ outer steps for $\Delta p$, $k{=}200$ for
+$\Delta\log p$). Per-refresh wall-clock is approximately one-tenth
+of one \vineppo{} outer-step budget at $K{=}9$, so the method
+remains dominated by RL rollout cost rather than refresh overhead.
+Neither the no-refresh default nor refresh is a complete defense
+against pathological feedback loops (e.g.\ a value head that learns
+to predict policy surface form rather than correctness); we report
+both to quantify the contribution of the refresh path.
 
 \paragraph{Cross-distribution probe-set evaluation of $V_\phi$.}
 Selecting the best refresh recipe by ranking candidate $V_\phi$ checkpoints
