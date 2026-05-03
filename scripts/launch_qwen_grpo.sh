@@ -17,7 +17,10 @@
 #   MAX_STEPS=600               # 600 RL outer iterations
 #   SAVE_EVERY=50               # ckpt every 50 steps
 #   KL_COEF=0.001               # 1B-stable; same as CASPO/VinePPO at this scale
-#   EPOCHS_PER_ROLLOUT=1        # GRPO upstream uses 1 (single-pass over rollouts)
+#   EPOCHS_PER_ROLLOUT=1        # canonical GRPO (DeepSeekMath, TRL default).
+#                               # set to 2 for iso-compute comparison with
+#                               # PPO+critic / VinePPO / CASPO (which use 2).
+#                               # Both are valid; pick one and report which.
 #   RUN_EVAL=true               # auto-eval all saved ckpts after training
 #                               # on math500/gsm8k/olympiadbench. Set false
 #                               # to skip eval and just train.

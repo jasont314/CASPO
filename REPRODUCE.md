@@ -295,13 +295,22 @@ auto-eval all saved checkpoints on math500/gsm8k/olympiadbench at greedy
 `$OUT_DIR/eval/${ckpt}.json`.
 
 ```bash
-# === GRPO baseline ===
+# === GRPO (canonical, μ=1) — DeepSeekMath / TRL default ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
 GPU_LIST="0 1 2 3" \
-OUT_DIR=/mnt/data/runs/grpo_qwen25math15b_dsr \
-LOG_DIR=/tmp/grpo_$(date +%Y%m%d_%H%M) \
+OUT_DIR=/mnt/data/runs/grpo_mu1_qwen25math15b_dsr \
+LOG_DIR=/tmp/grpo_mu1_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_grpo.sh
 # ETA: ~60-85 s/step × 600 = ~10-14 h on 4× A100 80GB
+
+# === GRPO (iso-budget, μ=2) — VinePPO-paper-style; matches PPO+critic / VinePPO / CASPO ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/grpo_mu2_qwen25math15b_dsr \
+LOG_DIR=/tmp/grpo_mu2_$(date +%Y%m%d_%H%M) \
+EPOCHS_PER_ROLLOUT=2 \
+  bash scripts/launch_qwen_grpo.sh
+# ETA: ~110-160 s/step × 600 = ~18-26 h on 4× A100 80GB
 
 # === PPO + critic baseline ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
@@ -311,6 +320,13 @@ LOG_DIR=/tmp/ppo_critic_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_ppo_critic.sh
 # ETA: ~150 s/step × 600 = ~25 h on 4× A100 80GB
 ```
+
+**On GRPO epochs (μ=1 vs μ=2):** μ=1 is the GRPO-canonical choice
+(DeepSeekMath origin paper, TRL/verl defaults). μ=2 is what the VinePPO
+paper used for its GRPO baseline to match PPO+critic compute. We report
+both; the canonical-μ=1 number is the GRPO-faithful comparison and the
+μ=2 number is the iso-compute comparison (so a CASPO-vs-GRPO win can't
+be attributed to GRPO doing fewer policy updates per rollout).
 
 If the teammate has 8 GPUs, both runs can train in parallel: GRPO on
 GPUs 0-3 and PPO+critic on GPUs 4-7. Total wall-clock = max(14h, 25h) ≈ 25h.
