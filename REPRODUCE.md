@@ -285,6 +285,59 @@ Targeted trainer/vLLM tests:
 
 ## Qwen2.5-Math-1.5B + dsr_sub track (current paper setup)
 
+### Quickstart (baselines for a teammate)
+
+Prerequisites: clone the repo, activate the `scalable` conda env (or set
+`CONDA_ENV` / `PYBIN`), have `dsr_sub.jsonl` available locally, and 4×
+A100/H100 80GB GPUs (FSDP=4). All launchers default to MAX_STEPS=600,
+auto-eval all saved checkpoints on math500/gsm8k/olympiadbench at greedy
+(k=1, T=0) after training, and write eval results to
+`$OUT_DIR/eval/${ckpt}.json`.
+
+```bash
+# === GRPO baseline ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/grpo_qwen25math15b_dsr \
+LOG_DIR=/tmp/grpo_$(date +%Y%m%d_%H%M) \
+  bash scripts/launch_qwen_grpo.sh
+# ETA: ~60-85 s/step × 600 = ~10-14 h on 4× A100 80GB
+
+# === PPO + critic baseline ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/ppo_critic_qwen25math15b_dsr \
+LOG_DIR=/tmp/ppo_critic_$(date +%Y%m%d_%H%M) \
+  bash scripts/launch_qwen_ppo_critic.sh
+# ETA: ~150 s/step × 600 = ~25 h on 4× A100 80GB
+```
+
+If the teammate has 8 GPUs, both runs can train in parallel: GRPO on
+GPUs 0-3 and PPO+critic on GPUs 4-7. Total wall-clock = max(14h, 25h) ≈ 25h.
+
+Useful overrides:
+- `MAX_STEPS=200` — smoke test (~3-8h depending on method)
+- `RUN_EVAL=false` — skip auto-eval, training only
+- `SAVE_EVERY=100` — fewer checkpoints (every 100 instead of every 50)
+
+**On VinePPO**: a baseline `scripts/launch_qwen_vineppo.sh` exists, but at
+the full upstream-faithful K_MC=9 config its step time is ~33 min/step on
+this dataset (because the LaTeX-aware splitter produces ~39 step
+boundaries per response on Qwen chains, dwarfing the upstream MATH
+config's ~10-20). 600 steps would take ~14 days, which is impractical.
+For a teammate run, drop K_MC to 5 and steps to 300:
+
+```bash
+# === VinePPO (paper-faithful K=5, reduced step count) ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/vineppo_qwen25math15b_dsr \
+VINEPPO_MC_ROLLOUTS=5 \
+MAX_STEPS=300 \
+  bash scripts/launch_qwen_vineppo.sh
+# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× A100 80GB
+```
+
 ### Setup summary
 
 | Field | Value |

@@ -217,13 +217,16 @@ reference.
 
 | Method | Launcher | `epochs_per_rollout` | `kl_coef` | Other notable |
 |---|---|---|---|---|
-| GRPO | `launch_grpo_full.sh` (in-tree) or analogous | 2 | 0.001 | no critic, group baseline |
-| CASPO Δp | `launch_caspo_full.sh` | 2 | 0.001 | `caspo_advantage_transform=prob` (was 1 pre-2026-05-03; updated to match upstream) |
-| CASPO Δlogp | (override `caspo_advantage_transform=logprob`) | 2 | 0.001 | logsigmoid asymmetry |
-| **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | **2** | **0.01** | **VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6`** |
-| **VinePPO** | **`scripts/launch_qwen_vineppo.sh`** (new 2026-05-02) | **2** | **0.01** | **VinePPO upstream MATH config: K_MC=9, no learned value model, `vllm_max_num_seqs=512`, `max_inflight_requests=1024` (faster than upstream's 128 at our scale)** |
-| **CASPO + alternating refresh** | **`scripts/launch_caspo_alternating.sh`** (new) | 2 | 0.001 | full RL → refresh PRM → resume cycle. `REFRESH_EVERY=150` (Δp) or `200` (Δlogp). Refresh-PRM collection at `max_resp=2048, max_train_prefix_len=0` (= match collection cap; train/deploy aligned). |
-| **CASPO refresh (Phase 2 only)** | **`scripts/launch_caspo_refresh_resume.sh`** (new) | 2 | 0.001 | resume from any Phase-1 ckpt with new PRM. Preserves optimizer/lr_scheduler/ref_policy from Phase 1. |
+| **GRPO** | **`scripts/launch_qwen_grpo.sh`** | 1 | 0.001 | value-free baseline; group-relative terminal advantages |
+| **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | 2 | 0.01 | VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6` |
+| **VinePPO** | **`scripts/launch_qwen_vineppo.sh`** | 2 | 0.01 | upstream MATH config K_MC=9; ⚠ ~33 min/step at K=9, drop to `VINEPPO_MC_ROLLOUTS=5` and lower `MAX_STEPS` for tractable wall-clock |
+| **CASPO** | **`scripts/launch_qwen_caspo.sh`** | 2 | 0.001 | step-TD over frozen PRM; `ADV_TRANSFORM=prob` (Δp, default) or `logprob` (Δlogp); needs `PRM_PATH` |
+| **CASPO + alternating refresh** | **`scripts/launch_caspo_alternating.sh`** | 2 | 0.001 | self-contained PRM → RL → PRM → RL pipeline. Trains initial PRM as Phase 0, then alternates RL with PRM refresh. `REFRESH_EVERY=150` (Δp) or `200` (Δlogp) |
+| **CASPO refresh (Phase 2 only)** | **`scripts/launch_caspo_refresh_resume.sh`** | 2 | 0.001 | resume from any Phase-1 ckpt with new PRM. Preserves optimizer/lr_scheduler/ref_policy from Phase 1 |
+| **MC PRM training** | **`scripts/launch_qwen_mc_prm.sh`** | – | – | unified pipeline (mc_step_label.py 4-shard collect + train_value_mc.py FSDP=4 train). Use for initial PRM (`POLICY=base`) or ad-hoc refresh |
+
+For copy-paste teammate quickstart commands, see
+[REPRODUCE.md → Quickstart](REPRODUCE.md#quickstart-baselines-for-a-teammate).
 
 ### PPO+critic recipe — exact config
 
