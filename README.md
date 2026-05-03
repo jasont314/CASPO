@@ -228,6 +228,73 @@ reference.
 For copy-paste teammate quickstart commands, see
 [REPRODUCE.md → Quickstart](REPRODUCE.md#quickstart-baselines-for-a-teammate).
 
+### Quickstart (copy-paste)
+
+Prerequisites: clone the repo, activate the `scalable` conda env (or set
+`CONDA_ENV` / `PYBIN`), have `dsr_sub.jsonl` available locally, and 4×
+A100/H100 80GB GPUs (FSDP=4). All launchers default to `MAX_STEPS=600`,
+auto-eval all saved checkpoints on `math500/gsm8k/olympiadbench` at
+greedy (k=1, T=0) after training, and write eval JSON to
+`$OUT_DIR/eval/${ckpt}.json`.
+
+```bash
+# === GRPO (canonical, μ=1) — DeepSeekMath / TRL default ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/grpo_mu1_qwen25math15b_dsr \
+LOG_DIR=/tmp/grpo_mu1_$(date +%Y%m%d_%H%M) \
+  bash scripts/launch_qwen_grpo.sh
+# ETA: ~10-14 h on 4× A100 80GB
+
+# === GRPO (iso-budget, μ=2) — VinePPO-paper-style ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/grpo_mu2_qwen25math15b_dsr \
+LOG_DIR=/tmp/grpo_mu2_$(date +%Y%m%d_%H%M) \
+EPOCHS_PER_ROLLOUT=2 \
+  bash scripts/launch_qwen_grpo.sh
+# ETA: ~18-26 h on 4× A100 80GB
+
+# === PPO + critic baseline ===
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/ppo_critic_qwen25math15b_dsr \
+LOG_DIR=/tmp/ppo_critic_$(date +%Y%m%d_%H%M) \
+  bash scripts/launch_qwen_ppo_critic.sh
+# ETA: ~25 h on 4× A100 80GB
+```
+
+**On GRPO μ=1 vs μ=2:** μ=1 is the GRPO-canonical choice (DeepSeekMath
+origin paper, TRL/verl defaults). μ=2 is what the VinePPO paper used for
+its GRPO baseline to match PPO+critic compute. We report both — the
+canonical-μ=1 number is the GRPO-faithful comparison and the μ=2 number
+is the iso-compute comparison (so a CASPO-vs-GRPO win can't be
+attributed to GRPO doing fewer policy updates per rollout).
+
+**On VinePPO**: a baseline `scripts/launch_qwen_vineppo.sh` exists, but at
+the upstream-faithful K_MC=9 config its step time is ~33 min/step on this
+dataset (because the LaTeX-aware splitter produces ~39 step boundaries
+per response on Qwen chains, dwarfing the upstream MATH config's ~10-20).
+600 steps would take ~14 days. For a teammate run, drop K_MC to 5 and
+steps to 300:
+
+```bash
+DSR_SUB=/path/to/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+OUT_DIR=/mnt/data/runs/vineppo_qwen25math15b_dsr \
+VINEPPO_MC_ROLLOUTS=5 \
+MAX_STEPS=300 \
+  bash scripts/launch_qwen_vineppo.sh
+# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× A100 80GB
+```
+
+If 8 GPUs are available, runs can be parallelized: GRPO μ=1 on GPUs 0-3,
+PPO+critic on GPUs 4-7, etc. Total wall-clock = max of individual ETAs
+instead of sum.
+
+Useful overrides per launcher: `MAX_STEPS=200` (smoke test),
+`RUN_EVAL=false` (skip auto-eval), `SAVE_EVERY=100` (fewer ckpts).
+
 ### PPO+critic recipe — exact config
 
 The portable launcher at `scripts/launch_qwen_ppo_critic.sh` matches
