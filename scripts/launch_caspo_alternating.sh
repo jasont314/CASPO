@@ -24,7 +24,7 @@
 #   GPU_LIST       : default "0 1 2 3" (4 GPUs)
 #   REF_MODEL      : default Qwen/Qwen2.5-Math-1.5B (base SFT — held fixed
 #                    across cycles for KL anchor + PRM init from-scratch)
-#   TOTAL_STEPS    : default 500 (total RL steps across all cycles)
+#   TOTAL_STEPS    : default 600 (total RL steps across all cycles)
 #   REFRESH_EVERY  : default 150 (RL steps between refreshes)
 #   METHOD         : default "caspo"
 #   ADV_TRANSFORM  : default "prob"  (or "logprob" for Δlogp)
@@ -61,10 +61,10 @@
 #
 # ---- ETA ----
 # Phase 0:                  ~91 min (collect ~41 + train ~50)
-# 500 RL steps × ~80s/step: ~11 h
+# 600 RL steps × ~80s/step: ~13.3 h
 # Refresh cycles:           ~91 min each
-# 500 / 150 = 3 refreshes     → 11 h + 1.5 h (Phase 0) + 4.5 h (refreshes) = ~17 h
-# 500 / 200 = 2 refreshes     → 11 h + 1.5 h (Phase 0) + 3 h (refreshes) = ~15.5 h (Δlogp)
+# 600 / 150 = 3 refreshes     → 13.3 h + 1.5 h (Phase 0) + 4.5 h (refreshes) = ~19 h
+# 600 / 200 = 2 refreshes     → 13.3 h + 1.5 h (Phase 0) + 3 h (refreshes) = ~17.8 h (Δlogp)
 # Skip Phase 0 (INITIAL_PRM provided): subtract 1.5 h.
 
 set -eo pipefail
@@ -81,7 +81,7 @@ INITIAL_PRM="${INITIAL_PRM:-}"
 GPU_LIST="${GPU_LIST:-0 1 2 3}"
 DSR_SUB="${DSR_SUB:-/tmp/rlvr_replication/dsr_sub.jsonl}"
 REF_MODEL="${REF_MODEL:-Qwen/Qwen2.5-Math-1.5B}"
-TOTAL_STEPS="${TOTAL_STEPS:-500}"
+TOTAL_STEPS="${TOTAL_STEPS:-600}"
 REFRESH_EVERY="${REFRESH_EVERY:-150}"
 METHOD="${METHOD:-caspo}"
 ADV_TRANSFORM="${ADV_TRANSFORM:-prob}"

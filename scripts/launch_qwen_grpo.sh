@@ -14,7 +14,7 @@
 #   DSR_SUB=/path/to/dsr_sub.jsonl  # the 1209-prompt One-Shot-RLVR JSONL
 #   OUT_DIR=/path/to/outputs
 #   LOG_DIR=/tmp/grpo_$(date +%H%M)
-#   MAX_STEPS=500               # 500 RL outer iterations
+#   MAX_STEPS=600               # 600 RL outer iterations
 #   SAVE_EVERY=50               # ckpt every 50 steps
 #   KL_COEF=0.001               # 1B-stable; same as CASPO/VinePPO at this scale
 #   EPOCHS_PER_ROLLOUT=1        # GRPO upstream uses 1 (single-pass over rollouts)
@@ -36,8 +36,8 @@
 #      gpu_memory_utilization=0.45)
 #
 # ---- ETA ----
-#   ~12h on 4×A100 80GB (~85s/step × 500 steps)
-#   ~8h on 4×H100 80GB
+#   ~14h on 4×A100 80GB (~85s/step × 600 steps)
+#   ~10h on 4×H100 80GB
 #
 set -o pipefail
 
@@ -79,7 +79,7 @@ DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
 
 OUT_DIR="${OUT_DIR:-./grpo_qwen25math15b_dsr_sub}"
 LOG_DIR="${LOG_DIR:-/tmp/grpo_$(date +%Y%m%d_%H%M)}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-600}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 KL_COEF="${KL_COEF:-0.001}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-1}"

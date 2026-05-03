@@ -25,7 +25,7 @@
 #   GPU_LIST            : default "0 1 2 3" (FSDP=4)
 #   DSR_SUB             : default /tmp/rlvr_replication/dsr_sub.jsonl
 #   REF_MODEL           : default Qwen/Qwen2.5-Math-1.5B (base SFT)
-#   MAX_STEPS           : default 500 (so lr_scheduler picks up correctly)
+#   MAX_STEPS           : default 600 (so lr_scheduler picks up correctly)
 #   SAVE_EVERY          : default 50
 #   METHOD              : default "caspo" (use "caspo_logprob" for Δlogp, etc.)
 #   ADV_TRANSFORM       : default "prob" (Δp); use "logprob" for Δlogp
@@ -65,7 +65,7 @@ N_GPUS=${#GPUS[@]}
 
 DSR_SUB="${DSR_SUB:-/tmp/rlvr_replication/dsr_sub.jsonl}"
 REF_MODEL="${REF_MODEL:-Qwen/Qwen2.5-Math-1.5B}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-600}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 METHOD="${METHOD:-caspo}"
 ADV_TRANSFORM="${ADV_TRANSFORM:-prob}"

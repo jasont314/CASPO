@@ -17,14 +17,14 @@
 #   DSR_SUB=/path/to/dsr_sub.jsonl
 #   OUT_DIR=/path/to/outputs
 #   LOG_DIR=/tmp/vineppo_$(date +%H%M)
-#   MAX_STEPS=500
+#   MAX_STEPS=600
 #   SAVE_EVERY=50
 #   KL_COEF=0.01
 #   VINEPPO_MC_ROLLOUTS=9       # K_MC per step boundary
 #   RUN_EVAL=true
 #
 # ---- ETA ----
-# ~28h on 4×A100 80GB (~200 s/step × 500). VinePPO has K_MC × n_steps extra
+# ~33h on 4×A100 80GB (~200 s/step × 600). VinePPO has K_MC × n_steps extra
 # rollouts per training step, so ~30% slower than PPO+critic.
 #
 set -o pipefail
@@ -62,7 +62,7 @@ DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
 
 OUT_DIR="${OUT_DIR:-./vineppo_qwen25math15b_dsr_sub}"
 LOG_DIR="${LOG_DIR:-/tmp/vineppo_$(date +%Y%m%d_%H%M)}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-600}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 KL_COEF="${KL_COEF:-0.01}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-false}"

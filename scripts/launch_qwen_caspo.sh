@@ -15,14 +15,14 @@
 #   OUT_DIR=/path/to/outputs
 #   LOG_DIR=/tmp/caspo_$(date +%H%M)
 #   ADV_TRANSFORM=prob          # 'prob' for Δp, 'logprob' for Δlogp
-#   MAX_STEPS=500
+#   MAX_STEPS=600
 #   SAVE_EVERY=50
 #   KL_COEF=0.001
 #   EPOCHS_PER_ROLLOUT=2
 #   RUN_EVAL=true
 #
 # ---- ETA ----
-#   ~12-14h on 4×A100 80GB (~95s/step × 500)
+#   ~15-17h on 4×A100 80GB (~95s/step × 600)
 #
 set -o pipefail
 
@@ -63,7 +63,7 @@ PRM_PATH="${PRM_PATH:-/mnt/nvme_tmp4/jason_caspo/qwen_mc_prm_15b_dsr_sub/best}"
 OUT_DIR="${OUT_DIR:-./caspo_qwen25math15b_dsr_sub}"
 LOG_DIR="${LOG_DIR:-/tmp/caspo_$(date +%Y%m%d_%H%M)}"
 ADV_TRANSFORM="${ADV_TRANSFORM:-prob}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-600}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 KL_COEF="${KL_COEF:-0.001}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-2}"

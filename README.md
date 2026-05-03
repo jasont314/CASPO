@@ -210,7 +210,7 @@ reference.
 | PPO minibatch | `micro_batch_size=4`, `grad_accum_steps=8` (= 32 effective batch / rank) |
 | Policy LR | `1e-6` |
 | KL coefficient | `0.001` for CASPO/GRPO, `0.01` for PPO+critic (1B-stable; 1e-4 diverges) |
-| Steps | `500` (CASPO original); `500` (PPO+critic baseline); resume runs add 250-350 more |
+| Steps | `600` (default for all methods); resume runs add 250-350 more |
 | Save cadence | `save_every=50` |
 
 ### Method launchers (Qwen2.5-Math-1.5B + dsr_sub, 4-GPU FSDP)

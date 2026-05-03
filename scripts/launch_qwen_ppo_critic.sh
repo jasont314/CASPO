@@ -19,7 +19,7 @@
 #   DSR_SUB=/path/to/dsr_sub.jsonl  # the 1209-prompt One-Shot-RLVR JSONL
 #   OUT_DIR=/path/to/outputs
 #   LOG_DIR=/tmp/ppo_critic_$(date +%H%M)
-#   MAX_STEPS=500               # 500 RL outer iterations (~21h on 4×A100 80GB)
+#   MAX_STEPS=600               # 600 RL outer iterations (~25h on 4×A100 80GB)
 #   SAVE_EVERY=50               # ckpt every 50 steps
 #   KL_COEF=0.01                # 1B-stable; VinePPO upstream uses 1e-4 at 7B
 #                               # (1e-4 caused divergence at 1B in our runs)
@@ -41,8 +41,8 @@
 #      gpu_memory_utilization=0.35)
 #
 # ---- ETA ----
-#   ~21h on 4×A100 80GB (~150s/step × 500 steps)
-#   ~14h on 4×H100 80GB (faster compute + NVLink)
+#   ~25h on 4×A100 80GB (~150s/step × 600 steps)
+#   ~17h on 4×H100 80GB (faster compute + NVLink)
 #
 set -o pipefail
 
@@ -84,7 +84,7 @@ DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
 
 OUT_DIR="${OUT_DIR:-./ppo_critic_qwen25math15b_dsr_sub}"
 LOG_DIR="${LOG_DIR:-/tmp/ppo_critic_$(date +%Y%m%d_%H%M)}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-600}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 KL_COEF="${KL_COEF:-0.01}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-false}"

@@ -214,7 +214,7 @@ def main():
         p_hat = blob["p_hat"][idxs].to(device)
         return prompt_ids, prompt_mask, response_ids, response_mask, step_end_idx, p_hat
 
-    def forward_loss(idxs):
+    def forward_loss(idxs, return_preds=False):
         pids, pmask, rids, rmask, step_end, p_hat = get_batch(idxs)
         out = pv(prompt_ids=pids, prompt_mask=pmask,
                  response_ids=rids, response_mask=rmask)
@@ -230,6 +230,8 @@ def main():
             preds = torch.sigmoid(logits)
             pred_mse = ((preds - p_hat) ** 2).mean()
             mean_pred = preds.mean()
+        if return_preds:
+            return loss, pred_mse, mean_pred, preds.detach().cpu(), p_hat.detach().cpu()
         return loss, pred_mse, mean_pred
 
     @torch.no_grad()
@@ -244,13 +246,17 @@ def main():
         total_loss_t = torch.zeros(1, device=device)
         total_mse_t = torch.zeros(1, device=device)
         n_eval_t = torch.zeros(1, device=device)
+        local_preds = []
+        local_phat = []
         for s in range(0, len(local_val), args.mb):
             batch_idxs = torch.tensor(local_val[s:s + args.mb], dtype=torch.long)
-            loss, mse, _ = forward_loss(batch_idxs)
+            loss, mse, _, preds, p_hat = forward_loss(batch_idxs, return_preds=True)
             n = float(len(batch_idxs))
             total_loss_t += loss.detach().float() * n
             total_mse_t += mse.detach().float() * n
             n_eval_t += n
+            local_preds.append(preds)
+            local_phat.append(p_hat)
         if is_dist_initialized():
             dist.all_reduce(total_loss_t, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_mse_t, op=dist.ReduceOp.SUM)
@@ -258,8 +264,42 @@ def main():
         n_eval = float(n_eval_t.item())
         if n_eval == 0:
             return None
+        # Gather predictions across ranks for global Spearman ρ + AUC
+        local_preds_t = torch.cat(local_preds) if local_preds else torch.zeros(0)
+        local_phat_t = torch.cat(local_phat) if local_phat else torch.zeros(0)
+        if is_dist_initialized() and world_size > 1:
+            preds_lists = [None] * world_size
+            phat_lists = [None] * world_size
+            dist.all_gather_object(preds_lists, local_preds_t.numpy().tolist())
+            dist.all_gather_object(phat_lists, local_phat_t.numpy().tolist())
+            import numpy as _np
+            all_preds = _np.array([x for lst in preds_lists for x in lst])
+            all_phat = _np.array([x for lst in phat_lists for x in lst])
+        else:
+            import numpy as _np
+            all_preds = local_preds_t.numpy()
+            all_phat = local_phat_t.numpy()
+        spearman_rho = float("nan")
+        within_auc = float("nan")
+        if is_main and len(all_preds) >= 2:
+            try:
+                from scipy.stats import spearmanr
+                rho, _ = spearmanr(all_preds, all_phat)
+                spearman_rho = float(rho) if rho is not None else float("nan")
+            except Exception:
+                pass
+            # Within-AUC: binary AUC where label = (p_hat > 0.5)
+            try:
+                from sklearn.metrics import roc_auc_score
+                bin_label = (all_phat > 0.5).astype(int)
+                if bin_label.min() != bin_label.max():
+                    within_auc = float(roc_auc_score(bin_label, all_preds))
+            except Exception:
+                pass
         return {"val_loss": float(total_loss_t.item()) / n_eval,
-                "val_mse": float(total_mse_t.item()) / n_eval}
+                "val_mse": float(total_mse_t.item()) / n_eval,
+                "val_spearman": spearman_rho,
+                "val_within_auc": within_auc}
 
     best_val_loss = float("inf")
     no_improve = 0
@@ -306,6 +346,8 @@ def main():
                     if is_main:
                         _rprint(f"[mc-train step {step}] val_loss={stats['val_loss']:.4f} "
                                 f"val_mse={stats['val_mse']:.4f} "
+                                f"val_ρ={stats['val_spearman']:.4f} "
+                                f"val_within_AUC={stats['val_within_auc']:.4f} "
                                 f"(best={best_val_loss:.4f})")
                         train_log.append({"step": step, **stats})
                     is_best = stats["val_loss"] < best_val_loss - 1e-4

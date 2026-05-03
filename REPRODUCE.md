@@ -302,7 +302,7 @@ Targeted trainer/vLLM tests:
 | Topology | FSDP=4 + colocated vLLM, 4× H100/A100 80GB |
 | Policy LR | 1e-6 |
 | KL coef | 0.001 (CASPO/GRPO/VinePPO), 0.01 (PPO+critic — needs stronger anchor at 1B) |
-| Steps | 500 |
+| Steps | 600 |
 
 ### Why response budget = 2048
 
@@ -401,7 +401,7 @@ GPU_LIST="0 1 2 3" \
 # Optional knobs
 ADV_TRANSFORM=logprob        # 'prob' (Δp, default) or 'logprob' (Δlogp)
 REFRESH_EVERY=200            # 150 for Δp (default), 200 for Δlogp
-TOTAL_STEPS=500
+TOTAL_STEPS=600
 METHOD=caspo                 # default
 PRM_TRAIN_K=16 PRM_TRAIN_J=16 PRM_TRAIN_S=5
 PRM_TRAIN_MAX_RESP=2048      # matches RL cap
