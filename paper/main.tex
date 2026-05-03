@@ -418,22 +418,55 @@ control distribution drift.
 
 \subsection{Iterated PRM refresh}
 \label{sec:refresh}
-A frozen $V_\phi$ trained at the SFT distribution drifts out of
-calibration as the policy optimizes; the prefixes encountered at
-later RL steps are no longer drawn from the SFT marginal. We address
-this with periodic refresh rather than inline online updates: every
+
+\paragraph{PRM decay.}
+A learned PRM is in-distribution only at the policy state on which its
+MC labels were collected. As RL training updates the policy, the
+prefixes seen at outer step $t$ drift away from the policy that
+generated the Phase-1 labels, and $V_\phi$'s calibration on those
+prefixes deteriorates. Concretely, on Qwen2.5-Math-1.5B + dsr_sub we
+measure the per-checkpoint Spearman $\rho$ between $V_\phi(s_t)$ and a
+fresh $J{=}8$ MC estimate of $P(\text{success} \mid s_t)$ at policy
+states $\{$step\_50, step\_100, $\ldots$, step\_400$\}$. A PRM trained
+on rollouts of step\_0 (SFT) yields $\rho \approx 0.63$ when scored on
+its own distribution; on policy state step\_150 this drops to
+$\rho \approx 0.54$, and on step\_400 it falls to $\rho \approx 0.27$.
+The decay is monotone with cumulative policy drift and is the dominant
+mechanism by which a fixed prefix-value model loses its credit-signal
+quality during RL.
+
+\paragraph{Refresh mechanism.}
+We address PRM decay by replacing a single drifting $V_\phi$ with a
+sequence of in-distribution snapshots, refreshed periodically. Every
 $k$ outer steps the trainer pauses, collects a new MC label set from
 the current policy snapshot under the same Phase-1 recipe
 (\eqref{eq:phat}, \eqref{eq:prmloss}), retrains $V_\phi$ \emph{from
 scratch} on those labels (initialized from the SFT backbone, not from
-the previous $V_\phi$), and resumes RL using the new $V_\phi$ as the
-prefix value source. The result is a sequence of in-distribution
-$V_\phi$ snapshots rather than a single drifting model. The refresh
-cost is well below one \vineppo{} outer-step budget at $K{=}9$ when
-amortized over the inter-refresh window. The \caspo{}-frozen-RM
-variant disables refresh and uses the Phase-1 $V_\phi$ for all RL
-training; we report it as an ablation that isolates the contribution
-of the refresh path.
+the previous $V_\phi$, to avoid bias compounding across refreshes),
+and resumes RL using the new $V_\phi$ as the prefix value source. We
+use $k = 150$ for the $\Delta p$ formulation and $k = 200$ for
+$\Delta\log p$, chosen so that $\rho$ at the refresh trigger remains
+well above the empirical $\tau \approx 0.4$ floor at which the
+credit-signal contribution of $V_\phi$ becomes negligible.
+
+\paragraph{Refresh cost.}
+A single refresh on Qwen2.5-Math-1.5B + dsr_sub takes
+$\approx 91$ minutes on $4 \times$H100 80GB ($\approx 41$~min for MC
+collection at $K{=}16$, $J{=}8$ on $N{=}300$ prompts, plus
+$\approx 50$~min for FSDP=4 PRM training). At $k = 150$ this amortizes
+to $\approx 36$~s of refresh overhead per RL outer step, which is
+below the per-step difference between \caspo{} and \ppocritic{} and
+well under the per-step cost of one extra \vineppo{} MC continuation
+($K{=}9 \to K{=}10$). Total \caspo{}-refresh wall-clock for a
+600-step RL run thus exceeds frozen-RM by roughly $5{-}6$~h, but
+remains an order of magnitude below \vineppo{} K=9.
+
+\paragraph{Variants.}
+The \caspo{}-frozen-RM variant disables refresh entirely and uses the
+Phase-1 $V_\phi$ throughout; \caspo{}-refresh applies the schedule
+above. The two variants share every other component (PPO objective,
+KL, advantage transform, segmenter), isolating the refresh
+contribution to a single ablation.
 
 \subsection{Step-TD advantage formulations from $V_\phi$}
 \label{sec:transforms}
