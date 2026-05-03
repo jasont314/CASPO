@@ -171,14 +171,15 @@ echo "[mc-prm] $(date +%H:%M:%S) merge done"
 echo "[mc-prm] $(date +%H:%M:%S) Phase B: FSDP=4 training"
 TRAIN_PORT=$((30000 + RANDOM % 5000))
 TRAIN_PIDS=()
+ref_arg=()
+[[ -n "$REF_PATH" ]] && ref_arg=(--ref_path "$REF_PATH")
 for r in 0 1 2 3; do
   gpu="${GPUS[$r]}"
   log="$LOG_DIR/train_rank${r}.log"
   CUDA_VISIBLE_DEVICES="$gpu" \
   WORLD_SIZE=4 RANK="$r" LOCAL_RANK=0 \
   MASTER_ADDR=127.0.0.1 MASTER_PORT="$TRAIN_PORT" \
-    ref_arg=()
-    [[ -n "$REF_PATH" ]] && ref_arg=(--ref_path "$REF_PATH")
+  PYTORCH_ALLOC_CONF=expandable_segments:True \
     nohup "$PYBIN" -u scripts/train_value_mc.py \
     --config configs/caspo_rho1b_math.yaml \
     --data "$OUT_DIR/mc_labels.pt" \
