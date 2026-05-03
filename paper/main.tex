@@ -31,13 +31,15 @@ reinforcement learning of mathematical reasoning that obtains step-level
 credit signals from a learned prefix-value model rather than from on-policy
 Monte Carlo prefix rollouts. \caspo{} retains the \vineppo{} step-segmentation
 and step-TD advantage structure but replaces \vineppo{}'s $K{=}9$ rollouts at
-each non-terminal prefix with a single forward pass through an
-\ipvrm{}-style cumulative-log-ratio prefix value model, optionally fine-tuned
-online during policy training under an ADB+DLW correction. The result is a
-strict drop-in for \vineppo{} that uses the same PPO clipped objective, the
-same KL penalty, the same response segmentation, and the same global PPO
-minibatch, but eliminates the per-step Monte Carlo expansion that dominates
-\vineppo{}'s wall-clock cost. We compare four methods (\grpo{}, \ppocritic{},
+each non-terminal prefix with a single forward pass through a learned
+process reward model (PRM), trained to predict
+$P(\text{success} \mid \text{prefix})$ from Monte Carlo step labels.
+A periodic refresh of the PRM on rollouts of the current policy controls
+distribution drift across RL training. The result is a strict drop-in for
+\vineppo{} that uses the same PPO clipped objective, the same KL penalty,
+the same response segmentation, and the same global PPO minibatch, but
+eliminates the per-step Monte Carlo expansion that dominates \vineppo{}'s
+wall-clock cost. We compare four methods (\grpo{}, \ppocritic{},
 \vineppo{}, \caspo{}) under one trainer, one verifier, one rollout engine,
 and one set of hyperparameters, on Qwen2.5-Math-1.5B with the
 \texttt{dsr\_sub} subset of DeepScaleR (1209 prompts from One-Shot-RLVR),
@@ -90,35 +92,34 @@ experimental scale; the cost-effectiveness gap to \vineppo{} is largest
 exactly where step-level credit assignment matters most.
 
 \caspo{} replaces those Monte Carlo prefix rollouts with a single forward
-pass through a \emph{learned} prefix value model
-$V_\phi(s_t)$. Following \ipvrm{} \citep{ipvrm2026}, $V_\phi$ is parameterized
-as a cumulative log-ratio between a trainable prefix policy $\pi_\phi$ and a
-frozen reference $\pi_{\mathrm{ref}}$, and trained from trajectory-level
-correctness labels using a margin BCE objective. \caspo{} keeps every other
-\vineppo{} component fixed: the same LaTeX-aware step splitter, the same
-step-TD advantage construction, the same clipped PPO objective, and the same
-KL penalty. Step-level credit is therefore extracted from $V_\phi$ in
-$\mathcal{O}(1)$ forward passes per response rather than $\mathcal{O}(K \cdot
-\text{steps})$ generations, and online updates of $V_\phi$ during policy
-training mitigate distribution shift.
+pass through a \emph{learned} prefix value model $V_\phi(s_t)$, a process
+reward model (PRM) trained to predict $P(\text{success} \mid s_t)$ from
+Monte Carlo step labels collected on the SFT policy. \caspo{} keeps every
+other \vineppo{} component fixed: the same LaTeX-aware step splitter, the
+same step-TD advantage construction, the same clipped PPO objective, and
+the same KL penalty. Step-level credit is therefore extracted from
+$V_\phi$ in $\mathcal{O}(1)$ forward passes per response rather than
+$\mathcal{O}(K \cdot \text{steps})$ generations, and a periodic
+\emph{refresh} of $V_\phi$ on rollouts of the current policy controls the
+distribution shift induced by RL.
 
 \paragraph{Contributions.} We contribute:
 (i) \caspo{}: a method that drops \vineppo{}'s prefix Monte Carlo step in
-favor of an \ipvrm{}-style learned prefix value model, including the step-TD
-construction and an online update path with ADB and DLW corrections;
-(ii) a family of three principled step-TD advantage formulations
-(\emph{value}, \emph{prob}, \emph{logprob}) derived from the Bradley--Terry
-interpretation of $V_\phi$ under the IPVRM BCE loss, each operating on a
-different scale of the prefix value (raw cumulative log-ratio, implied
-correctness probability, or its log) and motivated by a different
-bias--variance regime;
-(iii) a frozen reward-model variant (\caspo{}-frozen-RM) that disables online
-value updates and isolates the cost/benefit of online value drift correction;
-(iv) an iterated-refresh configuration that periodically retrains
-$V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the current policy,
-converting the credit model from a single drifting model into a sequence of
-in-distribution snapshots, at amortized wall-clock cost well below one
-\vineppo{} outer-step budget;
+favor of a learned process reward model (PRM) trained to predict
+$P(\text{success} \mid s_t)$ from Monte Carlo step labels, plugged into
+the \vineppo{} step-TD advantage construction;
+(ii) two step-TD advantage formulations of the prefix value: $\Delta p$
+(default), the canonical match for a binary verifier, and $\Delta\log p$
+(ablation), which operates on the log-probability scale of the underlying
+token logits and amplifies rescue signal on the failure tail;
+(iii) an iterated-refresh configuration that periodically retrains
+$V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the current
+policy, converting the credit model from a single drifting model into a
+sequence of in-distribution snapshots, at amortized wall-clock cost well
+below one \vineppo{} outer-step budget;
+(iv) a frozen-RM variant (\caspo{}-frozen-RM) that disables refresh and
+uses the Phase-1 PRM unchanged, isolating the contribution of the refresh
+path;
 (v) a unified comparison stack that implements \grpo{}, \ppocritic{},
 \vineppo{}, and \caspo{} under one trainer, one verifier, and one rollout
 engine, controlling everything except the algorithmic credit-signal choice; and
@@ -169,21 +170,26 @@ method's rollout multiplier scales as $K$ times the average number of steps
 per response.
 
 \paragraph{Learned process supervision.}
-A line of work trains a separate process reward model on human-annotated or
-self-supervised step-correctness labels. \caspo{}'s prefix value model is in
-this family but constructed differently: rather than scoring step text
-directly, it accumulates token-level $\log
-[\pi_\phi/\pi_{\mathrm{ref}}]$ contributions, following \ipvrm{}
-\citep{ipvrm2026}. This aligns prefix scoring with the same density that
-generated the response and avoids requiring a separate textual annotation.
+A line of work trains a separate process reward model (PRM) on
+human-annotated or self-supervised step-correctness labels. \caspo{}'s
+PRM is in this family: it predicts $P(\text{success} \mid \text{prefix})$
+from automatically-generated Monte Carlo step labels (a held-out batch
+of $J$ rollouts is averaged to form the soft target at each prefix),
+avoiding the human-annotation bottleneck of PRM800K-style data and
+recovering a directly calibrated correctness probability suitable for
+TD-style step advantages.
 
 \paragraph{Implicit prefix value learning (\ipvrm{}).}
-\ipvrm{} \citep{ipvrm2026} formalizes prefix values as cumulative log-ratios
-of a trainable prefix policy versus a frozen reference policy, trained from
-trajectory-level outcome labels using a margin BCE. \ipvrm{}'s reported
-setting uses LoRA adapters on a 7B base; we adopt the same parameterization
-but perform full-model updates, with corresponding adjustments to the online
-learning rate.
+\ipvrm{} \citep{ipvrm2026} formalizes prefix values as cumulative
+log-ratios of a trainable prefix policy versus a frozen reference policy,
+trained from trajectory-level outcome labels using a margin BCE. We
+\emph{share \ipvrm{}'s framing} of $V_\phi$ as a calibrated correctness
+predictor that drives a step-TD advantage, but \emph{differ
+architecturally and on training data}: our $V_\phi$ is a single sigmoid
+head trained on dense Monte Carlo step labels (not trajectory-level
+labels with a margin), and we replace inline online updates with
+periodic full retraining of $V_\phi$ from scratch on current-policy
+rollouts.
 
 \paragraph{Per-token learned-critic baselines.}
 The classical PPO-with-critic recipe \citep{schulman2017ppo} uses a learned
@@ -305,7 +311,7 @@ broadcast over the tokens in each step span for \vineppo{}/\caspo{}.
 \node[valbox, below=of vvine] (vcaspo)
     {\caspo{}\\
      $V_\phi(s_t) \approx P(\text{success}\mid s_t)$\\
-     learned prefix value (IPVRM)};
+     learned PRM (sigmoid head)};
 
 % Step-TD / advantage column
 \node[box, right=18mm of vpc.east, minimum width=33mm, fill=black!4] (adv)
@@ -332,9 +338,10 @@ $A_t = r_t + \gamma V(s_{t\!+\!1}) - V(s_t)$. \grpo{} uses no value
 \ppocritic{} (the canonical Schulman-2017 \ppo{}) learns a scalar per-token
 value head trained on $(V_\psi - \hat R)^2$ with GAE. \vineppo{} estimates
 $V(s_t)$ by averaging $K{=}9$ on-policy continuations from each prefix.
-\caspo{} replaces those continuations with a learned prefix value model
-$V_\phi(s_t)$ trained to approximate $P(\text{success}\mid s_t)$
-(IPVRM's cumulative-log-ratio parameterization, §\ref{sec:vphi}).}
+\caspo{} replaces those continuations with a learned process reward
+model $V_\phi(s_t)$ trained on Monte Carlo step labels to approximate
+$P(\text{success}\mid s_t)$, with periodic refresh on current-policy
+rollouts (§\ref{sec:vphi}, §\ref{sec:refresh}).}
 \label{fig:methods}
 \end{figure}
 
@@ -345,208 +352,184 @@ $V(s_t)$ differs.
 
 \subsection{Prefix value model}
 \label{sec:vphi}
-Following \ipvrm{} \citep{ipvrm2026}, we define
+The prefix value model $V_\phi$ is a neural network trained to predict
+the probability that a rollout starting from prefix $s_t$ eventually
+reaches a correct final answer:
 \begin{equation}
 \label{eq:vphi}
-V_\phi(s_t) \;=\;
-\beta \sum_{i < t}
-\log \frac{\pi_\phi(y_i \mid x, y_{<i})}{\pi_{\mathrm{ref}}(y_i \mid x, y_{<i})},
+V_\phi(s_t) \;\approx\; P\big(R(x, y) = 1 \mid s_t\big).
 \end{equation}
-where $\pi_\phi$ is a trainable prefix policy initialized from the same SFT
-checkpoint family as the base policy and $\pi_{\mathrm{ref}}$ is the same
-frozen reference used in the KL term in \eqref{eq:kl}. The scale $\beta$ is a
-fixed scalar; we use $\beta = 10$ throughout.
+We parameterize $V_\phi$ as a transformer with the same backbone as the
+base policy (initialized from the same SFT checkpoint) and a scalar
+output head with a sigmoid activation, so that $V_\phi(s_t) \in [0, 1]$
+by construction. We refer to $V_\phi$ as the \emph{process reward
+model} (PRM), following the convention of \citet{ipvrm2026} and the
+process-supervision literature.
 
-\subsection{Phase-1: offline value training}
-We train $V_\phi$ on a fixed corpus of (prompt, response, outcome) triples
-collected by sampling $G$ responses per prompt from the SFT policy at
-generation temperature $1.0$, scoring with the verifier, and discarding
-prompts whose $G$ outcomes are all 0 or all 1 (the mixed-outcome filter,
-following \ipvrm{}). For a response of length $T$ we use the
-length-normalized prefix value
-$\bar V_\phi(s_t) := V_\phi(s_t) / t$ and minimize a per-prefix
-BCE-with-margin against the eventual binary outcome $r_o \in \{0,1\}$
-(\ipvrm{} Eq.~9):
+\subsection{Phase-1: PRM training via Monte Carlo step labels}
+\label{sec:phase1}
+We train $V_\phi$ directly on Monte Carlo step labels rather than via a
+trajectory-level BCE-with-margin objective. For each of $N$ training
+prompts we sample $K$ base rollouts from the SFT policy at temperature
+$1.0$. From each rollout we randomly select $S$ step boundaries; at each
+boundary $s_t$ we sample $J$ additional independent continuations from
+the same SFT policy, each scored by the verifier $R \in \{0, 1\}$, and
+form the empirical Monte Carlo estimate
 \begin{equation}
-\label{eq:ipvrmloss}
-\mathcal{L}_{\mathrm{IPVRM}}(\phi) =
--\,\mathbb{E}_{(x, y, r_o)}\!\left[
-\frac{1}{T}\!\sum_{t=1}^{T}\!\Big(
-  r_o\,\log\sigma\!\big(\bar V_\phi(s_t) - m\big)
-\;+\;
-  (1\!-\!r_o)\,\log\!\big(1 - \sigma\!\big(\bar V_\phi(s_t) + m\big)\big)
-\Big)
-\right],
+\label{eq:phat}
+\widehat{p}(s_t) \;=\; \frac{1}{J}\sum_{j=1}^{J} R\!\big(x, [s_t; y^{(j)}_{>t}]\big),
+\qquad y^{(j)}_{>t}\sim \pi_{\mathrm{SFT}}(\cdot \mid s_t),
 \end{equation}
-with margin $m = 5$. We train for three epochs with full-model updates and a
-small learning rate ($5 \times 10^{-7}$).
+which is an unbiased estimator of $P(R = 1 \mid s_t)$. Following the
+process-supervision practice of mixed-outcome filtering, we discard
+rollouts whose $J$ continuations are all 0 or all 1 at every sampled
+boundary, since saturated prefixes contribute no learning signal.
+
+We train $V_\phi$ to minimize binary cross-entropy against the
+continuous targets $\widehat{p}(s_t) \in [0, 1]$:
+\begin{equation}
+\label{eq:prmloss}
+\mathcal{L}_{\mathrm{PRM}}(\phi) \;=\;
+-\,\mathbb{E}_{s_t}\!\Big[\,
+\widehat{p}(s_t)\,\log V_\phi(s_t)
+\;+\;
+\big(1-\widehat{p}(s_t)\big)\,\log\!\big(1 - V_\phi(s_t)\big)
+\Big].
+\end{equation}
+Equation~\eqref{eq:prmloss} is BCE on continuous targets in $[0, 1]$
+rather than binary; it minimizes the Bregman divergence between
+$V_\phi(s_t)$ and the MC label $\widehat{p}(s_t)$ and recovers the same
+calibration target without needing the trajectory-level margin term of
+\ipvrm{} \citep{ipvrm2026}. We train for two epochs with full-model
+FSDP updates, $\beta = 10$ stability scaling on the pre-sigmoid logit,
+effective batch size 32, and learning rate $5 \times 10^{-6}$.
 
 \subsection{Phase-2: step-TD policy optimization}
-At each PPO outer step, the trainer samples $G$ responses per prompt for
-$P$ prompts, segments each response, and constructs step values
+At each PPO outer step, the trainer samples $G$ responses per prompt
+for $P$ prompts, segments each response, and constructs step values
 $\{V_\phi(s_t)\}$ in a single forward pass through $V_\phi$ using
-\eqref{eq:vphi}. Step advantages are then assembled from \eqref{eq:adv} and
-broadcast over the tokens within each step span before applying the PPO
-objective in \eqref{eq:ppo} with KL penalty in \eqref{eq:kl}. The standard
-\caspo{} run optionally co-trains $V_\phi$ during policy optimization (next
-section).
+\eqref{eq:vphi}. Step advantages are assembled from \eqref{eq:adv} and
+broadcast over the tokens within each step span before applying the
+PPO objective in \eqref{eq:ppo} with the KL penalty in \eqref{eq:kl}.
+The default \caspo{} run holds $V_\phi$ frozen during policy
+optimization; an iterated-refresh variant (next section) periodically
+retrains $V_\phi$ from scratch on rollouts of the current policy to
+control distribution drift.
 
-\subsection{Online value updates with ADB+DLW}
-Distribution drift between the SFT-init prefix policy and the actively
-optimized policy can degrade $V_\phi$. We therefore allow online updates of
-$V_\phi$ from the same rollout batch used for PPO. The on-policy update uses
-the same margin-BCE loss \eqref{eq:ipvrmloss} but with two corrections from
-\ipvrm{}:
-\begin{itemize}
-\item \emph{ADB} (advantage debias): the BCE boundary is shifted per-prompt
-by $\log\!\big[\mu/(1-\mu)\big]$, where $\mu$ is the empirical positive
-fraction over the prompt's $G$ rollouts, so the value model learns
-\emph{deviations} from the prompt's SFT difficulty rather than its absolute
-difficulty.
-\item \emph{DLW} (difficulty-level weighting): the BCE term is weighted by
-$\mu (1-\mu)$, downweighting prompts where outcomes are nearly all-correct
-or all-incorrect.
-\end{itemize}
-The online value learning rate is set to $10^{-6}$, an order of magnitude
-below the offline rate to control drift.
+\subsection{Iterated PRM refresh}
+\label{sec:refresh}
+A frozen $V_\phi$ trained at the SFT distribution drifts out of
+calibration as the policy optimizes; the prefixes encountered at
+later RL steps are no longer drawn from the SFT marginal. We address
+this with periodic refresh rather than inline online updates: every
+$k$ outer steps the trainer pauses, collects a new MC label set from
+the current policy snapshot under the same Phase-1 recipe
+(\eqref{eq:phat}, \eqref{eq:prmloss}), retrains $V_\phi$ \emph{from
+scratch} on those labels (initialized from the SFT backbone, not from
+the previous $V_\phi$), and resumes RL using the new $V_\phi$ as the
+prefix value source. The result is a sequence of in-distribution
+$V_\phi$ snapshots rather than a single drifting model. The refresh
+cost is well below one \vineppo{} outer-step budget at $K{=}9$ when
+amortized over the inter-refresh window. The \caspo{}-frozen-RM
+variant disables refresh and uses the Phase-1 $V_\phi$ for all RL
+training; we report it as an ablation that isolates the contribution
+of the refresh path.
 
-\subsection{Three step-TD advantage formulations from $V_\phi$}
+\subsection{Step-TD advantage formulations from $V_\phi$}
 \label{sec:transforms}
 
-A central modeling choice in \caspo{} is \emph{which} statistic of $V_\phi$
-enters the step-TD difference. We derive and propose three principled
-formulations from how the IPVRM loss \eqref{eq:ipvrmloss} parameterizes
-correctness. Recall that the BCE margin loss treats $V_\phi$ as a
-Bradley--Terry score: the implied per-prefix correctness probability is
-\begin{equation}
-\label{eq:ptilde}
-\widetilde{p}(s_t) \;\triangleq\; \sigma(V_\phi(s_t)) \;\approx\; \mathbb{P}\!\left[R(x,y)=1 \mid s_t\right],
-\end{equation}
-where $\sigma$ is the logistic function. Equation~\eqref{eq:ptilde} is the
-natural way to convert an unbounded cumulative-log-ratio score into a
-calibrated probability, and it is the quantity the BCE objective directly
-optimizes.
-
-Equation~\eqref{eq:adv} is then well-defined on three distinct scales of
-$V_\phi$, each with a different statistical interpretation. We propose all
-three as named formulations of \caspo{}:
+A modeling choice in \caspo{} is \emph{which} statistic of $V_\phi$
+enters the step-TD difference. Because $V_\phi(s_t) \in [0, 1]$ is
+already a calibrated correctness probability under \eqref{eq:vphi},
+two natural formulations arise: the TD on probabilities ($\Delta p$,
+default) and the TD on log-probabilities ($\Delta\log p$, ablation).
 
 \begin{description}
-\item[\emph{value}] (raw cumulative log-ratio):
-\begin{equation}
-\label{eq:advV}
-A^{V}(s_t) \;=\; r_t \,+\, \gamma\, V_\phi(s_{t+1}) \,-\, V_\phi(s_t).
-\end{equation}
-\item[\emph{prob}] (Bradley--Terry probability):
+\item[$\Delta p$] (default, probability-scale TD):
 \begin{equation}
 \label{eq:advP}
-A^{P}(s_t) \;=\; r_t \,+\, \gamma\, \widetilde{p}(s_{t+1}) \,-\, \widetilde{p}(s_t)
-            \;=\; r_t \,+\, \gamma\, \sigma(V_\phi(s_{t+1})) \,-\, \sigma(V_\phi(s_t)).
+A^{\Delta p}(s_t) \;=\; r_t \,+\, \gamma\, V_\phi(s_{t+1}) \,-\, V_\phi(s_t).
 \end{equation}
-\item[\emph{logprob}] (log Bradley--Terry probability):
+\item[$\Delta\log p$] (ablation, log-probability-scale TD):
 \begin{equation}
 \label{eq:advLP}
-A^{LP}(s_t) \;=\; r_t \,+\, \gamma\, \log \widetilde{p}(s_{t+1}) \,-\, \log \widetilde{p}(s_t).
+A^{\Delta\log p}(s_t) \;=\; r_t \,+\, \gamma\, \log V_\phi(s_{t+1}) \,-\, \log V_\phi(s_t).
 \end{equation}
 \end{description}
 
-In all three variants, the terminal verifier reward $r_T = R(x,y)$ enters
-identically; the only difference is the function applied to $V_\phi$ before
-the TD difference.
+In both variants the terminal verifier reward $r_T = R(x,y)$ enters
+identically; the only difference is whether the TD operates on
+$V_\phi$ or $\log V_\phi$.
 
 \paragraph{Intuition.}
-The three transforms have different scales and different bias--variance
-profiles:
-
 \begin{itemize}
-\item \emph{value}: The TD operates on the unbounded log-ratio scale. A
-single token whose log-ratio swings by, say, $-10$ produces an unbounded
-$\Delta V_\phi$, which carries a strong gradient signal but also amplifies
-miscalibrated regions of the prefix value model (e.g.\ tokens far from the
-ref-policy distribution). High signal-to-noise where $V_\phi$ is
-well-calibrated, but heavier tails when it is not. Standardization +
-clipping (Section~\ref{sec:method}, advantage clip $\pm 3$) bounds the
-magnitude empirically, but does not reshape the underlying scale.
+\item $\Delta p$: The TD operates on the probability scale, so
+$|A^{\Delta p}(s_t)| \leq 1$ before standardization. Because
+$V_\phi(s_t) \approx P(R = 1 \mid s_t)$, $A^{\Delta p}$ is the
+empirical advantage an idealized binary-reward critic would compute:
+the change in expected terminal reward attributed to step $t$. This
+matches the binary verifier exactly. Its main weakness is
+\emph{near-saturation}: when $V_\phi(s_t)$ is close to $0$ or $1$,
+$\Delta p$ contributions are vanishingly small, so highly confident
+prefixes contribute little gradient.
 
-\item \emph{prob}: The TD operates on the probability scale, so
-$|A^P(s_t)| \leq 1$ before standardization. By
-\eqref{eq:ptilde}, $\widetilde{p}(s_t) \approx \mathbb{E}[R \mid s_t]$, so
-$A^P$ is the empirical advantage that an idealized binary-reward critic
-would compute: it is the change in the expected terminal reward attributed
-to step $t$. This is the variant most directly compatible with the binary
-verifier we use, but it suffers \emph{near saturation}: when $V_\phi(s_t)$
-is large positive or negative, $\sigma'(V_\phi)$ collapses toward zero, so
-two prefixes with very different log-ratios get essentially the same
-gradient. In practice this means \emph{prob} undersignals on prefixes the
-value model is highly confident about.
-
-\item \emph{logprob}: The TD operates on the log-probability scale, mirroring
-the form of token log-likelihoods used in the PPO ratio
+\item $\Delta\log p$: The TD operates on the log-probability scale,
+mirroring the form of token log-likelihoods used in the PPO ratio
 $\rho_t(\theta)$. For a sequence model trained by maximum likelihood,
 log-probability differences are the canonical update signal; using
-$\log \widetilde{p}$ keeps the value-derived advantage on the same
-information-theoretic scale as the underlying token logits. Numerically,
-$\log \sigma(V) = -\log(1 + e^{-V})$, which behaves linearly for $V \ll 0$
-(matching the value scale on the negative tail) and saturates softly to
-zero for $V \gg 0$ (compressing the high-confidence positive tail). This is
-a smooth interpolation between \emph{value} (linear in the negative regime)
-and \emph{prob} (bounded above).
+$\log V_\phi$ keeps the value-derived advantage on the same
+information-theoretic scale as the underlying token logits. The
+log-transform also amplifies the \emph{rescue} signal: a step that
+moves a near-failed trajectory ($V_\phi \to 0$) toward feasibility
+contributes a large negative-side gradient under $\log V_\phi$ but
+only a small positive-side gradient under $V_\phi$. The trade-off is
+unbounded magnitude on the failure tail, which we control with the
+shared $\pm 3$ standardized advantage clip in
+Section~\ref{sec:method}.
 \end{itemize}
 
 \paragraph{When each formulation is preferable.}
-The three formulations are not interchangeable: each is the principled
-choice under a different calibration regime of $V_\phi$.
-\emph{prob} (\eqref{eq:advP}) is the natural statistical match when $V_\phi$
-is well-calibrated as a Bradley--Terry score, and admits a clean
-expected-terminal-reward interpretation $A^P(s_t) = r_t + \gamma\,
-\mathbb{E}[R \mid s_{t+1}] - \mathbb{E}[R \mid s_t]$ via
-\eqref{eq:ptilde}.
-\emph{value} (\eqref{eq:advV}) is preferred when $V_\phi$ has wide log-ratio
-dynamic range that the BCE objective does not directly bound, in which case
-operating on $\sigma(V_\phi)$ would discard signal at the saturation tails;
-the price is heavier-tailed advantages, controlled in our setup by
-$\pm 3$ standardized clipping.
-\emph{logprob} (\eqref{eq:advLP}) provides a smooth interpolation: it
-preserves linear sensitivity in the negative-$V_\phi$ regime (where most
-gradient signal lives early in training, when the policy is still mostly
-off-distribution) and softly compresses the positive-$V_\phi$ regime
-(where over-confident prefixes would otherwise dominate the batch). It also
-matches the information-theoretic scale of the underlying token logits used
-in the PPO ratio $\rho_t(\theta)$, which is a desirable invariance property
-under reparameterization of $\pi_\phi$.
-We treat these three as a contributed family of step-TD formulations and
-report all three on MATH-500 pass@$16$ in Section~\ref{sec:results}.
+$\Delta p$ is the default: it is the canonical match for a binary
+verifier and has the clean expected-terminal-reward interpretation
+$A^{\Delta p}(s_t) = r_t + \gamma\, \mathbb{E}[R \mid s_{t+1}] -
+\mathbb{E}[R \mid s_t]$ via \eqref{eq:vphi}. $\Delta\log p$ is an
+ablation that exchanges saturation-near-1 robustness for
+unbounded-magnitude gradients on the failure tail; we report it as
+the second formulation. We report both on MATH-500 in
+Section~\ref{sec:results}.
 
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
     width=\linewidth, height=58mm,
-    xlabel={cumulative log-ratio $V_\phi(s_t)$},
+    xlabel={prefix value $V_\phi(s_t) \in [0,1]$},
     ylabel={transformed value},
-    xmin=-6, xmax=6, ymin=-5.0, ymax=5.0,
+    xmin=0, xmax=1, ymin=-5.5, ymax=1.0,
     grid=both,
     grid style={black!12},
     legend style={font=\footnotesize, at={(0.02,0.98)}, anchor=north west, draw=black!50},
     axis line style={->},
-    xtick={-6,-4,-2,0,2,4,6},
-    ytick={-4,-2,0,2,4},
+    xtick={0,0.2,0.4,0.6,0.8,1.0},
+    ytick={-5,-4,-3,-2,-1,0,1},
     samples=121,
+    domain=0.005:0.995,
 ]
-\addplot[thick, dashed]                {x};                                                  \addlegendentry{\emph{value} $V_\phi$}
-\addplot[thick]                        {1/(1+exp(-x))};                                      \addlegendentry{\emph{prob} $\sigma(V_\phi)$}
-\addplot[thick, dotted, line width=1pt] {ln(1/(1+exp(-x)))};                                 \addlegendentry{\emph{logprob} $\log\sigma(V_\phi)$}
-\addplot[thin, gray] coordinates {(-6,0)(6,0)};
+\addplot[thick]                        {x};                  \addlegendentry{$\Delta p$: $V_\phi$}
+\addplot[thick, dotted, line width=1pt] {ln(x)};             \addlegendentry{$\Delta\log p$: $\log V_\phi$}
+\addplot[thin, gray] coordinates {(0,0)(1,0)};
 \end{axis}
 \end{tikzpicture}
-\caption{The three step-TD transforms of the prefix value $V_\phi$.
-\emph{value} (dashed) is the identity: linear sensitivity, unbounded tails.
-\emph{prob} (solid) is bounded in $[0,1]$ but saturates symmetrically, so
-prefixes the model is highly confident about contribute near-zero gradient.
-\emph{logprob} (dotted) is the smooth interpolation: linear in the
-negative-$V_\phi$ regime where most early-training signal lives, soft
-saturation toward zero in the positive-$V_\phi$ regime that compresses
-overconfident prefixes. The TD difference
+\caption{The two step-TD transforms of the prefix value $V_\phi(s_t)
+\in [0,1]$. $\Delta p$ (solid) is the identity: bounded magnitude
+$|A^{\Delta p}| \leq 1$ before standardization, but saturates near
+$V_\phi = 0$ and $V_\phi = 1$ where two prefixes the model is
+confident about contribute essentially the same gradient.
+$\Delta\log p$ (dotted) is unbounded as $V_\phi \to 0$, amplifying
+\emph{rescue} signal on the failure tail (where most early-training
+gradient lives) and compressing the high-confidence regime. Both
+transforms share the global advantage clip $|A| \leq 3$ in
+Section~\ref{sec:method}. The TD difference
 $A^*(s_t) = r_t + \gamma\,f(V_\phi(s_{t+1})) - f(V_\phi(s_t))$
 inherits the regime of $f$.}
 \label{fig:transforms}
@@ -601,12 +584,15 @@ with $\epsilon_v = 0.2$ and $\lambda_{\mathrm{GAE}} = 1.0$, value-loss
 coefficient $1.0$, critic LR $10^{-6}$.
 \item[\vineppo{}] $K=9$ Monte Carlo continuations from each non-terminal step
 boundary; step-TD advantages.
-\item[\caspo{}] \ipvrm{} prefix value model with online updates; step-TD
-advantages over $V_\phi$. We report all three step-TD formulations from
-Section~\ref{sec:transforms} (\caspo{}-\emph{value}, \caspo{}-\emph{prob},
-\caspo{}-\emph{logprob}) as separate runs, and a fourth variant
-\caspo{}-frozen-RM that uses the \emph{value} formulation but disables
-online updates of $V_\phi$ during policy training.
+\item[\caspo{}] Learned process reward model
+$V_\phi(s_t) \approx P(\text{success} \mid s_t)$, a sigmoid-head
+network trained on Monte Carlo step labels (Section~\ref{sec:phase1}),
+plugged into the step-TD advantage. We report two step-TD formulations
+(Section~\ref{sec:transforms}): \caspo{}-$\Delta p$ (default) and
+\caspo{}-$\Delta\log p$ (ablation). We additionally report
+\caspo{}-frozen-RM, which uses the Phase-1 PRM unchanged across all RL
+training, and \caspo{}-refresh, which periodically retrains the PRM
+from scratch on current-policy rollouts (Section~\ref{sec:refresh}).
 \end{description}
 
 \subsection{Hyperparameters}
@@ -890,21 +876,22 @@ evaluation runs complete. The intended structure is:
 \begin{itemize}
 \item Per-method MATH-500 pass@1 and pass@$16$ at \texttt{final}, with
 seed-level error bars over a small number of seeds (target: 3 seeds per
-method per scale). Methods include all four compared rows: \grpo{},
-\ppocritic{}, \vineppo{}, and the three \caspo{} step-TD formulations plus
-\caspo{}-frozen-RM.
-\item Per-method full-suite (MATH, College Math, OlympiadBench) pass@$16$ at
-\texttt{final}.
+method per scale). Methods include \grpo{} ($\mu{=}1$ canonical and
+$\mu{=}2$ iso-budget), \ppocritic{}, \vineppo{}, \caspo{}-$\Delta p$
+(default), \caspo{}-$\Delta\log p$ (ablation), \caspo{}-frozen-RM, and
+\caspo{}-refresh.
+\item Per-method full-suite (MATH-500, GSM8K, OlympiadBench) pass@$1$
+greedy and pass@$16$ at \texttt{final}.
 \item Training curves on MATH-500 sample evaluation at intermediate
-checkpoints (1B: every 100 outer steps; 7B: every 200 outer steps) plus
-\texttt{final}, summarizing sample efficiency.
-\item Per-formulation comparison of the three step-TD advantage variants
-(\caspo{}-\emph{value} vs.\ \caspo{}-\emph{prob} vs.\ \caspo{}-\emph{logprob})
-on MATH-500 pass@$16$, mapping the empirical winner to the calibration
+checkpoints (every 50 outer steps) plus \texttt{final}, summarizing
+sample efficiency.
+\item Per-formulation comparison of $\Delta p$ vs.\ $\Delta\log p$ on
+MATH-500 pass@$16$, mapping the empirical winner to the saturation
 regime predicted in Section~\ref{sec:transforms} and visualized in
 Figure~\ref{fig:transforms}.
-\item \caspo{}-frozen-RM vs.\ \caspo{} (default, online value updates on)
-to quantify the contribution of the online update path.
+\item \caspo{}-frozen-RM vs.\ \caspo{}-refresh to quantify the
+contribution of the iterated PRM refresh path
+(Section~\ref{sec:refresh}).
 \item \ppocritic{} vs.\ \caspo{}: contrast a per-token learned scalar
 baseline against a per-step learned prefix value, both under the same
 PPO objective and the same global PPO minibatch.
@@ -954,30 +941,24 @@ accuracy/wall-clock trade-off.
 \label{sec:limitations}
 
 \paragraph{Reward-model drift.}
-\caspo{}'s online value updates are gated by ADB and DLW corrections, but no
-correction perfectly defends against pathological feedback loops (e.g.\ a
-value head that learns to predict the policy's surface form rather than its
-correctness). The \caspo{}-frozen-RM variant in our contributed family
-isolates this risk by holding $V_\phi$ fixed during policy training, at the
-cost of distribution-shift bias.
-
-A complementary direction is \emph{periodic refresh from scratch}: at
-intervals of $k$ outer steps the prefix value model is re-trained on a
-fresh Monte-Carlo-labeled corpus drawn from the current policy and a base-
-SFT initialization, then loaded as the new $V_\phi$ for the next $k$ outer
-steps. This converts the credit model into a sequence of in-distribution
-snapshots rather than a single drifting model. The Qwen2.5-Math-1.5B
-configuration uses this iterated-refresh recipe (alternating phase length
-$k{=}150$ for the $\Delta p$ transform, $k{=}200$ for $\Delta\log p$);
-the per-refresh wall-clock cost is approximately one-tenth of one
-\vineppo{} outer-step budget at $K{=}9$, leaving the method dominated by
-RL rollout cost rather than refresh overhead. We treat refresh-PRM as a
-distinct configuration of \caspo{} rather than a separate method, since
-it changes only how $V_\phi$ is sourced and not the step-TD advantage
-construction. A complete cross-method comparison of refresh-PRM
-\caspo{} against fixed-$V_\phi$ \caspo{} and \vineppo{} on
-Qwen2.5-Math-1.5B is in progress and is the primary subject of the
-companion experimental log accompanying this manuscript.
+A frozen $V_\phi$ trained on the SFT distribution drifts out of
+calibration as the policy optimizes; the prefixes encountered later in
+training are no longer drawn from the SFT marginal. \caspo{}-frozen-RM
+isolates this risk by holding the Phase-1 PRM fixed across all RL
+training, at the cost of distribution-shift bias. \caspo{}-refresh
+(Section~\ref{sec:refresh}) addresses it directly by periodically
+retraining $V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the
+current policy: every $k$ outer steps the trainer pauses RL, collects a
+new MC corpus, retrains $V_\phi$ from the SFT init, and resumes RL with
+the new model. We use $k{=}150$ for the $\Delta p$ transform and
+$k{=}200$ for $\Delta\log p$. Per-refresh wall-clock is approximately
+one-tenth of one \vineppo{} outer-step budget at $K{=}9$, so the
+method remains dominated by RL rollout cost rather than refresh
+overhead. Neither variant is a complete defense against pathological
+feedback loops (e.g.\ a value head that learns to predict policy
+surface form rather than correctness); we report both
+\caspo{}-frozen-RM and \caspo{}-refresh to quantify the contribution
+of the refresh path.
 
 \paragraph{Cross-distribution probe-set evaluation of $V_\phi$.}
 Selecting the best refresh recipe by ranking candidate $V_\phi$ checkpoints
@@ -1018,12 +999,15 @@ extrapolates to 70B is an open systems question.
 \section{Conclusion}
 \label{sec:conclusion}
 
-We described \caspo{}, a step-level credit assignment method for reasoning
-RL that replaces \vineppo{}'s on-policy Monte Carlo prefix rollouts with an
-\ipvrm{}-style learned prefix value model and an optional online value
-update. \caspo{} fits cleanly into the same PPO clipped objective, the same
-KL constraint, and the same step-TD advantage construction used by
-\vineppo{}, isolating the credit-signal change from confounders. By unifying
+We described \caspo{}, a step-level credit assignment method for
+reasoning RL that replaces \vineppo{}'s on-policy Monte Carlo prefix
+rollouts with a learned process reward model trained on Monte Carlo
+step labels to predict $P(\text{success} \mid \text{prefix})$, and a
+periodic refresh of that model on current-policy rollouts to control
+distribution drift. \caspo{} fits cleanly into the same PPO clipped
+objective, the same KL constraint, and the same step-TD advantage
+construction used by \vineppo{}, isolating the credit-signal change
+from confounders. By unifying
 \grpo{}, \ppocritic{}, \vineppo{}, and \caspo{} under one trainer, one
 verifier, and one rollout engine, we make it possible to compare these four
 methods under identical conditions on Qwen2.5-Math-1.5B with
