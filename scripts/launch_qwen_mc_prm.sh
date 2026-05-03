@@ -32,6 +32,9 @@
 #
 #   # Phase B (training):
 #   PHI_INIT=Qwen/Qwen2.5-Math-1.5B   # PRM backbone init (use base SFT for from-scratch)
+#   REF_PATH=                          # reference model for cumulative-log-ratio
+#                                      # architecture (V_φ = log π_φ/π_ref). Empty
+#                                      # = same as PHI_INIT.
 #   LR=5e-6
 #   TRAIN_MB=4
 #   GRAD_ACCUM=2                # eff_batch = N_GPUS × TRAIN_MB × GRAD_ACCUM = 32
@@ -92,6 +95,7 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-2048}"
 MAX_TRAIN_PREFIX_LEN="${MAX_TRAIN_PREFIX_LEN:-0}"
 
 PHI_INIT="${PHI_INIT:-Qwen/Qwen2.5-Math-1.5B}"
+REF_PATH="${REF_PATH:-}"
 LR="${LR:-5e-6}"
 TRAIN_MB="${TRAIN_MB:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
@@ -173,11 +177,14 @@ for r in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES="$gpu" \
   WORLD_SIZE=4 RANK="$r" LOCAL_RANK=0 \
   MASTER_ADDR=127.0.0.1 MASTER_PORT="$TRAIN_PORT" \
+    ref_arg=()
+    [[ -n "$REF_PATH" ]] && ref_arg=(--ref_path "$REF_PATH")
     nohup "$PYBIN" -u scripts/train_value_mc.py \
     --config configs/caspo_rho1b_math.yaml \
     --data "$OUT_DIR/mc_labels.pt" \
     --output_dir "$OUT_DIR" \
     --phi_init_path "$PHI_INIT" \
+    "${ref_arg[@]}" \
     --lr "$LR" --mb "$TRAIN_MB" --grad_accum "$GRAD_ACCUM" \
     --epochs "$EPOCHS" --val_fraction "$VAL_FRACTION" \
     --early_stop_patience "$EARLY_STOP_PATIENCE" \

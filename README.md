@@ -284,10 +284,14 @@ Two new scripts encapsulate the refresh pattern:
   ep, optimizer, lr_scheduler, ref_policy=base SFT) preserved
   from Phase 1; ONLY `prefix_value_path` changes.
 
-- **`scripts/launch_caspo_alternating.sh`** — Full RL → refresh
-  PRM → resume cycles. Required env: `INITIAL_CKPT`, `INITIAL_PRM`,
-  `OUT_ROOT`. Configurable `REFRESH_EVERY` (default 150 for Δp;
-  use 200 for Δlogp due to slower drift), `TOTAL_STEPS`.
+- **`scripts/launch_caspo_alternating.sh`** — End-to-end
+  PRM → RL → PRM → RL → ... pipeline. Trains the initial PRM as
+  Phase 0, then alternates RL with PRM refresh until `TOTAL_STEPS`
+  reached. Required env: `INITIAL_CKPT`, `OUT_ROOT`, `DSR_SUB`.
+  Configurable `REFRESH_EVERY` (default 150 for Δp; 200 for Δlogp due
+  to slower drift), `TOTAL_STEPS`, `ADV_TRANSFORM` (`prob`/`logprob`),
+  `METHOD`. Pass `INITIAL_PRM=/path/...` to skip Phase 0 if a
+  pre-trained PRM is already available.
 
 Each refresh cycle uses unified `max_response_len=2048` (matches RL
 deployment cap) without prefix decoupling — train/deploy distributions

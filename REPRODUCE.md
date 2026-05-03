@@ -384,25 +384,35 @@ cap=1536 trained without decoupling achieved ρ=0.630 in-distribution,
 directly contradicting the "long prefix training is noisy" theory. See
 `docs/RM_TRAINING.md` for the full re-interpretation.)
 
-### Two-phase / alternating refresh
+### Alternating refresh (PRM → RL → PRM → RL → ...)
 
-For RL → refresh PRM → continue RL cycles:
+End-to-end pipeline. Trains the initial PRM internally as Phase 0, then
+alternates RL training with PRM refresh. Self-contained — no external
+PRM training step required.
 
 ```bash
-# Required env
-export INITIAL_CKPT=/path/to/base_or_phase1_ckpt
-export INITIAL_PRM=/path/to/initial_PRM
-export OUT_ROOT=/mnt/nvme_tmp4/jason_caspo/caspo_alternating
+# Minimal invocation: Phase 0 + alternating cycles
+INITIAL_CKPT=Qwen/Qwen2.5-Math-1.5B \
+OUT_ROOT=/mnt/data/caspo_alternating \
+DSR_SUB=/tmp/rlvr_replication/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+  bash scripts/launch_caspo_alternating.sh
 
-# Optional
-export METHOD=caspo                 # default
-export ADV_TRANSFORM=prob           # 'prob' for Δp; 'logprob' for Δlogp
-export REFRESH_EVERY=150            # 150 (Δp) or 200 (Δlogp)
-export TOTAL_STEPS=500
-export PRM_TRAIN_MAX_RESP=2048      # default; matches RL cap
-export PRM_TRAIN_PREFIX_CAP=0       # default; no decoupling
+# Optional knobs
+ADV_TRANSFORM=logprob        # 'prob' (Δp, default) or 'logprob' (Δlogp)
+REFRESH_EVERY=200            # 150 for Δp (default), 200 for Δlogp
+TOTAL_STEPS=500
+METHOD=caspo                 # default
+PRM_TRAIN_K=16 PRM_TRAIN_J=16 PRM_TRAIN_S=5
+PRM_TRAIN_MAX_RESP=2048      # matches RL cap
+PRM_TRAIN_PREFIX_CAP=0       # no decoupling
 
-bash scripts/launch_caspo_alternating.sh
+# Skip Phase 0 by providing a pre-trained PRM
+INITIAL_PRM=/path/to/prm/best \
+INITIAL_CKPT=Qwen/Qwen2.5-Math-1.5B \
+OUT_ROOT=... \
+DSR_SUB=... \
+  bash scripts/launch_caspo_alternating.sh
 ```
 
 Or, for Phase-2-only resume (RL ckpt + new PRM, preserving optimizer +
