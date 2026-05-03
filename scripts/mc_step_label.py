@@ -100,12 +100,14 @@ def main():
     else:
         ds = load_dataset(args.dataset_name, split=args.dataset_split)
     rows = list(ds)
+    # Apply num_prompts BEFORE sharding so it's a TOTAL cap across all shards
+    # (not a per-shard cap, which was the previous unintuitive behavior).
+    if args.num_prompts is not None:
+        rows = rows[: args.num_prompts]
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
         rows = rows[i::n]
         print(f"[mc] shard {args.shard}: kept {len(rows)} prompts", flush=True)
-    if args.num_prompts is not None:
-        rows = rows[: args.num_prompts]
 
     prompts, raw_questions, gts = [], [], []
     for row in rows:
