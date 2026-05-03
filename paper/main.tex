@@ -616,7 +616,7 @@ Group size $G$ & 8 & 8 \\
 Prompts per outer step & 128 & 64 \\
 Responses per outer step & 1024 & 512 \\
 Global PPO minibatch & 128 & 64 \\
-PPO epochs per rollout & 2 ($\mu{=}1$ for canonical \grpo{}\textsuperscript{a}) & 2 \\
+PPO epochs per rollout & 2 (\grpo{} reported at both $\mu{=}1$ and $\mu{=}2$\textsuperscript{a}) & 2 \\
 Policy LR & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Online value LR (\caspo{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Critic LR (\ppocritic{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
@@ -638,13 +638,14 @@ Checkpoint cadence & every 50 & every 200 \\
 
 \smallskip
 \footnotesize
-\textsuperscript{a} \grpo{} is reported under both $\mu{=}1$ (canonical
-DeepSeekMath \citep{deepseekmath2024} setting, also the default in TRL and
-verl GRPO recipes) and $\mu{=}2$ (matches \ppocritic{}/\vineppo{}/\caspo{}
-optimizer-step budget per rollout, following the \vineppo{}-paper
-GRPO baseline). The $\mu{=}1$ comparison is GRPO-faithful but gives \grpo{}
-half the policy-update budget per rollout; the $\mu{=}2$ comparison
-isolates the credit-signal change from optimizer-budget effects.
+\textsuperscript{a} \ppocritic{}, \vineppo{}, and \caspo{} are fixed at
+$\mu{=}2$ epochs per rollout, matching the upstream \vineppo{}
+configuration. \grpo{} is reported at both $\mu{=}1$ (canonical setting
+in DeepSeekMath \citep{deepseekmath2024}, TRL, and verl) and $\mu{=}2$
+(matches the optimizer-step budget per rollout of the other three
+methods, following the \vineppo{}-paper \grpo{} baseline). The $\mu{=}1$
+comparison is \grpo{}-faithful; the $\mu{=}2$ comparison isolates the
+credit-signal change from optimizer-budget effects.
 \end{table}
 
 The Qwen2.5-Math-1.5B configuration uses 1024 responses per outer step

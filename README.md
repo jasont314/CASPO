@@ -217,10 +217,10 @@ reference.
 
 | Method | Launcher | `epochs_per_rollout` | `kl_coef` | Other notable |
 |---|---|---|---|---|
-| **GRPO** | **`scripts/launch_qwen_grpo.sh`** | **1** (canonical) or **2** (iso-budget) | 0.001 | value-free baseline; group-relative terminal advantages. μ=1 = DeepSeekMath / TRL default; μ=2 = VinePPO-paper baseline. Toggle via `EPOCHS_PER_ROLLOUT=2` |
-| **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | 2 | 0.01 | VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6` |
-| **VinePPO** | **`scripts/launch_qwen_vineppo.sh`** | 2 | 0.01 | upstream MATH config K_MC=9; ⚠ ~33 min/step at K=9, drop to `VINEPPO_MC_ROLLOUTS=5` and lower `MAX_STEPS` for tractable wall-clock |
-| **CASPO** | **`scripts/launch_qwen_caspo.sh`** | 2 | 0.001 | step-TD over frozen PRM; `ADV_TRANSFORM=prob` (Δp, default) or `logprob` (Δlogp); needs `PRM_PATH` |
+| **GRPO** | **`scripts/launch_qwen_grpo.sh`** | **1 AND 2** (run both) | 0.001 | value-free baseline; group-relative terminal advantages. Reported at both μ=1 (DeepSeekMath / TRL canonical) and μ=2 (iso-budget vs PPO+critic / VinePPO / CASPO). Toggle via `EPOCHS_PER_ROLLOUT=2` |
+| **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | **2** (fixed) | 0.01 | VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6` |
+| **VinePPO** | **`scripts/launch_qwen_vineppo.sh`** | **2** (fixed) | 0.01 | upstream MATH config K_MC=9; ⚠ ~33 min/step at K=9, drop to `VINEPPO_MC_ROLLOUTS=5` and lower `MAX_STEPS` for tractable wall-clock |
+| **CASPO** | **`scripts/launch_qwen_caspo.sh`** | **2** (fixed) | 0.001 | step-TD over frozen PRM; `ADV_TRANSFORM=prob` (Δp, default) or `logprob` (Δlogp); needs `PRM_PATH` |
 | **CASPO + alternating refresh** | **`scripts/launch_caspo_alternating.sh`** | 2 | 0.001 | self-contained PRM → RL → PRM → RL pipeline. Trains initial PRM as Phase 0, then alternates RL with PRM refresh. `REFRESH_EVERY=150` (Δp) or `200` (Δlogp) |
 | **CASPO refresh (Phase 2 only)** | **`scripts/launch_caspo_refresh_resume.sh`** | 2 | 0.001 | resume from any Phase-1 ckpt with new PRM. Preserves optimizer/lr_scheduler/ref_policy from Phase 1 |
 | **MC PRM training** | **`scripts/launch_qwen_mc_prm.sh`** | – | – | unified pipeline (mc_step_label.py 4-shard collect + train_value_mc.py FSDP=4 train). Use for initial PRM (`POLICY=base`) or ad-hoc refresh |
