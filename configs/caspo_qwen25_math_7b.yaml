@@ -4,8 +4,11 @@
 # lr=1e-6, ε=0.2, γ=1.0, KL=1e-4, no critic loss, PPO clipped surrogate.
 #
 # DeepScaleR is harder than MATH-train (AIME/AMC/Olympiad-tier), so we keep
-# longer responses (4096) and use the latex-aware step splitter that handles
-# the heavy LaTeX environments these problems use.
+# the longest responses the model can handle and use the latex-aware step
+# splitter for LaTeX environments. Response length ceiling is bounded by
+# Qwen2.5-Math-7B's `max_position_embeddings=4096`: max_prompt(1024) +
+# max_response(3072) = 4096 fills the full positional range. Going past
+# 3072 here would exceed RoPE's range and produce silent garbage.
 model_name_or_path: Qwen/Qwen2.5-Math-7B
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -20,7 +23,8 @@ eval_split: test
 # final answer so the math_verifier reward fires.
 prompt_template: "Problem:\n{query}\n\nPlease reason step by step, and put your final answer within \\boxed{}.\n\nSolution:"
 max_prompt_len: 1024
-max_response_len: 4096
+max_response_len: 3072
+max_sequence_len: 4096           # Qwen2.5-Math-7B max_position_embeddings ceiling
 
 # rollout — vLLM is mandatory at 7B + 4096 max-response length; HF backend
 # is several orders of magnitude too slow here.

@@ -14,6 +14,11 @@
 #   XEVAL_DATA       cached cross-dataset rollouts; auto-built if missing
 #   K          default 8 (rollouts per prompt for cross-eval)
 #   TEMP       default 1.0 (matches V_φ training rollout temperature)
+#   PROMPT_TEMPLATE  optional; for Qwen2.5-Math V_φ caches set to:
+#       "{query}\nLet's think step by step and output the final answer within \\boxed{}."
+#       (otherwise inherits Rho-1B [MATH_TASK] template, which mismatches Qwen training)
+#   MAX_RESPONSE_LEN optional; default inherits cfg=1024. For Qwen V_φ trained
+#       at cap=2048, set MAX_RESPONSE_LEN=2048 to match training distribution.
 set -eo pipefail
 
 source /opt/conda/etc/profile.d/conda.sh
@@ -27,6 +32,8 @@ LABEL="${LABEL:?must set LABEL}"
 XEVAL_BENCHMARK="${XEVAL_BENCHMARK:-math500}"
 K="${K:-8}"
 TEMP="${TEMP:-1.0}"
+PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-}"
 
 # In-dist data path: caller can override; otherwise look for value_data.pt
 # in the same dir as the V_φ ckpt (standard layout from retrain pipeline).
@@ -73,6 +80,12 @@ if [[ ! -f "$XEVAL_DATA" ]]; then
     XEVAL_CFG_OVERRIDE=()
     if [[ -n "$XEVAL_CFG" ]]; then
         XEVAL_CFG_OVERRIDE=(--override "dataset_config=$XEVAL_CFG")
+    fi
+    if [[ -n "$PROMPT_TEMPLATE" ]]; then
+        XEVAL_CFG_OVERRIDE+=(--override "prompt_template=$PROMPT_TEMPLATE")
+    fi
+    if [[ -n "$MAX_RESPONSE_LEN" ]]; then
+        XEVAL_CFG_OVERRIDE+=(--override "max_response_len=$MAX_RESPONSE_LEN")
     fi
     CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON_BIN" -u -m scripts.collect_value_data \
         --config configs/caspo_rho1b_math.yaml \

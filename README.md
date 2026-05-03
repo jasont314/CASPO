@@ -2,22 +2,33 @@
 
 CASPO is a math-RL training stack for comparing:
 
-- `ppo`: terminal-reward PPO with a sequence-level advantage.
 - `grpo`: group-relative terminal reward advantages.
+- `ppo_critic`: PPO with a learned scalar value head (Schulman-2017).
 - `vineppo`: VinePPO-style step TD using Monte Carlo prefix rollouts.
-- `caspo`: step TD using a learned IPVRM prefix value model instead of Monte Carlo prefix rollouts.
+- `caspo`: step TD using a learned IPVRM prefix value model instead of
+  Monte Carlo prefix rollouts. Supports `Δp`, `Δlogp`, `frozen-RM`, and
+  iterated-refresh variants.
 
-The main current target is a paper-faithful Rho-1B MATH run that matches the
-VinePPO Rho-1B MATH setup where possible, while running all four methods in the
-same trainer and vLLM infrastructure.
+**Current target (May 2026): Qwen2.5-Math-1.5B + dsr_sub** (1209-prompt
+DeepScaleR subset from One-Shot-RLVR), 4-GPU FSDP. DeepSeekMath-7B on
+MATH-lighteval is retained as a paper-faithful 7B reference site.
+
+The earlier Rho-1B-MATH replication track (paper-faithful VinePPO setup
+on `realtreetune/rho-1b-sft-MATH`) is **archived**: launchers and configs
+remain in the tree for reproduction but are no longer the active research
+target. Sections describing the Rho-1B setup below are kept for historical
+context only.
 
 ## Upstream VinePPO Attribution
 
 This project is an adaptation and extension of the VinePPO experimental setup,
 not an independent reimplementation from only the paper text. We use the
-VinePPO paper and public codebase as the reference point for the Rho-1B MATH
-configuration, PPO/VinePPO hyperparameters, rollout shape, prompt template,
-evaluation protocol, and LaTeX-aware step segmentation behavior.
+VinePPO paper and public codebase as the reference point for PPO/VinePPO
+hyperparameters, rollout shape, prompt template, evaluation protocol, and
+LaTeX-aware step segmentation behavior. The current Qwen2.5-Math-1.5B +
+dsr_sub setup adapts these to the model's native template and the
+One-Shot-RLVR `dsr_sub` subset; the archived Rho-1B-MATH track is the
+verbatim VinePPO replication.
 
 Upstream VinePPO resources:
 
@@ -49,8 +60,9 @@ assignment approaches:
   backbone. Paper: `https://arxiv.org/abs/1707.06347`.
 - VinePPO: the main upstream experimental reference. VinePPO estimates
   intermediate reasoning values with Monte Carlo continuations from prefixes.
-  This repo adapts its Rho-1B MATH setup and keeps a VinePPO baseline for direct
-  comparison. Paper: `https://arxiv.org/abs/2410.01679`; code:
+  This repo keeps a VinePPO baseline for direct comparison and adapts the
+  upstream PPO recipe to Qwen2.5-Math-1.5B + dsr_sub. Paper:
+  `https://arxiv.org/abs/2410.01679`; code:
   `https://github.com/McGill-NLP/VinePPO`.
 - IPVRM: the learned prefix-value model used for CASPO's reward/value signal.
   CASPO replaces VinePPO's online MC prefix values with IPVRM-style learned
@@ -61,33 +73,30 @@ assignment approaches:
   the same clipped PPO loss implementation as the other methods. Paper:
   `https://arxiv.org/abs/2402.03300`.
 - vLLM: the rollout/eval generation engine used for high-throughput sampling
-  and CUDA-IPC trainer-to-vLLM weight sync on Rho-scale runs. Paper:
+  and CUDA-IPC trainer-to-vLLM weight sync. Paper:
   `https://arxiv.org/abs/2309.06180`.
 
 ## Current Project State
 
-This repo is a working research codebase, not a packaged library. The current
-goal is to run controlled Rho-1B MATH RL experiments comparing terminal-reward
-PPO/GRPO, Monte-Carlo-step VinePPO, and learned-prefix-value CASPO under one
-trainer, one verifier, one dataset pipeline, and the same vLLM rollout stack.
+This repo is a working research codebase, not a packaged library. The
+current goal is to run controlled RL experiments on Qwen2.5-Math-1.5B
+with the One-Shot-RLVR `dsr_sub` subset (1209 DeepScaleR prompts),
+comparing GRPO, PPO+critic, VinePPO, and CASPO (Δp / Δlogp / frozen-RM /
+iterated-refresh) under one trainer, one verifier, one dataset pipeline,
+and the same vLLM rollout stack.
 
 The current production target is:
 
 - Full-model RL fine-tuning, not LoRA.
-- Rho-1B SFT base policy on MATH.
-- 512 sampled responses per outer PPO step.
-- Four saved checkpoints per full run: `step_250`, `step_500`, `step_750`,
-  and `final`.
-- Periodic cheap sample evals; full eval only at final unless curves are
-  needed.
-- CASPO uses the already-trained offline Rho-1B IPVRM checkpoint and can update
-  that value model online during RL.
-- VinePPO has both a one-GPU launcher and a faster two-GPU DDP launcher.
-
-Important caveat: the Rho-1B one-GPU-per-method launchers are ready for the
-main comparison. The 7B configs exist, but the fast Rho path should not be
-blindly extrapolated to 7B because full-model 7B training needs sharding and
-vLLM sync becomes a different systems problem.
+- Qwen2.5-Math-1.5B SFT base policy on `dsr_sub` (1209 DeepScaleR prompts).
+- 1024 sampled responses per outer PPO step (128 prompts × G=8).
+- Saved checkpoints every 50 outer steps for trajectory-aware eval.
+- 4-GPU FSDP + colocated rank-local vLLM, full-model fine-tuning.
+- CASPO uses an MC-trained Qwen-1.5B PRM and can update online during RL,
+  or refresh from scratch periodically against current-policy rollouts
+  (alternating launcher).
+- DeepSeekMath-7B on MATH-lighteval is retained as a paper-faithful 7B
+  reference; runs on the same trainer with model+data+template overrides.
 
 ## Repository Map
 
@@ -124,15 +133,15 @@ configs/value_smoke.yaml               Tiny phase-1 value smoke
 Launch/eval scripts:
 
 ```text
-scripts/launch_rho1b_parallel.sh       PPO/CASPO/GRPO/VinePPO, one GPU each
-scripts/launch_rho1b_all8_standard.sh  Full seven-run, eight-GPU suite
-scripts/launch_rho1b_{grpo,ppo,caspo}.sh
-scripts/launch_rho1b_caspo_delta_{prob,log_prob}.sh
-scripts/launch_rho1b_vineppo_ddp2.sh   Fast two-GPU VinePPO DDP path
-scripts/launch_rho1b_caspo_ablations.sh
-scripts/launch_rho1b_caspo_frozen_rm.sh
+scripts/archive/rho1b/launch_rho1b_parallel.sh       PPO/CASPO/GRPO/VinePPO, one GPU each
+scripts/archive/rho1b/launch_rho1b_all8_standard.sh  Full seven-run, eight-GPU suite
+scripts/archive/rho1b/launch_rho1b_{grpo,ppo,caspo}.sh
+scripts/archive/rho1b/launch_rho1b_caspo_delta_{prob,log_prob}.sh
+scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh   Fast two-GPU VinePPO DDP path
+scripts/archive/rho1b/launch_rho1b_caspo_ablations.sh
+scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh
 scripts/launch_eval_all.sh
-scripts/launch_eval_rho1b_{sample,final}_all8.sh
+scripts/archive/rho1b/launch_eval_rho1b_{sample,final}_all8.sh
 scripts/train_value.py                 Phase-1 IPVRM training
 scripts/train_caspo.py                 Phase-2 RL entrypoint
 scripts/collect_value_data.py          Phase-1 rollout data collection
@@ -178,13 +187,14 @@ VinePPO's expensive MC continuation phase.
 
 ## Qwen2.5-Math-1.5B + dsr_sub Setup (May 2026)
 
-The Rho-1B-MATH setup below is the original VinePPO-replication target.
-The **current paper setup uses Qwen2.5-Math-1.5B + dsr_sub** (the 1209-prompt
-DeepScaleR subset from One-Shot-RLVR), 4-GPU FSDP. Same trainer code, same
-config file (`configs/caspo_rho1b_math.yaml`), but different
-`model_name_or_path`, `dataset_name`, `prompts_per_step`, `max_response_len`,
-`epochs_per_rollout`. The Rho-1B section retains the original numbers for
-infrastructure-level reference.
+The **current paper setup uses Qwen2.5-Math-1.5B + dsr_sub** (the
+1209-prompt DeepScaleR subset from One-Shot-RLVR), 4-GPU FSDP, and is the
+active research target. Same trainer code, same config file
+(`configs/caspo_rho1b_math.yaml`, reused as the trainer-config schema),
+but different `model_name_or_path`, `dataset_name`, `prompts_per_step`,
+`max_response_len`, `epochs_per_rollout`. The archived Rho-1B-MATH section
+near the bottom of this document retains the historical numbers for
+reference.
 
 | Field | Qwen2.5-Math-1.5B value |
 |---|---|
@@ -192,7 +202,8 @@ infrastructure-level reference.
 | Dataset | `dsr_sub.jsonl` (1209 DeepScaleR prompts; One-Shot-RLVR subset) |
 | Eval | `math500`, `gsm8k`, `olympiadbench` (greedy, k=1, T=0) |
 | Prompt template | `{query}\nLet's think step by step and output the final answer within \boxed{}.` |
-| Response budget | **3072 tokens** (Qwen2.5-Math produces longer CoTs than Rho-1B) |
+| Response budget | **2048 tokens** (catches p98 of CORRECT Qwen2.5-Math-1.5B chains on dsr_sub, n=800 empirical; 2026-05-03 update). Truncates ~8% overall but only ~2% of correct chains — the truncated tail is overwhelmingly failed/rambling chains, which is the seq_len penalty signal. |
+| Sequence budget | **3072 tokens** (max_prompt=1024 + max_response=2048; well within Qwen `max_position_embeddings=4096`) |
 | Rollout group | `group_size=8` |
 | Prompts per step | `128` (= 1024 responses per outer step at G=8) |
 | Topology | **FSDP=4 + colocated vLLM**, `vllm_gpu_memory_utilization=0.45` (CASPO) or `0.35` (PPO+critic, leaves room for critic) |
@@ -206,10 +217,13 @@ infrastructure-level reference.
 
 | Method | Launcher | `epochs_per_rollout` | `kl_coef` | Other notable |
 |---|---|---|---|---|
-| GRPO | `launch_grpo_full.sh` (in-tree) or analogous | 1 | 0.001 | no critic, group baseline |
-| CASPO Δp | `launch_caspo_full.sh` | 1 | 0.001 | `caspo_advantage_transform=prob` |
-| CASPO Δlogp | (override `caspo_advantage_transform=logprob`) | 1 | 0.001 | logsigmoid asymmetry |
+| GRPO | `launch_grpo_full.sh` (in-tree) or analogous | 2 | 0.001 | no critic, group baseline |
+| CASPO Δp | `launch_caspo_full.sh` | 2 | 0.001 | `caspo_advantage_transform=prob` (was 1 pre-2026-05-03; updated to match upstream) |
+| CASPO Δlogp | (override `caspo_advantage_transform=logprob`) | 2 | 0.001 | logsigmoid asymmetry |
 | **PPO+critic** | **`scripts/launch_qwen_ppo_critic.sh`** | **2** | **0.01** | **VinePPO PPO baseline config: `lambda=1.0`, `value_loss_coef=1.0`, `cliprange_value=0.2`, `critic_lr=1e-6`** |
+| **VinePPO** | **`scripts/launch_qwen_vineppo.sh`** (new 2026-05-02) | **2** | **0.01** | **VinePPO upstream MATH config: K_MC=9, no learned value model, `vllm_max_num_seqs=512`, `max_inflight_requests=1024` (faster than upstream's 128 at our scale)** |
+| **CASPO + alternating refresh** | **`scripts/launch_caspo_alternating.sh`** (new) | 2 | 0.001 | full RL → refresh PRM → resume cycle. `REFRESH_EVERY=150` (Δp) or `200` (Δlogp). Refresh-PRM collection at `max_resp=2048, max_train_prefix_len=0` (= match collection cap; train/deploy aligned). |
+| **CASPO refresh (Phase 2 only)** | **`scripts/launch_caspo_refresh_resume.sh`** (new) | 2 | 0.001 | resume from any Phase-1 ckpt with new PRM. Preserves optimizer/lr_scheduler/ref_policy from Phase 1. |
 
 ### PPO+critic recipe — exact config
 
@@ -260,11 +274,70 @@ doesn't anchor to the rolling policy). Without these, refresh
 collapses (math500 −28pp). See
 `feedback_resume_optimizer_state.md` in session memory.
 
+### Two-phase / alternating refresh (2026-05-03)
+
+Two new scripts encapsulate the refresh pattern:
+
+- **`scripts/launch_caspo_refresh_resume.sh`** — Phase 2 only.
+  Resume from any Phase-1 ckpt with a NEW PRM. Required env:
+  `POLICY_CKPT`, `NEW_PRM`, `OUT_DIR`. All other hparams (lr, kl,
+  ep, optimizer, lr_scheduler, ref_policy=base SFT) preserved
+  from Phase 1; ONLY `prefix_value_path` changes.
+
+- **`scripts/launch_caspo_alternating.sh`** — Full RL → refresh
+  PRM → resume cycles. Required env: `INITIAL_CKPT`, `INITIAL_PRM`,
+  `OUT_ROOT`. Configurable `REFRESH_EVERY` (default 150 for Δp;
+  use 200 for Δlogp due to slower drift), `TOTAL_STEPS`.
+
+Each refresh cycle uses unified `max_response_len=2048` (matches RL
+deployment cap) without prefix decoupling — train/deploy distributions
+stay aligned. Empirically: 2048 catches p98 of correct Qwen2.5-Math-1.5B
+chains (1613 tokens), and the ~8% of all chains it truncates are
+overwhelmingly failed/rambling — exactly what the seq_len penalty is
+designed to discourage.
+
+### PRM training recipe (unified at 2048, 2026-05-03)
+
+Best PRM config (ρ=0.456 vs orig PRM 0.443) on 4-GPU FSDP:
+
+```
+COLLECTION (mc_step_label.py — 4-shard parallel):
+  --K 16 --J 16 --steps_per_response 5
+  --max_prompt_len 1024 --max_response_len 2048
+  --max_train_prefix_len 0           # = match collection cap (default)
+  --temperature 1.0 --top_p 1.0 --seed 0
+
+TRAINING (train_value_mc.py — FSDP=4):
+  --lr 5e-6 --mb 4 --grad_accum 2     # eff_batch = 4×4×2 = 32
+  --epochs 2                          # ρ saturates ~step_3500 ≈ 2 epochs
+  --val_fraction 0.1                  # matches orig PRM
+  --early_stop_patience 999           # no early stop; let val select best
+  --beta 10.0 --seed 0
+```
+
+Key lessons from sweep (2026-05-02 to 2026-05-03):
+- `eff_batch` matters: mb=1 (eff=4) → ρ=0.35; mb=4 acc=2 (eff=32) → ρ=0.45
+- ep=1 ≈ ep=2 ≈ ep=3 (within 0.01); ep=2 sweet spot
+- K=4 (eff=16) < K=8 (eff=32) only because of compute, not K diversity per se
+- J subsampling not supported by current data format (J=16 always)
+- The earlier "1024 ≫ 1792 (-0.10 ρ)" finding was confounded with
+  probe-cap mismatch: probe was at cap=1024, so 1792-trained PRMs got
+  scored OOD on their long-prefix half. v3 refresh at cap=1536 trained
+  without prefix decoupling → ρ=0.630 in-dist, confirming longer-cap
+  training is fine when train/probe distributions match.
+
 ---
 
-## Current Rho-1B MATH Setup
+## Rho-1B MATH Setup (ARCHIVED)
 
-Main config: `configs/caspo_rho1b_math.yaml`
+> ⚠️ **This section is archived.** The Rho-1B-MATH replication track is no
+> longer the active research target. Sections below describe the historical
+> setup; launchers and configs remain in the tree for reproducibility but
+> have been superseded by the Qwen2.5-Math-1.5B + dsr_sub setup above.
+
+Main config: `configs/caspo_rho1b_math.yaml` (note: this YAML is still the
+trainer-config schema reused by Qwen launchers via `--override`; the
+defaults below are for the Rho-1B run, not the Qwen run)
 
 | Field | Current value |
 |---|---|
@@ -589,7 +662,7 @@ Use GPUs 4-7. Each method gets one H100:
 ```bash
 cd /home/jason/experiment/CASPO
 RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_parallel.sh
+  ./scripts/archive/rho1b/launch_rho1b_parallel.sh
 ```
 
 Default mapping:
@@ -614,7 +687,7 @@ With `RUN_TAG=paper512_seed0`, outputs are:
 You can override the default cadence and run length:
 
 ```bash
-SAVE_EVERY=100 MAX_STEPS=300 RUN_TAG=debug ./scripts/launch_rho1b_parallel.sh
+SAVE_EVERY=100 MAX_STEPS=300 RUN_TAG=debug ./scripts/archive/rho1b/launch_rho1b_parallel.sh
 ```
 
 ## Standard 8-GPU Suite
@@ -624,13 +697,13 @@ GPUs. The default map is:
 
 | Experiment | GPUs | Script | Output tag |
 |---|---:|---|---|
-| GRPO | 0 | `scripts/launch_rho1b_grpo.sh` | `grpo` |
-| PPO+critic | 1 | `scripts/launch_rho1b_ppo_critic.sh` | `ppo_critic` |
-| VinePPO K=9 DDP2 | 2,3 | `scripts/launch_rho1b_vineppo_ddp2.sh` | `vineppo_ddp2` |
-| CASPO online RM | 4 | `scripts/launch_rho1b_caspo.sh` | `caspo` |
-| CASPO delta-prob | 5 | `scripts/launch_rho1b_caspo_delta_prob.sh` | `caspo_prob` |
-| CASPO delta-log-prob | 6 | `scripts/launch_rho1b_caspo_delta_log_prob.sh` | `caspo_logprob` |
-| CASPO frozen RM | 7 | `scripts/launch_rho1b_caspo_frozen_rm.sh` | `caspo_frozen_rm` |
+| GRPO | 0 | `scripts/archive/rho1b/launch_rho1b_grpo.sh` | `grpo` |
+| PPO+critic | 1 | `scripts/archive/rho1b/launch_rho1b_ppo_critic.sh` | `ppo_critic` |
+| VinePPO K=9 DDP2 | 2,3 | `scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh` | `vineppo_ddp2` |
+| CASPO online RM | 4 | `scripts/archive/rho1b/launch_rho1b_caspo.sh` | `caspo` |
+| CASPO delta-prob | 5 | `scripts/archive/rho1b/launch_rho1b_caspo_delta_prob.sh` | `caspo_prob` |
+| CASPO delta-log-prob | 6 | `scripts/archive/rho1b/launch_rho1b_caspo_delta_log_prob.sh` | `caspo_logprob` |
+| CASPO frozen RM | 7 | `scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh` | `caspo_frozen_rm` |
 
 (The legacy critic-free `launch_rho1b_ppo.sh` is preserved but **not** part
 of the standard suite — "PPO" in the head-to-head means PPO+critic, the
@@ -641,19 +714,19 @@ Launch all seven jobs at once:
 ```bash
 cd /home/jason/experiment/CASPO
 RUN_TAG=paper512_seed0 GPU_LIST="0 1 2 3 4 5 6 7" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_all8_standard.sh
+  ./scripts/archive/rho1b/launch_rho1b_all8_standard.sh
 ```
 
 Or launch a single job by overriding its GPU:
 
 ```bash
-RUN_TAG=paper512_seed0 GPU=0 WANDB_MODE=offline ./scripts/launch_rho1b_grpo.sh
-RUN_TAG=paper512_seed0 GPU=1 WANDB_MODE=offline ./scripts/launch_rho1b_ppo_critic.sh
-RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline ./scripts/launch_rho1b_vineppo_ddp2.sh
-RUN_TAG=paper512_seed0 GPU=4 WANDB_MODE=offline ./scripts/launch_rho1b_caspo.sh
-RUN_TAG=paper512_seed0 GPU=5 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_delta_prob.sh
-RUN_TAG=paper512_seed0 GPU=6 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_delta_log_prob.sh
-RUN_TAG=paper512_seed0 GPU=7 WANDB_MODE=offline ./scripts/launch_rho1b_caspo_frozen_rm.sh
+RUN_TAG=paper512_seed0 GPU=0 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_grpo.sh
+RUN_TAG=paper512_seed0 GPU=1 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_ppo_critic.sh
+RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
+RUN_TAG=paper512_seed0 GPU=4 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_caspo.sh
+RUN_TAG=paper512_seed0 GPU=5 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_caspo_delta_prob.sh
+RUN_TAG=paper512_seed0 GPU=6 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_caspo_delta_log_prob.sh
+RUN_TAG=paper512_seed0 GPU=7 WANDB_MODE=offline ./scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh
 ```
 
 All seven scripts use `configs/caspo_rho1b_math.yaml`, vLLM IPC sync,
@@ -676,7 +749,7 @@ additional CASPO ablations with:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="4 5" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_caspo_ablations.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_ablations.sh
 ```
 
 Default ablation outputs:
@@ -690,7 +763,7 @@ To include the direct-value run in an ablation-only sweep:
 
 ```bash
 ADV_VARIANTS="value prob logprob" GPU_LIST="4 5 6" \
-  ./scripts/launch_rho1b_caspo_ablations.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_ablations.sh
 ```
 
 Frozen-RM CASPO keeps IPVRM prefix scoring but disables online value-model
@@ -698,7 +771,7 @@ updates:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="4" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_caspo_frozen_rm.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh
 ```
 
 Output:
@@ -716,7 +789,7 @@ current 512-response global outer step:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_vineppo_ddp2.sh
+  ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
 ```
 
 Default DDP shape:
@@ -742,7 +815,7 @@ Recommended fastest tested Rho-1B DDP settings:
 MICRO_BATCH_SIZE=4 GRAD_ACCUM_STEPS=8 USE_GRADIENT_CHECKPOINTING=false \
 LOGPROB_MICRO_BATCH_SIZE=16 CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.55 \
 RUN_TAG=paper512_seed0 GPU_LIST="2 3" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_vineppo_ddp2.sh
+  ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
 ```
 
 Useful optional knobs:
@@ -796,7 +869,7 @@ For an infrastructure smoke:
 ```bash
 MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
 GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
-GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
+GPU_LIST="2 3" WANDB_MODE=disabled ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
 ```
 
 ## Evaluation
@@ -812,7 +885,7 @@ Standard seven-method sample eval:
 
 ```bash
 RUN_TAG=paper512_seed0 CKPT_SUBDIR=step_250 \
-EVAL_GPU_LIST="0 1 2 3 4 5 6" ./scripts/launch_eval_rho1b_sample_all8.sh
+EVAL_GPU_LIST="0 1 2 3 4 5 6" ./scripts/archive/rho1b/launch_eval_rho1b_sample_all8.sh
 ```
 
 This defaults to `math500`, `EVAL_LIMIT=100`, and `EVAL_K=8`. On Rho-1B, the
@@ -825,7 +898,7 @@ Standard seven-method full final eval:
 
 ```bash
 RUN_TAG=paper512_seed0 EVAL_GPU_LIST="0 1 2 3 4 5 6" \
-  ./scripts/launch_eval_rho1b_final_all8.sh
+  ./scripts/archive/rho1b/launch_eval_rho1b_final_all8.sh
 ```
 
 This runs `math500,math,collegemath,olympiadbench` at `k=16`. The prior
@@ -912,7 +985,7 @@ Each knob is overridable from the launcher CLI for safety:
 ```bash
 MICRO_BATCH_SIZE=1 GRAD_ACCUM_STEPS=64 USE_GRADIENT_CHECKPOINTING=true \
 CASPO_VLLM_GPU_MEMORY_UTILIZATION=0.45 \
-RUN_TAG=conservative ./scripts/launch_rho1b_caspo.sh
+RUN_TAG=conservative ./scripts/archive/rho1b/launch_rho1b_caspo.sh
 ```
 
 ### Round 2 optimizations (Apr 2026)
@@ -1327,12 +1400,12 @@ machine; teammates run the four below as ablations:
 
 # Example: friend's box, GPU 0, run tag "ablation_seed0"
 ROOT=/path/to/output GPU=0 RUN_TAG=ablation_seed0 \
-  bash scripts/launch_rho1b_caspo_frozen_rm.sh
+  bash scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh
 
 # If V_φ checkpoint isn't at the YAML default path on friend's box:
 ROOT=/path/to/output GPU=0 RUN_TAG=ablation_seed0 \
 PREFIX_VALUE_PATH=/path/to/local/value_final \
-  bash scripts/launch_rho1b_caspo_delta_log_prob.sh
+  bash scripts/archive/rho1b/launch_rho1b_caspo_delta_log_prob.sh
 ```
 
 **Required pre-flight**: the YAML's `prefix_value_path` defaults to a
@@ -1353,7 +1426,7 @@ Each variant takes ~16 hours on a single H100 80GB.
 
 ### 4-method parallel launcher (Rho-1B, four NVMe drives)
 
-`scripts/launch_rho1b_4method_split.sh` runs GRPO + PPO+Critic +
+`scripts/archive/rho1b/launch_rho1b_4method_split.sh` runs GRPO + PPO+Critic +
 CASPO + CASPO Δp concurrently on GPUs 4-7 (or the user's
 `GPU_LIST`). Each method writes its checkpoints to its own NVMe
 drive so 10 ckpts/run × 4 runs (save_every=100 × 1000 steps) all

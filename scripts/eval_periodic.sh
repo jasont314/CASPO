@@ -3,13 +3,20 @@
 # as it appears under one or more run output dirs. Decoupled from the
 # trainer — no code changes required, just run alongside training.
 #
-# Usage:
-#   ./scripts/eval_periodic.sh \
-#       --gpu 7 \
-#       --config configs/caspo_rho1b_math.yaml \
-#       --k 8 --limit 100 --temperature 0.7 \
-#       /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_paper_seed0 \
-#       /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_frozen_rm_paper_seed0
+# Defaults are tuned for Rho-1B-MATH (cfg=caspo_rho1b_math.yaml,
+# [MATH_TASK] template, max_response_len=1024). For Qwen2.5-Math-1.5B
+# runs, you MUST override --config (or pass --prompt-template and
+# --max-new-tokens) — otherwise the launcher silently uses the wrong
+# template and truncates responses at 1024, hiding 30+pp of Qwen gains.
+#
+# Usage (Rho-1B):
+#   ./scripts/eval_periodic.sh --gpu 7 \
+#       /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_caspo_paper_seed0
+#
+# Usage (Qwen2.5-Math-1.5B):
+#   ./scripts/eval_periodic.sh --gpu 7 --max-new-tokens 2048 \
+#       --prompt-template '{query}\nLet'\''s think step by step and output the final answer within \boxed{}.' \
+#       /mnt/nvme_tmp4/jason_caspo/qwen15b_rlvr_dsr_sub
 #
 # Each step_N/ dir gets evaluated exactly once; result lands at
 # step_N/eval.json. Uses --gpu-memory-utilization=0.30 to share with
@@ -22,6 +29,8 @@ CONFIG="${CONFIG:-configs/caspo_rho1b_math.yaml}"
 K="${K:-8}"
 LIMIT="${LIMIT:-100}"
 TEMP="${TEMP:-0.7}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"   # empty = inherit cfg.max_response_len
+PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-}" # empty = inherit cfg.prompt_template
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 
 declare -a RUN_DIRS=()
@@ -33,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --k) K="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         --temperature) TEMP="$2"; shift 2 ;;
+        --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
+        --prompt-template) PROMPT_TEMPLATE="$2"; shift 2 ;;
         --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
         --) shift; RUN_DIRS+=("$@"); break ;;
         -*) echo "[eval_watcher] unknown flag: $1" >&2; exit 2 ;;
@@ -56,11 +67,15 @@ run_eval() {
     local out="$ckpt_dir/eval.json"
     local logf="$ckpt_dir/eval.log"
     if [[ -f "$out" ]]; then return 0; fi
+    local extra=()
+    if [[ -n "$MAX_NEW_TOKENS" ]]; then extra+=(--max-new-tokens "$MAX_NEW_TOKENS"); fi
+    if [[ -n "$PROMPT_TEMPLATE" ]]; then extra+=(--override "prompt_template=$PROMPT_TEMPLATE"); fi
     echo "[eval_watcher] evaluating $ckpt_dir"
     CUDA_VISIBLE_DEVICES="$EVAL_GPU" \
         "$PYTHON_BIN" -u scripts/eval.py \
             --config "$CONFIG" \
             --override "model_name_or_path=$ckpt_dir" \
+            "${extra[@]}" \
             --benchmarks math500 \
             --k "$K" --limit "$LIMIT" \
             --temperature "$TEMP" --top-p 0.9 \

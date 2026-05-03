@@ -160,23 +160,30 @@ The full-batch variant is what current CASPO Δp uses. The per-prompt-group vari
 
 ```
 Phase 0 (one-time):
-  Train initial MC PRM at base policy (~50 min, AUC=0.90)
+  Train initial MC PRM at base policy (~91 min total at unified 2048 cap)
+    - collection: ~41 min on 4 GPUs (N=1209, K=16, J=16, max_resp=2048)
+    - training:   ~50 min FSDP=4, ep=2, mb=4 grad_accum=2, lr=5e-6
 
-For phase t = 1, 2, ..., T (every k=100 RL steps):
+For phase t = 1, 2, ..., T (every k=150 RL steps for Δp; 200 for Δlogp):
   1. Snapshot current policy π_t
-  2. Generate ~2K rollouts from π_t on RL prompt set      (~5 min)
-  3. MC-label at random token positions, K=8, J=8         (~10 min)
-  4. APPEND to cumulative replay buffer (don't replace)
-  5. Fine-tune PRM_{t-1} on cumulative buffer:
-     - target within-AUC ≈ 0.83 (~step 1500 from cold)
-     - or warm-start from PRM_{t-1} for 1000 steps
-                                                          (~10-15 min)
-  6. Use PRM_t as critic for next k RL steps
+  2. Re-collect MC labels at π_t                          (~41 min, K=16, J=16)
+  3. Train PRM from scratch (NOT warm-start — see RM_TRAINING.md axis C)
+     init from base SFT (Qwen2.5-Math-1.5B), full-FT      (~50 min)
+  4. Use PRM_t as critic for next k RL steps
 ```
 
-**Refresh cost per phase**: ~25-30 min.
-**Total over 500-step RL run**: 5 phases × ~30 min = **2.5 hours additional compute**.
-**Wall-clock impact**: zero if PRM refresh runs on idle GPUs in parallel with RL.
+**Refresh cost per phase (at unified 2048 cap)**: ~91 min wall-clock total
+(~13 GPU-h on 4 GPUs collection + 4 GPUs training).
+**Total over 500-step RL run**: 3 phases (Δp, REFRESH=150) × ~91 min ≈
+**4.5 hours additional compute**, or 2 phases (Δlogp, REFRESH=200) × ~91 min ≈
+**3.0 hours**.
+**Wall-clock impact**: ~zero if PRM refresh runs on idle GPUs in parallel
+with RL, but each refresh requires ~13 GPU-h of compute to be available.
+
+(Earlier estimate of ~25-30 min/refresh assumed warm-start fine-tuning at
+max_resp=1024 with append-replay-buffer; superseded by the from-scratch
+recipe at unified 2048 cap which empirically gives higher ρ — see
+RM_TRAINING.md sweep findings.)
 
 ### Hyperparameters
 - k (refresh interval): 100 RL steps (start) — ablate over {50, 100, 200}

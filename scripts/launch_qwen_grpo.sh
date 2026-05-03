@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# PPO+critic baseline for Qwen2.5-Math-1.5B on dsr_sub (One-Shot-RLVR
-# replication subset). Matches VinePPO upstream's PPO baseline config:
-#   - num_epochs_per_iteration = 2
-#   - ppo_gae_lambda = 1.0 (terminal verifier reward only)
-#   - value_loss_coef = 1.0
-#   - cliprange_value = 0.2
-#   - clip_eps = 0.2
-#   - critic_lr = policy_lr = 1e-6
+# GRPO baseline for Qwen2.5-Math-1.5B on dsr_sub (One-Shot-RLVR
+# replication subset). Group-relative terminal-reward advantages with
+# G=8; no learned value model, no Monte Carlo prefix rollouts.
 #
-# This is the canonical PPO+critic baseline against which CASPO Δp /
-# Δlogp / VinePPO are compared in the paper.
+# This is the value-free baseline for the paper comparison against
+# PPO+critic, VinePPO, and CASPO (Δp / Δlogp / refresh).
 #
 # ---- Configurable env vars (override before running) ----
 #
@@ -18,11 +13,11 @@
 #   GPU_LIST="0 1 2 3"          # 4 GPUs; FSDP requires exactly 4 ranks here
 #   DSR_SUB=/path/to/dsr_sub.jsonl  # the 1209-prompt One-Shot-RLVR JSONL
 #   OUT_DIR=/path/to/outputs
-#   LOG_DIR=/tmp/ppo_critic_$(date +%H%M)
-#   MAX_STEPS=500               # 500 RL outer iterations (~21h on 4×A100 80GB)
+#   LOG_DIR=/tmp/grpo_$(date +%H%M)
+#   MAX_STEPS=500               # 500 RL outer iterations
 #   SAVE_EVERY=50               # ckpt every 50 steps
-#   KL_COEF=0.01                # 1B-stable; VinePPO upstream uses 1e-4 at 7B
-#                               # (1e-4 caused divergence at 1B in our runs)
+#   KL_COEF=0.001               # 1B-stable; same as CASPO/VinePPO at this scale
+#   EPOCHS_PER_ROLLOUT=1        # GRPO upstream uses 1 (single-pass over rollouts)
 #   RUN_EVAL=true               # auto-eval all saved ckpts after training
 #                               # on math500/gsm8k/olympiadbench. Set false
 #                               # to skip eval and just train.
@@ -36,13 +31,13 @@
 #   3. Dataset: dsr_sub.jsonl from One-Shot-RLVR replication
 #      (1209 DeepScaleR prompts; SHA256 verifiable from paper repo)
 #   4. Disk: ~80 GB free for ckpts (10 saves × ~7 GB each at
-#      save_optimizer_state=false; ~190 GB if save_optim=true)
+#      save_optimizer_state=false)
 #   5. Hardware: 4× A100 80GB or H100 80GB (FSDP=4, colocated vLLM at
-#      gpu_memory_utilization=0.35)
+#      gpu_memory_utilization=0.45)
 #
 # ---- ETA ----
-#   ~21h on 4×A100 80GB (~150s/step × 500 steps)
-#   ~14h on 4×H100 80GB (faster compute + NVLink)
+#   ~12h on 4×A100 80GB (~85s/step × 500 steps)
+#   ~8h on 4×H100 80GB
 #
 set -o pipefail
 
@@ -82,40 +77,41 @@ N_GPUS=${#GPUS[@]}
 DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
 [[ -f "$DSR_SUB" ]] || { echo "ERROR: dataset not found: $DSR_SUB"; echo "  Set DSR_SUB env var to dsr_sub.jsonl path"; exit 1; }
 
-OUT_DIR="${OUT_DIR:-./ppo_critic_qwen25math15b_dsr_sub}"
-LOG_DIR="${LOG_DIR:-/tmp/ppo_critic_$(date +%Y%m%d_%H%M)}"
+OUT_DIR="${OUT_DIR:-./grpo_qwen25math15b_dsr_sub}"
+LOG_DIR="${LOG_DIR:-/tmp/grpo_$(date +%Y%m%d_%H%M)}"
 MAX_STEPS="${MAX_STEPS:-500}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
-KL_COEF="${KL_COEF:-0.01}"
+KL_COEF="${KL_COEF:-0.001}"
+EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-1}"
 SAVE_OPTIMIZER_STATE="${SAVE_OPTIMIZER_STATE:-false}"
 
 mkdir -p "$OUT_DIR/logs" "$LOG_DIR"
 
-echo "[ppo-critic] $(date +%H:%M:%S) === START ==="
-echo "[ppo-critic] model:       Qwen/Qwen2.5-Math-1.5B"
-echo "[ppo-critic] dataset:     $DSR_SUB"
-echo "[ppo-critic] GPUs:        ${GPUS[*]}"
-echo "[ppo-critic] output:      $OUT_DIR"
-echo "[ppo-critic] logs:        $LOG_DIR"
-echo "[ppo-critic] max_steps:   $MAX_STEPS"
-echo "[ppo-critic] save_every:  $SAVE_EVERY"
-echo "[ppo-critic] kl_coef:     $KL_COEF"
-echo "[ppo-critic] config: matches VinePPO PPO baseline (epochs=2, lambda=1.0)"
-echo "[ppo-critic] ETA: ~150s/step × $MAX_STEPS = $((MAX_STEPS * 150 / 3600))h"
+echo "[grpo] $(date +%H:%M:%S) === START ==="
+echo "[grpo] model:       Qwen/Qwen2.5-Math-1.5B"
+echo "[grpo] dataset:     $DSR_SUB"
+echo "[grpo] GPUs:        ${GPUS[*]}"
+echo "[grpo] output:      $OUT_DIR"
+echo "[grpo] logs:        $LOG_DIR"
+echo "[grpo] max_steps:   $MAX_STEPS"
+echo "[grpo] save_every:  $SAVE_EVERY"
+echo "[grpo] kl_coef:     $KL_COEF"
+echo "[grpo] epochs/roll: $EPOCHS_PER_ROLLOUT"
+echo "[grpo] ETA: ~85s/step × $MAX_STEPS = $((MAX_STEPS * 85 / 3600))h"
 
 PORT=$((30000 + RANDOM % 5000))
 PIDS=()
 for r in 0 1 2 3; do
   gpu="${GPUS[$r]}"
-  log="$LOG_DIR/ppo_critic_rank${r}.log"
-  echo "[ppo-critic] launching rank $r on GPU $gpu (log: $log)"
+  log="$LOG_DIR/grpo_rank${r}.log"
+  echo "[grpo] launching rank $r on GPU $gpu (log: $log)"
   CUDA_VISIBLE_DEVICES="$gpu" \
   WORLD_SIZE=4 RANK="$r" LOCAL_RANK=0 \
   MASTER_ADDR=127.0.0.1 MASTER_PORT="$PORT" \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
     nohup "$PYBIN" -u -m scripts.train_caspo \
     --config configs/caspo_rho1b_math.yaml \
-    --override "method=ppo_critic" \
+    --override "method=grpo" \
     --override "model_name_or_path=Qwen/Qwen2.5-Math-1.5B" \
     --override "tokenizer_name_or_path=Qwen/Qwen2.5-Math-1.5B" \
     --override "trust_remote_code=true" \
@@ -139,22 +135,16 @@ for r in 0 1 2 3; do
     --override "lr=1.0e-6" \
     --override "kl_coef=$KL_COEF" \
     --override "kl_estimator=k3" \
-    --override "value_loss_coef=1.0" \
-    --override "cliprange_value=0.2" \
-    --override "ppo_gae_lambda=1.0" \
-    --override "critic_lr=1.0e-6" \
-    --override "critic_weight_decay=0.0" \
-    --override "critic_grad_clip=1.0" \
     --override "clip_eps_low=0.2" \
     --override "clip_eps_high=0.2" \
     --override "max_steps=$MAX_STEPS" \
     --override "save_every=$SAVE_EVERY" \
     --override "save_optimizer_state=$SAVE_OPTIMIZER_STATE" \
     --override "eval_every=999999" \
-    --override "epochs_per_rollout=2" \
+    --override "epochs_per_rollout=$EPOCHS_PER_ROLLOUT" \
     --override "rollout_backend=vllm" \
     --override "vllm_weight_sync_backend=ipc" \
-    --override "vllm_gpu_memory_utilization=0.35" \
+    --override "vllm_gpu_memory_utilization=0.45" \
     --override "vllm_kv_cache_dtype=fp8" \
     --override "vllm_enforce_eager=false" \
     --override "vllm_multi_sample_mode=auto" \
@@ -163,36 +153,30 @@ for r in 0 1 2 3; do
     --override "compile=false" \
     --override "wandb_mode=disabled" \
     --override "output_dir=$OUT_DIR" \
-    --override "wandb_run_name=ppo_critic_qwen25math15b_dsr" \
+    --override "wandb_run_name=grpo_qwen25math15b_dsr" \
     --override "distributed_backend=fsdp" \
     > "$log" 2>&1 &
   PIDS+=("$!")
 done
-echo "[ppo-critic] PIDs: ${PIDS[*]}"
+echo "[grpo] PIDs: ${PIDS[*]}"
 echo "${PIDS[*]}" > "$LOG_DIR/pids.txt"
 
 fail=0
 for pid in "${PIDS[@]}"; do wait "$pid" || fail=$((fail+1)); done
-echo "[ppo-critic] $(date +%H:%M:%S) TRAINING DONE ($fail failures) — ckpts at $OUT_DIR/"
+echo "[grpo] $(date +%H:%M:%S) TRAINING DONE ($fail failures) — ckpts at $OUT_DIR/"
 
 # ---- Post-training greedy eval (math500/gsm8k/olympiadbench) ----
-#
-# Default: ON. Set RUN_EVAL=false to skip.
-# Evals each saved step_* ckpt + final/ on all 3 math benchmarks at
-# greedy decoding (k=1, T=0). Output: $OUT_DIR/eval/${ckpt}.json.
-# Uses up to 4 GPUs in parallel for speed.
 RUN_EVAL="${RUN_EVAL:-true}"
 if [[ "$RUN_EVAL" == "true" && "$fail" -eq 0 ]]; then
   EVAL_DIR="$OUT_DIR/eval"
   mkdir -p "$EVAL_DIR"
-  echo "[ppo-critic] $(date +%H:%M:%S) === POST-TRAIN EVAL ==="
-  echo "[ppo-critic] eval out: $EVAL_DIR"
+  echo "[grpo] $(date +%H:%M:%S) === POST-TRAIN EVAL ==="
 
   CKPTS=()
   for d in "$OUT_DIR"/step_* "$OUT_DIR/final"; do
     [[ -d "$d" ]] && CKPTS+=("$(basename "$d")")
   done
-  echo "[ppo-critic] eval ckpts: ${CKPTS[*]}"
+  echo "[grpo] eval ckpts: ${CKPTS[*]}"
 
   eval_one() {
     local gpu="$1" ckpt="$2"
@@ -210,39 +194,20 @@ if [[ "$RUN_EVAL" == "true" && "$fail" -eq 0 ]]; then
       --backend vllm --gpu-memory-utilization 0.85 \
       --output "$out" \
       > "$elog" 2>&1 \
-    && echo "[$ckpt] $(date +%H:%M:%S) done" \
-    || echo "[$ckpt] FAILED — see $elog"
+    && echo "[$ckpt] $(date +%H:%M:%S) done" || echo "[$ckpt] FAIL"
   }
 
   i=0
   while (( i < ${#CKPTS[@]} )); do
     EPIDS=()
-    for ((j=0; j<N_GPUS && i+j<${#CKPTS[@]}; j++)); do
-      gpu="${GPUS[$j]}"
-      ( eval_one "$gpu" "${CKPTS[$((i+j))]}" ) &
+    for ((j=0; j<4 && i+j<${#CKPTS[@]}; j++)); do
+      ( eval_one "${GPUS[$j]}" "${CKPTS[$((i+j))]}" ) &
       EPIDS+=("$!")
     done
-    for ep in "${EPIDS[@]}"; do wait "$ep"; done
+    for pid in "${EPIDS[@]}"; do wait "$pid"; done
     i=$((i + ${#EPIDS[@]}))
   done
-
-  echo ""
-  echo "=== EVAL SUMMARY (greedy pass@1) ==="
-  printf "%-12s %-10s %-10s %-13s\n" "ckpt" "math500" "gsm8k" "olympiad"
-  for ckpt in "${CKPTS[@]}"; do
-    f="$EVAL_DIR/${ckpt}.json"
-    [[ -f "$f" ]] || continue
-    m=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d['math500']['pass@k']:.3f}\")" 2>/dev/null || echo "?")
-    g=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d.get('gsm8k',{}).get('pass@k',0):.3f}\")" 2>/dev/null || echo "?")
-    o=$("$PYBIN" -c "import json; d=json.load(open('$f'))['results']; print(f\"{d.get('olympiadbench',{}).get('pass@k',0):.3f}\")" 2>/dev/null || echo "?")
-    printf "%-12s %-10s %-10s %-13s\n" "$ckpt" "$m" "$g" "$o"
-  done
-  echo ""
-  echo "[ppo-critic] $(date +%H:%M:%S) === ALL DONE ==="
-else
-  if [[ "$fail" -gt 0 ]]; then
-    echo "[ppo-critic] skipping eval due to training failures"
-  else
-    echo "[ppo-critic] eval skipped (RUN_EVAL=false)"
-  fi
+  echo "[grpo] $(date +%H:%M:%S) === EVAL DONE ==="
 fi
+
+echo "[grpo] $(date +%H:%M:%S) === ALL DONE ==="

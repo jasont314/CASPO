@@ -48,8 +48,14 @@ def main():
                     help="randomly sample this many step boundaries per rollout")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top_p", type=float, default=1.0)
-    ap.add_argument("--max_prompt_len", type=int, default=512)
-    ap.add_argument("--max_response_len", type=int, default=1024)
+    ap.add_argument("--max_prompt_len", type=int, default=1024)
+    ap.add_argument("--max_response_len", type=int, default=2048)
+    ap.add_argument("--max_train_prefix_len", type=int, default=0,
+                    help="cap step-prefix tokens for training (0=use max_response_len). "
+                         "Decouples collection budget from training prefix budget. Default "
+                         "0 keeps train/deploy aligned. Set to a smaller value (e.g. 1024) "
+                         "only if you specifically want to hedge against rambling-tail noise "
+                         "at the cost of leaving late RL prefixes out-of-distribution.")
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mixed_only", action="store_true", default=True,
@@ -201,6 +207,10 @@ def main():
         candidate_steps = list(last_idx_per_step.keys())
         if len(candidate_steps) > 1:
             candidate_steps = candidate_steps[:-1]  # drop final
+        # Optionally cap prefix length for training (Option C: collect long responses but train on early prefixes)
+        if args.max_train_prefix_len > 0:
+            train_cap = args.max_train_prefix_len
+            candidate_steps = [s for s in candidate_steps if last_idx_per_step[s] < train_cap]
         n_pick = min(args.steps_per_response, len(candidate_steps))
         chosen = rng.sample(candidate_steps, n_pick) if n_pick < len(candidate_steps) else list(candidate_steps)
         for sid in chosen:

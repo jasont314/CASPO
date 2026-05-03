@@ -39,8 +39,9 @@ same KL penalty, the same response segmentation, and the same global PPO
 minibatch, but eliminates the per-step Monte Carlo expansion that dominates
 \vineppo{}'s wall-clock cost. We compare four methods (\grpo{}, \ppocritic{},
 \vineppo{}, \caspo{}) under one trainer, one verifier, one rollout engine,
-and one set of hyperparameters, and report wall-clock and accuracy on the
-MATH benchmark for both Rho-1B and DeepSeekMath-7B. \ppocritic{} is the
+and one set of hyperparameters, on Qwen2.5-Math-1.5B with the
+\texttt{dsr\_sub} subset of DeepScaleR (1209 prompts from One-Shot-RLVR),
+with DeepSeekMath-7B on MATH-lighteval as a 7B paper-faithful reference. \ppocritic{} is the
 canonical Schulman-2017 \ppo{} with a learned scalar value head on a
 stripped-LM-head backbone copy and GAE; we use it rather than bare \ppo{}
 (uniform sequence-broadcast advantages with no value baseline) because
@@ -102,10 +103,15 @@ correctness probability, or its log) and motivated by a different
 bias--variance regime;
 (iii) a frozen reward-model variant (\caspo{}-frozen-RM) that disables online
 value updates and isolates the cost/benefit of online value drift correction;
-(iv) a unified comparison stack that implements \grpo{}, \ppocritic{},
+(iv) an iterated-refresh configuration that periodically retrains
+$V_\phi$ from scratch on Monte-Carlo-labeled rollouts of the current policy,
+converting the credit model from a single drifting model into a sequence of
+in-distribution snapshots, at amortized wall-clock cost well below one
+\vineppo{} outer-step budget;
+(v) a unified comparison stack that implements \grpo{}, \ppocritic{},
 \vineppo{}, and \caspo{} under one trainer, one verifier, and one rollout
 engine, controlling everything except the algorithmic credit-signal choice; and
-(v) implementation infrastructure for full-finetune 7B-scale RL with
+(vi) implementation infrastructure for full-finetune 7B-scale RL with
 FSDP-sharded trainer and rank-local vLLM generation, including a streaming
 CUDA-IPC weight-sync path that is collective with
 \texttt{summon\_full\_params}, fp32 master weights with on-demand AdamW
@@ -115,11 +121,15 @@ and per-method ckpt sharding across multiple NVMe drives so each of the four
 
 \paragraph{Implementation provenance.} The codebase is an adaptation and
 extension of the public \vineppo{} setup \citep{vineppo2024,vineppocode}. The
-Rho-1B and DeepSeekMath-7B configurations, prompt templates, rollout shapes,
-PPO hyperparameters, evaluation protocol, and LaTeX-aware step segmentation
-are matched to or derived from the upstream paper and reference repository so
+DeepSeekMath-7B configuration's prompt template, rollout shape, PPO
+hyperparameters, evaluation protocol, and LaTeX-aware step segmentation are
+matched to or derived from the upstream paper and reference repository so
 that any wall-clock or accuracy gap between methods reflects the algorithmic
-change rather than infrastructure.
+change rather than infrastructure. The Qwen2.5-Math-1.5B configuration on
+\texttt{dsr\_sub} adapts the same training contract to the model's native
+prompt template and to a 4-GPU FSDP topology, and is the primary
+experimental site for the comparison and for the iterated-refresh
+contribution.
 
 \section{Related Work}
 \label{sec:related}
@@ -542,17 +552,24 @@ step-level signal.
 \label{sec:setup}
 
 \subsection{Models and data}
-We evaluate on two policy initializations and one shared dataset family:
-\begin{itemize}
-\item \textbf{Rho-1B}: \texttt{realtreetune/rho-1b-sft-MATH}, a 1.1B-parameter
-SFT-on-MATH initialization used in the upstream \vineppo{} paper.
-\item \textbf{DeepSeekMath-7B}: \texttt{realtreetune/deepseekmath-7b-sft-MATH-v2},
-the 7B SFT-on-MATH initialization from the same upstream pipeline.
-\end{itemize}
-Training prompts are drawn from \texttt{DigitalLearningGmbH/MATH-lighteval}
-(train split). Held-out evaluation uses \texttt{HuggingFaceH4/MATH-500} (test
-split, 500 problems) plus the full MATH test set, College Math, and
-OlympiadBench (math-only configuration). All settings use the prompt template
+The primary experimental site is \textbf{Qwen2.5-Math-1.5B}
+(\texttt{Qwen/Qwen2.5-Math-1.5B}), a 1.5B math-specialist SFT
+initialization, trained on the \textbf{One-Shot-RLVR \texttt{dsr\_sub}}
+1209-prompt subset of DeepScaleR. Evaluation uses MATH-500, GSM8K, and
+OlympiadBench under greedy decoding ($k{=}1$, $T{=}0$). Qwen2.5-Math is a
+math-specialist SFT model that responds best to its native template
+\texttt{\{query\}\textbackslash nLet's think step by step and output the
+final answer within \textbackslash boxed\{\}.}; substituting the
+\texttt{[MATH\_TASK]} template degrades Qwen accuracy by ${>}30$ percentage
+points and is a critical reproduction footgun.
+
+For a 7B paper-faithful reference site, we additionally evaluate on
+\textbf{DeepSeekMath-7B} (\texttt{realtreetune/deepseekmath-7b-sft-MATH-v2}),
+the SFT-on-MATH initialization from the upstream \vineppo{} pipeline,
+trained on \texttt{DigitalLearningGmbH/MATH-lighteval} (train split). 7B
+held-out evaluation uses \texttt{HuggingFaceH4/MATH-500} (test split, 500
+problems) plus the full MATH test set, College Math, and OlympiadBench
+(math-only configuration), under the upstream prompt template
 \texttt{[MATH\_TASK] Problem:\textbackslash n\{query\}\textbackslash n\textbackslash nSolution:}
 and the LaTeX-aware step splitter from the upstream codebase.
 
@@ -585,20 +602,20 @@ summarizes the key knobs.
 
 \begin{table}[t]
 \centering
-\caption{Shared training hyperparameters (Rho-1B and DeepSeekMath-7B). All
-fields are matched to the upstream \vineppo{} configuration for the
-respective scale; the only deliberate difference is the model. Values
-reflect the paper-faithful alignment after the upstream-divergence audit
-(Section~\ref{sec:infra}).}
+\caption{Training hyperparameters at the two experimental sites. The
+Qwen2.5-Math-1.5B configuration is the primary site for the comparison;
+DeepSeekMath-7B retains the upstream \vineppo{} configuration as a
+paper-faithful 7B reference. The 2048-token response budget for
+Qwen2.5-Math-1.5B is justified empirically (see text below).}
 \label{tab:hp}
 \begin{tabular}{lll}
 \toprule
-Field & Rho-1B & DeepSeekMath-7B \\
+Field & Qwen2.5-Math-1.5B & DeepSeekMath-7B \\
 \midrule
 Group size $G$ & 8 & 8 \\
-Prompts per outer step & 64 & 64 \\
-Responses per outer step & 512 & 512 \\
-Global PPO minibatch & 64 & 64 \\
+Prompts per outer step & 128 & 64 \\
+Responses per outer step & 1024 & 512 \\
+Global PPO minibatch & 128 & 64 \\
 PPO epochs per rollout & 2 & 2 \\
 Policy LR & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
 Online value LR (\caspo{}) & $1\times 10^{-6}$ & $1\times 10^{-6}$ \\
@@ -607,25 +624,44 @@ Value $\beta$, $m$ & $10$, $5$ & $10$, $5$ \\
 PPO clip $\epsilon$ & $0.2$ & $0.2$ \\
 Value clip $\epsilon_v$ (\ppocritic{}) & $0.2$ & $0.2$ \\
 GAE $\lambda$ (\ppocritic{}) & $1.0$ & $1.0$ \\
-KL coefficient & $10^{-2}$ ($k_3$) & $10^{-2}$ ($k_3$) \\
+KL coefficient & $10^{-3}$ ($k_3$, $10^{-2}$ for \ppocritic{}) & $10^{-2}$ ($k_3$) \\
 Advantage clip & $3.0$ & $3.0$ \\
 Advantage standardization & batch & batch \\
-Rollout sampling & temp $0.6$, top-$p$ $0.9$ & temp $0.6$, top-$p$ $0.9$ \\
-Max prompt / response & 1024 / 1024 & 1512 / 1024 \\
-Max sequence length & 2048 & 2499 \\
-Warmup steps & 480 & 480 \\
-Outer steps & 1000 & 1000 \\
-Checkpoint cadence & every 100 (steps 100--1000) & every 200 (steps 200--1000) \\
+Rollout sampling & temp $0.6$, top-$p$ $1.0$ & temp $0.6$, top-$p$ $0.9$ \\
+Max prompt / response & 1024 / 2048 & 1512 / 1024 \\
+Max sequence length & 3072 & 2499 \\
+Warmup steps & 0 & 480 \\
+Outer steps & 500 & 1000 \\
+Checkpoint cadence & every 50 & every 200 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Both configurations land at 512 responses per outer step ($64 \times G{=}8$),
-2 PPO epochs per rollout, and a 64-response global PPO minibatch, matching
-the upstream \vineppo{} hyperparameters at each scale
-\citep{vineppo2024,vineppocode}. Apart from the base policy, every entry in
-Table~\ref{tab:hp} is identical between the two scales, isolating any
-empirical difference to the model rather than to the optimization recipe.
+The Qwen2.5-Math-1.5B configuration uses 1024 responses per outer step
+(128 prompts $\times G{=}8$) on a 4-GPU FSDP topology. The KL coefficient
+of $10^{-3}$ for \caspo{}/\grpo{}/\vineppo{} (versus $10^{-2}$ for
+\ppocritic{}) is empirically required: the math-specialist Qwen SFT
+initialization is over-anchored at $10^{-2}$ and policy updates do not
+move the model without a weaker reference anchor, while \ppocritic{} is
+critic-stabilized and tolerates the stronger anchor. The DeepSeekMath-7B
+configuration retains the upstream \vineppo{} hyperparameters at 7B
+\citep{vineppo2024,vineppocode}: 512 responses per outer step
+($64 \times G{=}8$), 2 PPO epochs per rollout, and a 64-response global
+PPO minibatch, isolating any empirical differences between the two sites
+to the model and dataset rather than the optimization recipe.
+
+The response budget of 2048 tokens for Qwen2.5-Math-1.5B is set by
+empirical measurement on \texttt{dsr\_sub}: an 800-chain uncapped sample
+($T{=}1.0$, max=3000) places the 98th percentile of \emph{correct} chains
+at 1613 tokens. At $2048$, only $2\%$ of correct chains are truncated,
+while the overall truncation rate is $8\%$ (i.e., the truncated tail is
+overwhelmingly off-track / rambling chains rather than length-bound
+correct ones). This makes the unfinished-response penalty signal load
+the right pattern: ``long without resolution'' is what gets penalized,
+not ``hard problem requires more tokens.'' Going further to $3072$ catches
+fewer than one additional correct chain per 150 sampled and risks the
+Qwen \texttt{max\_position\_embeddings}${=}4096$ ceiling at
+$\text{prompt}+\text{response}$.
 
 \subsection{Evaluation protocol}
 Final evaluation reports pass@1 and pass@$k$ ($k=16$) on MATH-500, full MATH
@@ -901,12 +937,46 @@ correctness). The \caspo{}-frozen-RM variant in our contributed family
 isolates this risk by holding $V_\phi$ fixed during policy training, at the
 cost of distribution-shift bias.
 
+A complementary direction is \emph{periodic refresh from scratch}: at
+intervals of $k$ outer steps the prefix value model is re-trained on a
+fresh Monte-Carlo-labeled corpus drawn from the current policy and a base-
+SFT initialization, then loaded as the new $V_\phi$ for the next $k$ outer
+steps. This converts the credit model into a sequence of in-distribution
+snapshots rather than a single drifting model. The Qwen2.5-Math-1.5B
+configuration uses this iterated-refresh recipe (alternating phase length
+$k{=}150$ for the $\Delta p$ transform, $k{=}200$ for $\Delta\log p$);
+the per-refresh wall-clock cost is approximately one-tenth of one
+\vineppo{} outer-step budget at $K{=}9$, leaving the method dominated by
+RL rollout cost rather than refresh overhead. We treat refresh-PRM as a
+distinct configuration of \caspo{} rather than a separate method, since
+it changes only how $V_\phi$ is sourced and not the step-TD advantage
+construction. A complete cross-method comparison of refresh-PRM
+\caspo{} against fixed-$V_\phi$ \caspo{} and \vineppo{} on
+Qwen2.5-Math-1.5B is in progress and is the primary subject of the
+companion experimental log accompanying this manuscript.
+
+\paragraph{Cross-distribution probe-set evaluation of $V_\phi$.}
+Selecting the best refresh recipe by ranking candidate $V_\phi$ checkpoints
+on a fixed probe set is sensitive to the response-length cap used when the
+probe data was generated. A $V_\phi$ trained on collection budget $L_{\text{tr}}$
+sees prefixes spanning the range $[0, L_{\text{tr}}]$, but a probe set
+generated at cap $L_{\text{probe}} < L_{\text{tr}}$ contains prefixes only in
+$[0, L_{\text{probe}}]$. Differences in Spearman $\rho$ between checkpoints
+trained at different $L_{\text{tr}}$ on a single shared probe set therefore
+conflate intrinsic credit-assignment quality with the fraction of the
+checkpoint's training distribution that the probe never exercises. We
+encountered this confound in early refresh-recipe sweeps and recommend
+that any future $V_\phi$ recipe selection generate the probe at the
+maximum training cap of any candidate, or otherwise restrict the
+comparison to recipes whose training caps match the probe cap.
+
 \paragraph{Segmenter quality.}
 The LaTeX-aware step splitter is a structural heuristic. Manual spot checks
-on Rho-1B MATH generations show coherent boundaries for prose, equations,
-factorization, and aligned derivations, but generations that continue past a
-final boxed answer have those trailing fragments treated as additional steps;
-a post-answer truncation pass is left as future work.
+on Qwen2.5-Math-1.5B and DeepSeekMath-7B generations show coherent
+boundaries for prose, equations, factorization, and aligned derivations,
+but generations that continue past a final boxed answer have those trailing
+fragments treated as additional steps; a post-answer truncation pass is
+left as future work.
 
 \paragraph{Apples-to-apples scope.}
 Our comparison fixes the SFT initialization, prompt set, verifier, sampling
@@ -917,7 +987,7 @@ report the upstream-paper values where available and otherwise the values
 that minimize wall-clock without regressing pass@1 on a small validation set.
 
 \paragraph{Scale.}
-Results at 1B and 7B may not transfer to substantially larger scales. The
+Results at 1.5B and 7B may not transfer to substantially larger scales. The
 7B FSDP+vLLM-IPC stack is novel to this work; whether the same configuration
 extrapolates to 70B is an open systems question.
 
@@ -932,11 +1002,14 @@ KL constraint, and the same step-TD advantage construction used by
 \vineppo{}, isolating the credit-signal change from confounders. By unifying
 \grpo{}, \ppocritic{}, \vineppo{}, and \caspo{} under one trainer, one
 verifier, and one rollout engine, we make it possible to compare these four
-methods under identical conditions on Rho-1B and DeepSeekMath-7B. Empirical results
-in Section~\ref{sec:results} will quantify whether the learned value model
+methods under identical conditions on Qwen2.5-Math-1.5B with
+\texttt{dsr\_sub} as the primary site and DeepSeekMath-7B with
+MATH-lighteval as a paper-faithful 7B reference. Empirical results in
+Section~\ref{sec:results} will quantify whether the learned value model
 recovers \vineppo{}'s reasoning-credit signal at a fraction of its
 generation cost, or whether step-level Monte Carlo remains uniquely
-advantageous.
+advantageous, and whether iterated refresh of $V_\phi$ from current-policy
+rollouts closes any residual gap.
 
 \bibliographystyle{plainnat}
 \bibliography{references}

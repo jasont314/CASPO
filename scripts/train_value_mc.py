@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--mb", type=int, default=8)
+    ap.add_argument("--grad_accum", type=int, default=1, help="gradient accumulation steps; effective batch = mb*FSDP_size*grad_accum")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--eval_every", type=int, default=50)
@@ -272,15 +273,27 @@ def main():
         train_t = torch.tensor(train_idxs, dtype=torch.long)
         perm_t = torch.randperm(len(train_t), generator=gen)
         train_t = train_t[perm_t]
+        accum_count = 0
         for s in range(0, len(train_t), args.mb):
-            step += 1
             batch_idxs = train_t[s:s + args.mb]
             pv.phi.train()
             loss, mse, mean_pred = forward_loss(batch_idxs)
-            optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(pv.phi.parameters(), 1.0)
-            optim.step()
+            scaled_loss = loss / args.grad_accum
+            # Skip all_gather on intermediate accum batches via FSDP no_sync
+            if accum_count + 1 < args.grad_accum and isinstance(pv.phi, FSDP):
+                with pv.phi.no_sync():
+                    scaled_loss.backward()
+            else:
+                scaled_loss.backward()
+            accum_count += 1
+            if accum_count == args.grad_accum:
+                step += 1
+                accum_count = 0
+                torch.nn.utils.clip_grad_norm_(pv.phi.parameters(), 1.0)
+                optim.step()
+                optim.zero_grad()
+            else:
+                continue
             if step % 10 == 0:
                 _rprint(
                     f"[mc-train step {step}/{total_steps}] loss={float(loss):.4f} "

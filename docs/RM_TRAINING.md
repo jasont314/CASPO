@@ -304,11 +304,18 @@ cost a few hundred GPU-h.
 
 ---
 
-## Selected Refresh Recipe (v1 paper, 2026-05-01)
+## Selected Refresh Recipe (v1 paper, 2026-05-01) — **SUPERSEDED**
+
+> ⚠️ **Superseded by "Updated Recipe (gap-closed)" below (2026-05-03).**
+> Kept here as historical record of how the recipe evolved; do **not**
+> follow this section as current guidance. Specifically: response cap,
+> training epochs, mb, accumulation, and ETAs all changed in the
+> updated recipe. The reasoning around scratch-vs-warmstart and
+> val_loss/ρ disagreement still stands.
 
 After axis A (recipe), axis C (warmstart vs scratch), axis D (LoRA vs
 full-FT), and the val_loss-vs-ρ disagreement findings, the recommended
-refresh recipe is:
+refresh recipe **at the time** was:
 
 **For each refresh trigger** (e.g., Spearman ρ drops 25% from peak):
 
@@ -332,6 +339,77 @@ refresh recipe is:
 **Refresh budget:** ~2.5h wall-clock total per refresh, ~13 GPU-hours
 on 8 GPUs (collection) + 4 GPUs (training). Well under VinePPO K=9's
 ~22 GPU-hour MC overhead per 150 RL steps.
+
+## Updated Recipe (gap-closed, 2026-05-03; revised 2026-05-03)
+
+After investigating why our sweep PRMs underperformed orig PRM, we
+identified the gap as data design (max_response_len) and effective
+batch size. The gap-closed recipe matches/exceeds orig PRM (ρ=0.456 vs
+0.443) and is the new default.
+
+**Recipe (initial PRM and all refreshes, unified at 2048):**
+```
+Collection (mc_step_label.py 4-shard):
+  --K 16 --J 16 --steps_per_response 5
+  --max_prompt_len 1024 --max_response_len 2048
+  --max_train_prefix_len 0     # default — match collection cap
+  --temperature 1.0 --top_p 1.0 --seed 0
+
+Training (train_value_mc.py FSDP=4):
+  --lr 5e-6 --mb 4 --grad_accum 2     # eff_batch = 4 × 4 × 2 = 32
+  --epochs 2 --val_fraction 0.1
+  --early_stop_patience 999            # no early stop
+  --beta 10.0 --seed 0
+```
+ETA: ~41 min collection + ~50 min training on 4 GPUs.
+
+**Why 2048?** Empirical Qwen2.5-Math-1.5B base rollouts on dsr_sub
+(800 chains, max=3000) show **p98 of CORRECT chains at 1613 tokens**:
+2048 catches 98% of correct chains, while truncating ~8% overall —
+mostly failed/rambling chains, which is the seq_len penalty signal we
+want. `max_response_len=2048` is the right ceiling for both initial PRM
+collection and refresh PRM collection (the policy distribution shifts
+across RL training but stays within this cap).
+
+**Why no `--max_train_prefix_len` decoupling?** RL deploys at cap=2048,
+so PRM training at cap=2048 keeps train/deploy distributions aligned.
+The original "Option C" hedge (collect at 2048, train at 1024) was
+motivated by the iter_max1792 result (-0.10 ρ vs iter_max1024). That
+result is now **understood as a probe-cap mismatch artifact**: the
+sweep evaluated all PRMs against a probe at cap=1024, so 1792-trained
+PRMs were scoring out-of-distribution. The v3 refresh at cap=1536
+trained without prefix decoupling and achieved ρ=0.630 in-distribution,
+directly validating that training prefix cap >1024 is fine.
+
+**When to use `--max_train_prefix_len`:** only as a hedge if you
+specifically observe rambling-tail noise hurting downstream RL.
+Default 0 (= match collection) is the correct production choice.
+
+### Sweep findings (2026-05-02 to 2026-05-03)
+
+Single-axis ablations on Qwen2.5-Math-1.5B / dsr_sub at gap-closed config:
+
+| axis | range tested | best | notes |
+|---|---|---|---|
+| max_response_len | 512, 768, 1024, 1792 | 768 (≈1024) | ⚠️ probe-cap confound: probe was at cap=1024; 1792-trained PRMs were scored OOD. v3 refresh at cap=1536 (in-dist) got ρ=0.630, contradicting "longer hurts". 512 → NaN unrelated. |
+| eff_batch | 4, 16, 32, 64 | 32 | ★★★★ doubling 4→32 → +0.10ρ |
+| ep_per_run | 1, 2, 3, 5 | 2 (≈ 1) | ★★ marginal past ep=2; ep=1 already 99% of value |
+| K | 4, 8, 16 | 16 (= 8 at matched compute) | ★ K is artifact of training data size, not diversity |
+| S | 3, 5, 10 | 5 | minor — saturated |
+| N | 100, 300, 500, 1209 | 1209 | monotone, diminishing past ~500 |
+| J | 16 (only) | — | not subsamplable from current data |
+| lr | 1e-6, 3e-6, 5e-6, 1e-5, 3e-5 | 5e-6 | ★★★ very narrow window |
+
+The "gap-closing" findings:
+- `max_response_len=1792` looked bad (-0.10ρ) but was scored against a
+  probe at cap=1024 — half its training prefixes (the >1024 ones) were
+  out-of-distribution at probe time. Likely measurement artifact, not
+  intrinsic. Confirmed by v3 refresh at cap=1536 trained without
+  prefix decoupling → ρ=0.630 in-dist.
+- `eff_batch=4` (our prior default mb=1 FSDP=4) was the second-largest miss.
+  Bumping to 32 (mb=4 acc=2) closed the rest.
+- val_fraction=0.05 vs 0.1 was a minor but real factor (smaller val → noisier
+  best-ckpt selection with patience=999).
 
 ### Why scratch (not warmstart, not LoRA)
 

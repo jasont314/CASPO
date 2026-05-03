@@ -1,9 +1,23 @@
 # Reproducing Current CASPO Runs
 
-This runbook tracks the current repository setup for the Rho-1B MATH
-comparison. It is intentionally narrower than the older cross-repo playbook:
-the active production target is one shared trainer/inference stack that can run
-PPO, GRPO, CASPO, and VinePPO under the same config.
+The active research target is **Qwen2.5-Math-1.5B + dsr_sub** (1209
+DeepScaleR prompts from One-Shot-RLVR), 4-GPU FSDP. See the
+"Qwen2.5-Math-1.5B + dsr_sub track" section below for the full reproduction
+recipe.
+
+The earlier Rho-1B-MATH track is **archived** — sections labeled
+"Rho-1B-MATH (ARCHIVED)" below describe the historical paper-faithful
+VinePPO replication setup. Launchers and configs remain in the tree but
+are no longer the active comparison.
+
+DeepSeekMath-7B on MATH-lighteval is retained as a paper-faithful 7B
+reference site; it runs on the same trainer with model+data+template
+overrides.
+
+## Rho-1B-MATH track (ARCHIVED)
+
+> ⚠️ Historical reproduction notes for the original VinePPO-replication
+> target. No longer active; preserved for reference.
 
 ## Environment
 
@@ -88,7 +102,7 @@ Run all methods in parallel on GPUs 4-7:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="4 5 6 7" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_parallel.sh
+  ./scripts/archive/rho1b/launch_rho1b_parallel.sh
 ```
 
 Default mapping:
@@ -113,9 +127,9 @@ With `RUN_TAG=paper512_seed0`, outputs land at:
 Useful overrides:
 
 ```bash
-MAX_STEPS=20 RUN_TAG=smoke ./scripts/launch_rho1b_parallel.sh
-SAVE_EVERY=100 RUN_TAG=short ./scripts/launch_rho1b_parallel.sh
-WANDB_MODE=offline RUN_TAG=paper512_seed1 ./scripts/launch_rho1b_parallel.sh
+MAX_STEPS=20 RUN_TAG=smoke ./scripts/archive/rho1b/launch_rho1b_parallel.sh
+SAVE_EVERY=100 RUN_TAG=short ./scripts/archive/rho1b/launch_rho1b_parallel.sh
+WANDB_MODE=offline RUN_TAG=paper512_seed1 ./scripts/archive/rho1b/launch_rho1b_parallel.sh
 ```
 
 ## CASPO Advantage Ablations
@@ -137,7 +151,7 @@ Launch only the two extra experiments:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="4 5" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_caspo_ablations.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_ablations.sh
 ```
 
 Outputs:
@@ -151,7 +165,7 @@ To run all three CASPO variants in one sweep:
 
 ```bash
 ADV_VARIANTS="value prob logprob" GPU_LIST="4 5 6" \
-  ./scripts/launch_rho1b_caspo_ablations.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_ablations.sh
 ```
 
 Frozen-RM CASPO disables online value updates while keeping prefix-value
@@ -159,7 +173,7 @@ scoring:
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="4" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_caspo_frozen_rm.sh
+  ./scripts/archive/rho1b/launch_rho1b_caspo_frozen_rm.sh
 ```
 
 Output:
@@ -178,7 +192,7 @@ its local vLLM engine see exactly one CUDA device. By default it preserves the
 
 ```bash
 RUN_TAG=paper512_seed0 GPU_LIST="6 7" WANDB_MODE=offline \
-  ./scripts/launch_rho1b_vineppo_ddp2.sh
+  ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
 ```
 
 Default shape:
@@ -199,7 +213,7 @@ Smoke:
 ```bash
 MAX_STEPS=1 SAVE_EVERY=0 PROMPTS_PER_STEP=1 GROUP_SIZE=1 \
 GRAD_ACCUM_STEPS=1 VINEPPO_MC_ROLLOUTS=1 RUN_TAG=ddp2_smoke \
-GPU_LIST="6 7" WANDB_MODE=disabled ./scripts/launch_rho1b_vineppo_ddp2.sh
+GPU_LIST="6 7" WANDB_MODE=disabled ./scripts/archive/rho1b/launch_rho1b_vineppo_ddp2.sh
 ```
 
 ## Evaluation
@@ -266,6 +280,164 @@ Targeted trainer/vLLM tests:
   tests/test_trainer_integration.py \
   tests/test_method_dispatch.py
 ```
+
+---
+
+## Qwen2.5-Math-1.5B + dsr_sub track (current paper setup)
+
+### Setup summary
+
+| Field | Value |
+|---|---|
+| Base policy | `Qwen/Qwen2.5-Math-1.5B` |
+| Dataset | `/tmp/rlvr_replication/dsr_sub.jsonl` (1209 DeepScaleR prompts; One-Shot-RLVR subset) |
+| Eval | `math500`, `gsm8k`, `olympiadbench` (greedy, k=1, T=0) |
+| Prompt template | `{query}\nLet's think step by step and output the final answer within \boxed{}.` |
+| Max prompt | 1024 tokens |
+| **Max response** | **2048 tokens** |
+| **Max sequence** | **3072 tokens** (max_prompt + max_response; well within Qwen `max_position_embeddings=4096`) |
+| Group size | 8 |
+| Prompts per step | 128 (= 1024 responses per outer step at G=8) |
+| PPO minibatch | mb=4, grad_accum=8 (= 32 effective per rank, 128 global) |
+| Topology | FSDP=4 + colocated vLLM, 4× H100/A100 80GB |
+| Policy LR | 1e-6 |
+| KL coef | 0.001 (CASPO/GRPO/VinePPO), 0.01 (PPO+critic — needs stronger anchor at 1B) |
+| Steps | 500 |
+
+### Why response budget = 2048
+
+Empirical measurement (n=800 uncapped Qwen2.5-Math-1.5B base rollouts on
+dsr_sub at max=3000, T=1.0, May 2026):
+
+| pct | tokens (all chains) | tokens (correct chains only) |
+|---|---|---|
+| p50 | 684 | 558 |
+| p75 | 1142 | 778 |
+| p90 | 1906 | 1076 |
+| p95 | 2902 | 1377 |
+| **p98** | (right-censored) | **1613** |
+| p99 | (right-censored) | 2187 |
+
+At cap=2048: 8% truncation overall, but only **2% of correct chains** get
+truncated. The 6pp gap (8% truncated total vs 2% correct truncated) is
+entirely failed/rambling chains — exactly what the seq-len penalty signal is
+designed to discourage. Going to cap=3000 catches one additional correct
+chain in 150 (~0.7% gain) at the cost of risking the Qwen RoPE position-
+embedding ceiling at prompt+response=4096.
+
+### Method launchers (4-GPU FSDP)
+
+| Method | Launcher | `epochs_per_rollout` | `kl_coef` |
+|---|---|---|---|
+| GRPO | `scripts/launch_qwen_grpo.sh` | 1 | 0.001 |
+| PPO+critic | `scripts/launch_qwen_ppo_critic.sh` | 2 | 0.01 |
+| VinePPO | `scripts/launch_qwen_vineppo.sh` | 2 | 0.01 |
+| CASPO Δp | `scripts/launch_qwen_caspo.sh` (default `ADV_TRANSFORM=prob`) | 2 | 0.001 |
+| CASPO Δlogp | `scripts/launch_qwen_caspo.sh` with `ADV_TRANSFORM=logprob` | 2 | 0.001 |
+| CASPO + alternating refresh | `scripts/launch_caspo_alternating.sh` | 2 | 0.001 |
+| CASPO refresh resume (Phase 2 only) | `scripts/launch_caspo_refresh_resume.sh` | 2 | 0.001 |
+
+All Qwen launchers source the base config `configs/caspo_rho1b_math.yaml`
+and override the relevant fields (template, response length, model). The
+Rho-1B YAML is the trainer-config schema; no separate Qwen YAML required.
+
+### PRM training recipe (gap-closed, unified at 2048)
+
+Initial PRM and refresh PRM use the same recipe — no decoupling between
+collection and training prefix budgets. Use `scripts/launch_qwen_mc_prm.sh`
+for both:
+
+```bash
+# Initial PRM (rollouts from base SFT, V_φ from base SFT)
+OUT_DIR=/mnt/nvme_tmp4/jason_caspo/qwen_mc_prm_initial \
+DSR_SUB=/tmp/rlvr_replication/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+  bash scripts/launch_qwen_mc_prm.sh
+
+# Refresh PRM (rollouts from current RL ckpt, V_φ trained from-scratch)
+OUT_DIR=/mnt/nvme_tmp7/jason_caspo/qwen_mc_prm_refresh_step150 \
+POLICY=/path/to/caspo/step_150 \
+NUM_PROMPTS=300 \
+DSR_SUB=/tmp/rlvr_replication/dsr_sub.jsonl \
+GPU_LIST="0 1 2 3" \
+  bash scripts/launch_qwen_mc_prm.sh
+```
+
+The launcher consolidates both phases (mc_step_label.py 4-shard collection
++ merge + train_value_mc.py FSDP=4 training) with unified-2048 defaults:
+K=16, J=16, steps=5, max_response_len=2048, max_train_prefix_len=0,
+lr=5e-6, mb=4, grad_accum=2, epochs=2, beta=10.0. All knobs are env-var
+overridable.
+
+ETA: ~91 min total for the initial PRM (~41 min collection + ~50 min
+training on 4 GPUs). Refresh PRM at N=300 is ~30 min collection + ~50 min
+training.
+
+`--max_train_prefix_len 0` (default) means "use whatever was collected" —
+NO prefix decoupling. This matches RL deployment cap so train/deploy
+distributions are aligned.
+
+(The earlier "Option C" decoupling — collect long, train short — was a
+hedge against an interpretation of the iter_max1792 sweep finding that
+turned out to be a probe-cap mismatch artifact. The v3 refresh PRM at
+cap=1536 trained without decoupling achieved ρ=0.630 in-distribution,
+directly contradicting the "long prefix training is noisy" theory. See
+`docs/RM_TRAINING.md` for the full re-interpretation.)
+
+### Two-phase / alternating refresh
+
+For RL → refresh PRM → continue RL cycles:
+
+```bash
+# Required env
+export INITIAL_CKPT=/path/to/base_or_phase1_ckpt
+export INITIAL_PRM=/path/to/initial_PRM
+export OUT_ROOT=/mnt/nvme_tmp4/jason_caspo/caspo_alternating
+
+# Optional
+export METHOD=caspo                 # default
+export ADV_TRANSFORM=prob           # 'prob' for Δp; 'logprob' for Δlogp
+export REFRESH_EVERY=150            # 150 (Δp) or 200 (Δlogp)
+export TOTAL_STEPS=500
+export PRM_TRAIN_MAX_RESP=2048      # default; matches RL cap
+export PRM_TRAIN_PREFIX_CAP=0       # default; no decoupling
+
+bash scripts/launch_caspo_alternating.sh
+```
+
+Or, for Phase-2-only resume (RL ckpt + new PRM, preserving optimizer +
+lr_scheduler + ref_policy from Phase 1):
+
+```bash
+POLICY_CKPT=/path/to/phase1/step_150 \
+NEW_PRM=/path/to/refreshed_PRM \
+OUT_DIR=/path/to/phase2 \
+  bash scripts/launch_caspo_refresh_resume.sh
+```
+
+### Evaluation (Qwen)
+
+Use the post-train auto-eval blocks built into the per-method launchers
+(set `RUN_EVAL=true`, default). For ad-hoc periodic eval during training,
+use `scripts/eval_periodic.sh` with the matching template + length:
+
+```bash
+./scripts/eval_periodic.sh --gpu 7 --max-new-tokens 2048 \
+    --prompt-template '{query}\nLet'\''s think step by step and output the final answer within \boxed{}.' \
+    /mnt/nvme_tmp4/jason_caspo/your_qwen_run_dir
+```
+
+Or `scripts/launch_eval_all.sh` with overrides:
+
+```bash
+EVAL_MAX_NEW_TOKENS=2048 \
+EVAL_PROMPT_TEMPLATE='{query}\nLet'\''s think step by step and output the final answer within \boxed{}.' \
+  ./scripts/launch_eval_all.sh
+```
+
+Without these overrides, the launcher silently falls through to the Rho-1B
+`[MATH_TASK]` template + 1024-token cap, which empirically hides 30+pp of
+Qwen gains.
 
 Paper build:
 

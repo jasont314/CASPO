@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Phase 5 — eval all method checkpoints on the full Rho-1B-MATH eval suite.
 # Runs: math500 (subset), math (full 5K), collegemath (500), olympiadbench (674).
-# k=16 / temp=0.35 / top_p=0.9 / max_tokens=1024 (matches VinePPO eval protocol).
+# k=16 / temp=0.35 / top_p=0.9 (matches VinePPO eval protocol).
+#
+# Defaults are tuned for Rho-1B (max-new-tokens=1024, [MATH_TASK] template).
+# For Qwen2.5-Math-1.5B + dsr_sub evals, override the relevant env vars:
+#   EVAL_MAX_NEW_TOKENS=2048 (matches Qwen training cap)
+#   EVAL_PROMPT_TEMPLATE="{query}\nLet's think step by step and output the final answer within \\boxed{}."
+# Otherwise the launcher will silently truncate Qwen responses at 1024 and
+# fall through to the [MATH_TASK] template, hiding 30+pp of Qwen gains.
 #
 # Usage:
 #   ./scripts/launch_eval_all.sh
@@ -62,6 +69,8 @@ BENCHMARKS="${EVAL_BENCHMARKS:-math500,math,collegemath,olympiadbench}"
 EVAL_K="${EVAL_K:-16}"
 CKPT_SUBDIR="${CKPT_SUBDIR:-final}"
 EVAL_VLLM_GPU_MEMORY_UTILIZATION="${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"     # 2048 for Qwen2.5-Math-1.5B
+EVAL_PROMPT_TEMPLATE="${EVAL_PROMPT_TEMPLATE:-}"        # empty = use cfg.prompt_template
 EVAL_LIMIT_ARGS=()
 LIMIT_TAG="full"
 if [[ -n "${EVAL_LIMIT:-}" ]]; then
@@ -89,6 +98,10 @@ eval_method() {
         return
     fi
     echo "[eval] ${method} -> GPU ${gpu} -> ckpt=${ckpt}"
+    local template_override=()
+    if [[ -n "$EVAL_PROMPT_TEMPLATE" ]]; then
+        template_override=(--override "prompt_template=${EVAL_PROMPT_TEMPLATE}")
+    fi
     # python -u for unbuffered output (belt-and-suspenders with PYTHONUNBUFFERED).
     CUDA_VISIBLE_DEVICES="$gpu" nohup "$PYTHON_BIN" -u -m scripts.eval \
         --config configs/caspo_rho1b_math.yaml \
@@ -96,11 +109,12 @@ eval_method() {
         --override "output_dir=${out_dir}" \
         --override wandb_enabled=false \
         --override rollout_backend=vllm \
+        "${template_override[@]}" \
         --benchmarks "$BENCHMARKS" \
         --k "$EVAL_K" \
         --temperature 0.35 \
         --top-p 0.9 \
-        --max-new-tokens 1024 \
+        --max-new-tokens "$EVAL_MAX_NEW_TOKENS" \
         --gpu-memory-utilization "$EVAL_VLLM_GPU_MEMORY_UTILIZATION" \
         "${EVAL_LIMIT_ARGS[@]}" \
         --output "$output_json" \

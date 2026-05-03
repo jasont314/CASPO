@@ -347,7 +347,7 @@ cd /home/jason/experiment/CASPO
 
 # 2-step smoke on 1 GPU at Rho-1B (~3 min wall, ~6 GB peak)
 GPU=0 MAX_STEPS=2 RUN_TAG=infra_smoke WANDB_MODE=offline \
-    ./scripts/launch_rho1b_grpo.sh
+    ./scripts/archive/rho1b/launch_rho1b_grpo.sh
 
 # Inspect:
 tail -f /mnt/nvme_tmp/jason_caspo/caspo_rho1b_math_infra_smoke/logs/phase2_grpo.log
@@ -386,5 +386,5 @@ RUN_TAG=paper_seed0 CKPT_SUBDIR=step_500 \
     EVAL_GPU_LIST="0 1 2" \
     EVAL_BENCHMARKS=math500 EVAL_K=16 EVAL_LIMIT=100 \
     EVAL_VLLM_GPU_MEMORY_UTILIZATION=0.85 \
-    ./scripts/launch_eval_rho1b_sample_all8.sh
+    ./scripts/archive/rho1b/launch_eval_rho1b_sample_all8.sh
 ```
