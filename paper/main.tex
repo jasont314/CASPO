@@ -83,7 +83,7 @@ step-level credit is most needed. On the One-Shot-RLVR \texttt{dsr\_sub}
 DeepScaleR subset with Qwen2.5-Math-1.5B, the LaTeX-aware step splitter
 produces ${\sim}40$ step boundaries per response (vs.\ ${\sim}10$--$20$ on
 upstream MATH), and the $K{=}9$ Monte Carlo continuations push per-step
-training to ${\sim}33$ minutes on $4 \times$A100 80GB. A 600-outer-step
+training to ${\sim}33$ minutes on $4 \times$H100 80GB. A 600-outer-step
 \vineppo{} run at this configuration thus requires roughly $14$ days of
 wall-clock and is practically infeasible to run as a baseline at our
 experimental scale; the cost-effectiveness gap to \vineppo{} is largest

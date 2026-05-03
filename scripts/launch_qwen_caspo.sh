@@ -22,7 +22,7 @@
 #   RUN_EVAL=true
 #
 # ---- ETA ----
-#   ~15-17h on 4×A100 80GB (~95s/step × 600)
+#   ~15-17h on 4×H100 80GB (~95s/step × 600)
 #
 set -o pipefail
 

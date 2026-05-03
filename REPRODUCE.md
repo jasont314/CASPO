@@ -289,7 +289,7 @@ Targeted trainer/vLLM tests:
 
 Prerequisites: clone the repo, activate the `scalable` conda env (or set
 `CONDA_ENV` / `PYBIN`), have `dsr_sub.jsonl` available locally, and 4×
-A100/H100 80GB GPUs (FSDP=4). All launchers default to MAX_STEPS=600,
+H100 80GB GPUs (FSDP=4). All launchers default to MAX_STEPS=600,
 auto-eval all saved checkpoints on math500/gsm8k/olympiadbench at greedy
 (k=1, T=0) after training, and write eval results to
 `$OUT_DIR/eval/${ckpt}.json`.
@@ -301,7 +301,7 @@ GPU_LIST="0 1 2 3" \
 OUT_DIR=/mnt/data/runs/grpo_mu1_qwen25math15b_dsr \
 LOG_DIR=/tmp/grpo_mu1_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_grpo.sh
-# ETA: ~60-85 s/step × 600 = ~10-14 h on 4× A100 80GB
+# ETA: ~60-85 s/step × 600 = ~10-14 h on 4× H100 80GB
 
 # === GRPO (iso-budget, μ=2) — VinePPO-paper-style; matches PPO+critic / VinePPO / CASPO ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
@@ -310,7 +310,7 @@ OUT_DIR=/mnt/data/runs/grpo_mu2_qwen25math15b_dsr \
 LOG_DIR=/tmp/grpo_mu2_$(date +%Y%m%d_%H%M) \
 EPOCHS_PER_ROLLOUT=2 \
   bash scripts/launch_qwen_grpo.sh
-# ETA: ~110-160 s/step × 600 = ~18-26 h on 4× A100 80GB
+# ETA: ~110-160 s/step × 600 = ~18-26 h on 4× H100 80GB
 
 # === PPO + critic baseline ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
@@ -318,7 +318,7 @@ GPU_LIST="0 1 2 3" \
 OUT_DIR=/mnt/data/runs/ppo_critic_qwen25math15b_dsr \
 LOG_DIR=/tmp/ppo_critic_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_ppo_critic.sh
-# ETA: ~150 s/step × 600 = ~25 h on 4× A100 80GB
+# ETA: ~150 s/step × 600 = ~25 h on 4× H100 80GB
 ```
 
 **On GRPO epochs (μ=1 vs μ=2):** μ=1 is the GRPO-canonical choice
@@ -351,7 +351,7 @@ OUT_DIR=/mnt/data/runs/vineppo_qwen25math15b_dsr \
 VINEPPO_MC_ROLLOUTS=5 \
 MAX_STEPS=300 \
   bash scripts/launch_qwen_vineppo.sh
-# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× A100 80GB
+# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× H100 80GB
 ```
 
 ### Setup summary
@@ -368,7 +368,7 @@ MAX_STEPS=300 \
 | Group size | 8 |
 | Prompts per step | 128 (= 1024 responses per outer step at G=8) |
 | PPO minibatch | mb=4, grad_accum=8 (= 32 effective per rank, 128 global) |
-| Topology | FSDP=4 + colocated vLLM, 4× H100/A100 80GB |
+| Topology | FSDP=4 + colocated vLLM, 4× H100 80GB |
 | Policy LR | 1e-6 |
 | KL coef | 0.001 (CASPO/GRPO/VinePPO), 0.01 (PPO+critic — needs stronger anchor at 1B) |
 | Steps | 600 |

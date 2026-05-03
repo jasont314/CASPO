@@ -19,7 +19,7 @@
 #   DSR_SUB=/path/to/dsr_sub.jsonl  # the 1209-prompt One-Shot-RLVR JSONL
 #   OUT_DIR=/path/to/outputs
 #   LOG_DIR=/tmp/ppo_critic_$(date +%H%M)
-#   MAX_STEPS=600               # 600 RL outer iterations (~25h on 4×A100 80GB)
+#   MAX_STEPS=600               # 600 RL outer iterations (~25h on 4×H100 80GB)
 #   SAVE_EVERY=50               # ckpt every 50 steps
 #   KL_COEF=0.01                # 1B-stable; VinePPO upstream uses 1e-4 at 7B
 #                               # (1e-4 caused divergence at 1B in our runs)
@@ -37,12 +37,11 @@
 #      (1209 DeepScaleR prompts; SHA256 verifiable from paper repo)
 #   4. Disk: ~80 GB free for ckpts (10 saves × ~7 GB each at
 #      save_optimizer_state=false; ~190 GB if save_optim=true)
-#   5. Hardware: 4× A100 80GB or H100 80GB (FSDP=4, colocated vLLM at
+#   5. Hardware: 4× H100 80GB (FSDP=4, colocated vLLM at
 #      gpu_memory_utilization=0.35)
 #
 # ---- ETA ----
-#   ~25h on 4×A100 80GB (~150s/step × 600 steps)
-#   ~17h on 4×H100 80GB (faster compute + NVLink)
+#   ~25h on 4×H100 80GB (~150s/step × 600 steps)
 #
 set -o pipefail
 

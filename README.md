@@ -232,7 +232,7 @@ For copy-paste teammate quickstart commands, see
 
 Prerequisites: clone the repo, activate the `scalable` conda env (or set
 `CONDA_ENV` / `PYBIN`), have `dsr_sub.jsonl` available locally, and 4×
-A100/H100 80GB GPUs (FSDP=4). All launchers default to `MAX_STEPS=600`,
+H100 80GB GPUs (FSDP=4). All launchers default to `MAX_STEPS=600`,
 auto-eval all saved checkpoints on `math500/gsm8k/olympiadbench` at
 greedy (k=1, T=0) after training, and write eval JSON to
 `$OUT_DIR/eval/${ckpt}.json`.
@@ -244,7 +244,7 @@ GPU_LIST="0 1 2 3" \
 OUT_DIR=/mnt/data/runs/grpo_mu1_qwen25math15b_dsr \
 LOG_DIR=/tmp/grpo_mu1_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_grpo.sh
-# ETA: ~10-14 h on 4× A100 80GB
+# ETA: ~10-14 h on 4× H100 80GB
 
 # === GRPO (iso-budget, μ=2) — VinePPO-paper-style ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
@@ -253,7 +253,7 @@ OUT_DIR=/mnt/data/runs/grpo_mu2_qwen25math15b_dsr \
 LOG_DIR=/tmp/grpo_mu2_$(date +%Y%m%d_%H%M) \
 EPOCHS_PER_ROLLOUT=2 \
   bash scripts/launch_qwen_grpo.sh
-# ETA: ~18-26 h on 4× A100 80GB
+# ETA: ~18-26 h on 4× H100 80GB
 
 # === PPO + critic baseline ===
 DSR_SUB=/path/to/dsr_sub.jsonl \
@@ -261,7 +261,7 @@ GPU_LIST="0 1 2 3" \
 OUT_DIR=/mnt/data/runs/ppo_critic_qwen25math15b_dsr \
 LOG_DIR=/tmp/ppo_critic_$(date +%Y%m%d_%H%M) \
   bash scripts/launch_qwen_ppo_critic.sh
-# ETA: ~25 h on 4× A100 80GB
+# ETA: ~25 h on 4× H100 80GB
 ```
 
 **On GRPO μ=1 vs μ=2:** μ=1 is the GRPO-canonical choice (DeepSeekMath
@@ -285,7 +285,7 @@ OUT_DIR=/mnt/data/runs/vineppo_qwen25math15b_dsr \
 VINEPPO_MC_ROLLOUTS=5 \
 MAX_STEPS=300 \
   bash scripts/launch_qwen_vineppo.sh
-# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× A100 80GB
+# ETA: ~12 min/step × 300 = ~60 h (~2.5 days) on 4× H100 80GB
 ```
 
 If 8 GPUs are available, runs can be parallelized: GRPO μ=1 on GPUs 0-3,
@@ -324,7 +324,7 @@ inherit from YAML and don't override). Fix: do NOT hardcode
 `kl_coef` in PPO+critic launchers; inherit YAML's stronger
 ref-anchor or set explicitly to ≥0.01.
 
-ETA on 4×A100 80GB: ~150-180s/step × 500 steps ≈ **~22-25h** for
+ETA on 4×H100 80GB: ~150-180s/step × 500 steps ≈ **~22-25h** for
 PPO+critic. Slower than CASPO Δp (~80s/step × 500 ≈ 11h) primarily
 because of `epochs_per_rollout=2`.
 

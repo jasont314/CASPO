@@ -24,7 +24,7 @@
 #   RUN_EVAL=true
 #
 # ---- ETA ----
-# ~33h on 4×A100 80GB (~200 s/step × 600). VinePPO has K_MC × n_steps extra
+# ~33h on 4×H100 80GB (~200 s/step × 600). VinePPO has K_MC × n_steps extra
 # rollouts per training step, so ~30% slower than PPO+critic.
 #
 set -o pipefail

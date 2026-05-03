@@ -35,12 +35,11 @@
 #      (1209 DeepScaleR prompts; SHA256 verifiable from paper repo)
 #   4. Disk: ~80 GB free for ckpts (10 saves × ~7 GB each at
 #      save_optimizer_state=false)
-#   5. Hardware: 4× A100 80GB or H100 80GB (FSDP=4, colocated vLLM at
+#   5. Hardware: 4× H100 80GB (FSDP=4, colocated vLLM at
 #      gpu_memory_utilization=0.45)
 #
 # ---- ETA ----
-#   ~14h on 4×A100 80GB (~85s/step × 600 steps)
-#   ~10h on 4×H100 80GB
+#   ~10-14h on 4×H100 80GB (~60-85s/step × 600 steps)
 #
 set -o pipefail
 
