@@ -304,8 +304,8 @@ broadcast over the tokens in each step span for \vineppo{}/\caspo{}.
      $V(s_t)=\bar R_K$};
 \node[valbox, below=of vvine] (vcaspo)
     {\caspo{}\\
-     $V_\phi(s_t)\!=\!\beta\!\sum\!\log\!\frac{\pi_\phi}{\pi_{\mathrm{ref}}}$\\
-     learned prefix value};
+     $V_\phi(s_t) \approx P(\text{success}\mid s_t)$\\
+     learned prefix value (IPVRM)};
 
 % Step-TD / advantage column
 \node[box, right=18mm of vpc.east, minimum width=33mm, fill=black!4] (adv)
@@ -332,8 +332,9 @@ $A_t = r_t + \gamma V(s_{t\!+\!1}) - V(s_t)$. \grpo{} uses no value
 \ppocritic{} (the canonical Schulman-2017 \ppo{}) learns a scalar per-token
 value head trained on $(V_\psi - \hat R)^2$ with GAE. \vineppo{} estimates
 $V(s_t)$ by averaging $K{=}9$ on-policy continuations from each prefix.
-\caspo{} replaces those continuations with an \ipvrm{}-style
-cumulative-log-ratio prefix value model $V_\phi$.}
+\caspo{} replaces those continuations with a learned prefix value model
+$V_\phi(s_t)$ trained to approximate $P(\text{success}\mid s_t)$
+(IPVRM's cumulative-log-ratio parameterization, §\ref{sec:vphi}).}
 \label{fig:methods}
 \end{figure}
 
@@ -343,6 +344,7 @@ identical across all four methods. Only the source of the per-step value
 $V(s_t)$ differs.
 
 \subsection{Prefix value model}
+\label{sec:vphi}
 Following \ipvrm{} \citep{ipvrm2026}, we define
 \begin{equation}
 \label{eq:vphi}
