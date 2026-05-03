@@ -422,7 +422,8 @@ A learned PRM is in-distribution only at the policy state on which its
 MC labels were collected. As RL training updates the policy, the
 prefixes seen at outer step $t$ drift away from the policy that
 generated the Phase-1 labels, and $V_\phi$'s calibration on those
-prefixes deteriorates. Concretely, on Qwen2.5-Math-1.5B + dsr_sub we
+prefixes deteriorates. Concretely, on Qwen2.5-Math-1.5B with the
+\texttt{dsr\_sub} dataset we
 measure the per-checkpoint Spearman $\rho$ between $V_\phi(s_t)$ and a
 fresh $J{=}8$ MC estimate of $P(\text{success} \mid s_t)$ at policy
 states $\{$step\_50, step\_100, $\ldots$, step\_400$\}$. A PRM trained
@@ -448,16 +449,15 @@ well above the empirical $\tau \approx 0.4$ floor at which the
 credit-signal contribution of $V_\phi$ becomes negligible.
 
 \paragraph{Refresh cost.}
-A single refresh on Qwen2.5-Math-1.5B + dsr_sub takes
+A single refresh on Qwen2.5-Math-1.5B with \texttt{dsr\_sub} takes
 $\approx 91$ minutes on $4 \times$H100 80GB ($\approx 41$~min for MC
 collection at $K{=}16$, $J{=}8$ on $N{=}300$ prompts, plus
 $\approx 50$~min for FSDP=4 PRM training). At $k = 150$ this amortizes
-to $\approx 36$~s of refresh overhead per RL outer step, well under
-the per-step cost of one extra \vineppo{} MC continuation
-($K{=}9 \to K{=}10$). Total \caspo{}+refresh wall-clock for a
-600-step RL run thus exceeds the no-refresh \caspo{} baseline by
-roughly $5{-}6$~h, but remains an order of magnitude below
-\vineppo{} K=9.
+to $\approx 36$~s of refresh overhead per RL outer step, raising
+total \caspo{}+refresh wall-clock for a 600-step RL run by roughly
+$5{-}6$~h above the no-refresh \caspo{} baseline. The amortized
+refresh cost is small relative to overall per-step training time and
+is an order of magnitude below \vineppo{}~$K{=}9$.
 
 \paragraph{Ablation.}
 We report \caspo{} both with and without refresh: \caspo{} (the
