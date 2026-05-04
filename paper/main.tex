@@ -1134,26 +1134,47 @@ column.
 We train RL on the full 1209-prompt \texttt{dsr\_sub} set and observe
 strong generalization to MATH-500, GSM8K, OlympiadBench, AMC, AIME, and
 \texttt{college\_math} despite the training-prompt count being orders
-of magnitude smaller than typical instruction-tuning corpora. Concretely
-the entire RL-training distribution fits in a fixed 1209-prompt subset
-of \texttt{DeepScaleR}, yet pass@1 lifts on out-of-distribution
-benchmarks are competitive with much larger PPO recipes
-(Section~\ref{sec:results}). This raises a sharp practical question:
-\emph{how small can the RL prompt set be while still yielding the same
-benchmark transfer?} A 300-prompt RL set, for instance, would cut both
-the PRM training wall-clock and the RL rollout wall-clock by roughly
-$4{\times}$ relative to the 1209-prompt default --- both phases scale
-roughly linearly with prompt count at fixed $K$, $J$, and rollouts
-per RL step --- and the iterated-refresh schedule (\S\ref{sec:refresh})
-would amortize even further if the per-iteration PRM is cheaper.
-Promising next experiments: (i) sweep prompt-set sizes
-$N \in \{100, 300, 600, 1209\}$ at fixed RL budget and report the
-benchmark-transfer Pareto curve; (ii) compare a fixed random subset to
-a curated difficulty-balanced subset (since success-rate distributions
-shift with the prompt mix, per Section~\ref{sec:vphi}); and (iii) test
-whether a small high-quality RL prompt set combined with a high-quality
-\emph{PRM} (trained on a separate larger collection) can match the full
-1209 RL recipe at a fraction of the wall-clock. The structural
+of magnitude smaller than typical instruction-tuning corpora.
+
+\emph{Asymmetric generalization requirement.} A subtle point that this
+result foregrounds: the PRM and the policy face very different
+generalization demands. The PRM is only ever queried on prefixes the
+policy generates during RL, and those prefixes always come from the
+same fixed RL prompt set; the PRM never has to extrapolate to a new
+prompt distribution. The policy, by contrast, must transfer from those
+same RL prompts to the actual evaluation benchmarks. This is exactly
+the asymmetry our held-out comparison exposes: the same $V_\phi$ that
+held-out OOD evaluation flags as having weak rank-correlation on
+unseen prompts is nonetheless the same $V_\phi$ that drives
+useful step-TD advantages \emph{on its own training prompts} during
+RL, where it does not need to generalize. Crucially, the policy's
+benchmark transfer is then carried by the underlying base SFT
+representations and by the structural reasoning patterns RL reinforces,
+not by the PRM extrapolating to new problems. So an in-distribution-only
+PRM trained on a small high-quality RL set is not a weakness --- it is
+the operating regime the design tolerates.
+
+\emph{Practical question.} \emph{How small can the RL prompt set be
+while still yielding the same benchmark transfer?} A 300-prompt RL set,
+for instance, would cut both the PRM training wall-clock and the RL
+rollout wall-clock by roughly $4{\times}$ relative to the 1209-prompt
+default --- both phases scale roughly linearly with prompt count at
+fixed $K$, $J$, and rollouts per RL step --- and the iterated-refresh
+schedule (\S\ref{sec:refresh}) would amortize even further if the
+per-iteration PRM is cheaper. The asymmetric-generalization framing
+above makes this plausible: a tight PRM on a small RL set is enough
+because the PRM only has to be calibrated \emph{on that set}; the
+policy generalizes via the base LM features.
+
+\emph{Promising next experiments.} (i) Sweep prompt-set sizes
+$N \in \{100, 300, 600, 1209\}$ at fixed RL budget and report
+the benchmark-transfer Pareto curve, distinguishing PRM held-out
+ρ (which is allowed to be low) from policy benchmark pass@1 (which
+must remain high). (ii) Compare a fixed random subset to a curated
+difficulty-balanced subset at the same $N$ (since success-rate
+distributions shift with the prompt mix, per Section~\ref{sec:vphi}).
+(iii) Decouple the budgets entirely: a \emph{small} high-quality RL
+prompt set paired with a \emph{larger}-collection PRM. The structural
 advantage of \caspo{} over methods that require on-policy MC
 continuations (\vineppo{}) is exactly that the PRM is decoupled from
 the RL prompt set, so the two budgets can be chosen independently.
