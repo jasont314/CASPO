@@ -193,7 +193,8 @@ for r in 0 1 2 3; do
     --epochs "$EPOCHS" --val_fraction "$VAL_FRACTION" \
     --early_stop_patience "$EARLY_STOP_PATIENCE" \
     --beta "$BETA" --seed "$SEED" \
-    --save_every 500 --eval_every 100 \
+    --save_every 500 --eval_every 200 \
+    --eval_mb 16 \
     > "$log" 2>&1 &
   TRAIN_PIDS+=("$!")
 done

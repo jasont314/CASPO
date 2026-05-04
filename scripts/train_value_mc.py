@@ -74,9 +74,15 @@ class SigmoidHeadValueModel(torch.nn.Module):
     def forward(self, prompt_ids, prompt_mask, response_ids, response_mask):
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
-        # phi.model bypasses the LM head — we only need backbone hidden states.
-        out = self.phi.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = out.last_hidden_state  # [B, P+R, H]
+        # Call phi (the FSDP-wrapped outer module) so flat-sharded params are
+        # properly all-gathered. Calling self.phi.model directly trips FSDP's
+        # 1-D flat param view → "weight must be 2-D" inside torch.embedding.
+        # We pay an unused lm_head matmul (tied embeds → no extra storage, ~1ms/step).
+        out = self.phi(
+            input_ids=input_ids, attention_mask=attention_mask,
+            output_hidden_states=True, use_cache=False,
+        )
+        hidden = out.hidden_states[-1]  # last-layer hidden [B, P+R, H]
         # Slice response-side hidden states only — caller indexes by step_end_idx
         # which is already a response-token offset (0..R-1).
         P = prompt_ids.shape[1]
@@ -153,6 +159,10 @@ def main():
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--mb", type=int, default=8)
+    ap.add_argument("--eval_mb", type=int, default=0,
+                    help="eval batch size (0 = use 4×mb). Eval has no backward, "
+                         "so the activation footprint is much smaller than train; "
+                         "a 4× larger eval batch typically halves total eval wall.")
     ap.add_argument("--grad_accum", type=int, default=1, help="gradient accumulation steps; effective batch = mb*FSDP_size*grad_accum")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--save_every", type=int, default=200)
@@ -422,8 +432,12 @@ def main():
         n_eval_t = torch.zeros(1, device=device)
         local_preds = []
         local_phat = []
-        for s in range(0, len(local_val), args.mb):
-            batch_idxs = torch.tensor(local_val[s:s + args.mb], dtype=torch.long)
+        # Eval batch size: default is 4×mb because eval has no backward → no
+        # activation memory growth → can fit a much larger forward batch. This
+        # cuts eval wall by ~3-4× without affecting metric.
+        eval_mb = args.eval_mb if args.eval_mb > 0 else max(args.mb * 4, args.mb)
+        for s in range(0, len(local_val), eval_mb):
+            batch_idxs = torch.tensor(local_val[s:s + eval_mb], dtype=torch.long)
             loss, mse, _, preds, p_hat = forward_loss(batch_idxs, return_preds=True)
             n = float(len(batch_idxs))
             total_loss_t += loss.detach().float() * n

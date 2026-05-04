@@ -88,9 +88,20 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_prompt_len + args.max_response_len,
         enable_prefix_caching=True, trust_remote_code=True,
+        # Phase B has many concurrent decode sequences (J=8 × ~4000 prefixes per
+        # bucket). Pushing max_num_seqs and max_num_batched_tokens above the
+        # default (256 / 8192) keeps the GPU saturated through the long Phase B
+        # tail. enable_chunked_prefill overlaps the per-bucket prefill burst
+        # with ongoing decode from the previous bucket.
+        max_num_seqs=512,
+        max_num_batched_tokens=16384,
+        enable_chunked_prefill=True,
         seed=args.seed,
     )
-    reward_fn = MathRewardFn()
+    # num_workers=8 parallelizes the per-shard ~33k continuation MathRewardFn
+    # verifications across a ProcessPoolExecutor. Verification was the single-
+    # threaded tail (~1-2 min per shard); 8 workers cuts it to ~10-20s.
+    reward_fn = MathRewardFn(num_workers=8)
 
     # ============================================================
     # Load prompts
