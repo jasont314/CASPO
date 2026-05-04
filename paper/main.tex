@@ -181,13 +181,22 @@ TD-style step advantages.
 \ipvrm{} \citep{ipvrm2026} formalizes prefix values as cumulative
 log-ratios of a trainable prefix policy versus a frozen reference policy,
 trained from trajectory-level outcome labels using a margin BCE. We
-\emph{share \ipvrm{}'s framing} of $V_\phi$ as a calibrated correctness
-predictor that drives a step-TD advantage, but \emph{differ
-architecturally and on training data}: our $V_\phi$ is a single sigmoid
-head trained on dense Monte Carlo step labels (not trajectory-level
-labels with a margin), and we replace inline online updates with
-periodic full retraining of $V_\phi$ from scratch on current-policy
-rollouts.
+\emph{adopt \ipvrm{}'s cumulative-log-ratio architecture} for $V_\phi$
+and its framing as a calibrated correctness predictor that drives a
+step-TD advantage. Our differences are in \emph{training-data form} and
+\emph{refresh strategy}: we train $V_\phi$ on dense Monte Carlo step
+labels with a continuous-target BCE (rather than trajectory-level
+labels with the margin term), and we replace inline online updates
+with periodic full retraining of $V_\phi$ from scratch on current-policy
+rollouts. We also empirically verified that the cumulative-log-ratio
+parameterization is essential: at matched hyperparameters and training
+data, an alternative single-sigmoid-head parameterization
+$V_\phi(s_t) = \sigma(W h_\phi(s_t))$ converged at val Spearman
+$\rho \approx 0.43$ versus $\rho \approx 0.78$ for the
+log-ratio architecture (matched step 1000), because the log-ratio's
+$V_\phi(s_t) = \beta \sum_{i<t} \log\!\big(\pi_\phi/\pi_{\mathrm{ref}}\big)(a_i \mid s_{<i})$
+decomposition yields one direct gradient term per response token rather
+than a single end-of-prefix gradient.
 
 \paragraph{Per-token learned-critic baselines.}
 The classical PPO-with-critic recipe \citep{schulman2017ppo} uses a learned
@@ -309,7 +318,7 @@ broadcast over the tokens in each step span for \vineppo{}/\caspo{}.
 \node[valbox, below=of vvine] (vcaspo)
     {\caspo{}\\
      $V_\phi(s_t) \approx P(\text{success}\mid s_t)$\\
-     learned PRM (sigmoid head)};
+     learned PRM (\ipvrm{} log-ratio)};
 
 % Step-TD / advantage column
 \node[box, right=18mm of vpc.east, minimum width=33mm, fill=black!4] (adv)
@@ -357,12 +366,31 @@ reaches a correct final answer:
 \label{eq:vphi}
 V_\phi(s_t) \;\approx\; P\big(R(x, y) = 1 \mid s_t\big).
 \end{equation}
-We parameterize $V_\phi$ as a transformer with the same backbone as the
-base policy (initialized from the same SFT checkpoint) and a scalar
-output head with a sigmoid activation, so that $V_\phi(s_t) \in [0, 1]$
-by construction. We refer to $V_\phi$ as the \emph{process reward
-model} (PRM), following the convention of \citet{ipvrm2026} and the
-process-supervision literature.
+Following \ipvrm{} \citep{ipvrm2026} we parameterize $V_\phi$ as a
+\emph{cumulative log-ratio} of a trainable prefix policy
+$\pi_\phi$ against a frozen reference policy $\pi_{\mathrm{ref}}$
+(both initialized from the same SFT checkpoint as the base policy):
+\begin{equation}
+\label{eq:vphi_param}
+V_\phi(s_t) \;=\; \beta \sum_{i<t}
+   \log\!\frac{\pi_\phi(a_i \mid s_{<i})}{\pi_{\mathrm{ref}}(a_i \mid s_{<i})},
+\end{equation}
+with $\beta = 10$ a fixed stability scale. The PRM probability is
+recovered by a sigmoid on the scaled logit
+$\sigma\!\big(V_\phi(s_t)/\beta\big) \in [0, 1]$. At initialization
+$\pi_\phi = \pi_{\mathrm{ref}}$, so $V_\phi \equiv 0$ everywhere and
+the implied probability is exactly $0.5$ for every prefix --- a
+natural calibrated prior. We refer to $V_\phi$ as the \emph{process
+reward model} (PRM), following the convention of \citet{ipvrm2026}
+and the process-supervision literature. The cumulative-log-ratio
+form is critical: because the value at any prefix decomposes as a
+sum of per-token log-ratio terms, every response token contributes a
+direct gradient signal during training rather than only the
+single-token signal an end-of-prefix scalar head would provide. We
+verified empirically that replacing this parameterization with
+$V_\phi(s_t) = \sigma(W h_\phi(s_t))$ at matched hyperparameters
+collapses validation Spearman $\rho$ from $\approx 0.78$ to
+$\approx 0.43$ (\S\ref{sec:phase1}).
 
 \subsection{Phase-1: PRM training via Monte Carlo step labels}
 \label{sec:phase1}
@@ -384,23 +412,34 @@ rollouts whose $J$ continuations are all 0 or all 1 at every sampled
 boundary, since saturated prefixes contribute no learning signal.
 
 We train $V_\phi$ to minimize binary cross-entropy against the
-continuous targets $\widehat{p}(s_t) \in [0, 1]$:
+continuous targets $\widehat{p}(s_t) \in [0, 1]$, applied to the
+sigmoid of the scaled cumulative log-ratio:
 \begin{equation}
 \label{eq:prmloss}
 \mathcal{L}_{\mathrm{PRM}}(\phi) \;=\;
 -\,\mathbb{E}_{s_t}\!\Big[\,
-\widehat{p}(s_t)\,\log V_\phi(s_t)
+\widehat{p}(s_t)\,\log \sigma\!\big(V_\phi(s_t)/\beta\big)
 \;+\;
-\big(1-\widehat{p}(s_t)\big)\,\log\!\big(1 - V_\phi(s_t)\big)
-\Big].
+\big(1-\widehat{p}(s_t)\big)\,\log\!\big(1 - \sigma\!\big(V_\phi(s_t)/\beta\big)\big)
+\Big],
 \end{equation}
-Equation~\eqref{eq:prmloss} is BCE on continuous targets in $[0, 1]$
-rather than binary; it minimizes the Bregman divergence between
-$V_\phi(s_t)$ and the MC label $\widehat{p}(s_t)$ and recovers the same
-calibration target without needing the trajectory-level margin term of
-\ipvrm{} \citep{ipvrm2026}. We train for two epochs with full-model
-FSDP updates, $\beta = 10$ stability scaling on the pre-sigmoid logit,
-effective batch size 32, and learning rate $5 \times 10^{-6}$.
+with $V_\phi(s_t)$ defined by the cumulative log-ratio
+of \eqref{eq:vphi_param}. Equation~\eqref{eq:prmloss} is BCE on
+continuous targets in $[0, 1]$ rather than binary; it minimizes the
+Bregman divergence between the implied PRM probability
+$\sigma\!\big(V_\phi(s_t)/\beta\big)$ and the MC label
+$\widehat{p}(s_t)$, and recovers the same calibration target without
+needing the trajectory-level margin term of \ipvrm{}
+\citep{ipvrm2026}. Concretely, the trainer caches the per-token
+log-probabilities of $\pi_\phi$ and $\pi_{\mathrm{ref}}$ on the
+prefix, forms the per-token log-ratios, takes a cumulative sum, and
+gathers the value at the step boundary $s_t$. Because all $i \le t$
+log-ratio terms enter the loss additively, every response token in
+the prefix produces a direct gradient signal --- which is the
+empirical reason this parameterization dominates an end-of-prefix
+scalar-head alternative (\S\ref{sec:related}). We train for two
+epochs with full-model FSDP updates, $\beta = 10$, effective batch
+size 32, and learning rate $5 \times 10^{-6}$.
 
 \subsection{Phase-2: step-TD policy optimization}
 At each PPO outer step, the trainer samples $G$ responses per prompt
@@ -616,9 +655,9 @@ coefficient $1.0$, critic LR $10^{-6}$.
 \item[\vineppo{}] $K=9$ Monte Carlo continuations from each non-terminal step
 boundary; step-TD advantages.
 \item[\caspo{}] Learned process reward model
-$V_\phi(s_t) \approx P(\text{success} \mid s_t)$, a sigmoid-head
-network trained on Monte Carlo step labels (Section~\ref{sec:phase1}),
-plugged into the step-TD advantage. We report two step-TD formulations
+$V_\phi(s_t) \approx P(\text{success} \mid s_t)$, an \ipvrm{}-style
+cumulative-log-ratio network trained on Monte Carlo step labels
+(Section~\ref{sec:phase1}), plugged into the step-TD advantage. We report two step-TD formulations
 (Section~\ref{sec:transforms}): \caspo{}-$\Delta p$ (default) and
 \caspo{}-$\Delta\log p$ (ablation). Each is reported with and without
 the iterated PRM-refresh schedule of Section~\ref{sec:refresh},
