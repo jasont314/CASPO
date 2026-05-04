@@ -413,6 +413,31 @@ def main():
         else:
             if hasattr(pv, "save_pretrained"):
                 pv.save_pretrained(path)
+        # Save FSDP-aware optimizer state. Without this, resuming a partial
+        # PRM run starts with fresh Adam moments → loss blows up for ~50
+        # steps until 2nd-moment estimate stabilises (cf. memory
+        # feedback_resume_optimizer_state.md). Only rank 0 writes.
+        try:
+            if isinstance(pv.phi, FSDP):
+                from torch.distributed.fsdp.api import (
+                    FullStateDictConfig as _FSDC,
+                    FullOptimStateDictConfig,
+                    StateDictType as _SDT,
+                )
+                full_optim_cfg = FullOptimStateDictConfig(
+                    offload_to_cpu=True, rank0_only=True,
+                )
+                full_state_cfg = _FSDC(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(pv.phi, _SDT.FULL_STATE_DICT,
+                                         full_state_cfg, full_optim_cfg):
+                    optim_state = FSDP.optim_state_dict(pv.phi, optim)
+            else:
+                optim_state = optim.state_dict()
+            if is_main:
+                torch.save(optim_state, os.path.join(path, "optimizer.pt"))
+        except Exception as _e:
+            if is_main:
+                _rprint(f"[mc-train] optimizer save failed: {_e}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
