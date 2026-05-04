@@ -77,9 +77,14 @@ def main():
         tok.pad_token = tok.eos_token
 
     print(f"[mc] init vLLM (max_model_len={args.max_prompt_len + args.max_response_len})", flush=True)
+    # NOTE: kv_cache_dtype="fp8" was tried as a "free 25-35%" speedup but it
+    # collapses Qwen2.5-Math-1.5B to multilingual-token gibberish at
+    # max_response_len=2048 (verified empirically: v2 bf16 KV → coherent
+    # \boxed{} outputs; v3 fp8 KV → 1/75 mixed-outcome with garbage tokens
+    # past ~500 tokens). fp8 KV's accumulated quantization error breaks long
+    # autoregressive Qwen2 generation even though it's "fine" at PPL eval.
     llm = LLM(
         model=args.model, dtype="bfloat16",
-        kv_cache_dtype="fp8",
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_prompt_len + args.max_response_len,
         enable_prefix_caching=True, trust_remote_code=True,
