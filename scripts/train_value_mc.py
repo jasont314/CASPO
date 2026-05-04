@@ -165,16 +165,36 @@ def main():
     else:
         # FSDP-wrap phi only (ref is frozen) — full FT path
         if world_size > 1:
-            pv.phi = FSDP(
-                pv.phi,
+            # Use per-block auto_wrap_policy (mirrors caspo/value/train_value.py).
+            # Without this, the entire 1.5B model is one FSDP unit → no
+            # compute/comm overlap → ~2-3× wallclock vs per-block wrapping.
+            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+            import functools
+            # Auto-detect transformer block classes (Qwen2DecoderLayer etc.)
+            layer_classes = set()
+            for module in pv.phi.modules():
+                cls_name = type(module).__name__
+                if cls_name.endswith("DecoderLayer") or cls_name.endswith("Block"):
+                    layer_classes.add(type(module))
+            wrap_kwargs = dict(
                 device_id=local_rank,
                 mixed_precision=MixedPrecision(
                     param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
+                    reduce_dtype=torch.bfloat16,  # was fp32 — bf16 halves comm bytes;
+                                                  # PRM training is short + tolerant
                     buffer_dtype=torch.bfloat16,
                 ),
                 sync_module_states=True,
+                forward_prefetch=True,
+                limit_all_gathers=True,
+                use_orig_params=True,
             )
+            if layer_classes:
+                wrap_kwargs["auto_wrap_policy"] = functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls=layer_classes,
+                )
+            pv.phi = FSDP(pv.phi, **wrap_kwargs)
     pv.ref.eval()
     for p in pv.ref.parameters():
         p.requires_grad = False

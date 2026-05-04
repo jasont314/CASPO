@@ -97,6 +97,9 @@ MAX_TRAIN_PREFIX_LEN="${MAX_TRAIN_PREFIX_LEN:-0}"
 PHI_INIT="${PHI_INIT:-Qwen/Qwen2.5-Math-1.5B}"
 REF_PATH="${REF_PATH:-}"
 LR="${LR:-5e-6}"
+# Reverted to validated v3 config (mb=4 grad_accum=2). Earlier mb=8 grad_accum=1
+# was untested at seq=3072 and ran ~2× slower per step than mb=4 (per
+# feedback_grpo_mb_pareto.md: "mb=4 best (65s/step), mb=8 slower (72s)").
 TRAIN_MB="${TRAIN_MB:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 EPOCHS="${EPOCHS:-2}"
