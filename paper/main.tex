@@ -1130,6 +1130,34 @@ ablations should default to held-out prompts and quantify the gap
 between in-distribution and OOD performance as a single reported
 column.
 
+\paragraph{Minimum RL training-set size for benchmark transfer.}
+We train RL on the full 1209-prompt \texttt{dsr\_sub} set and observe
+strong generalization to MATH-500, GSM8K, OlympiadBench, AMC, AIME, and
+\texttt{college\_math} despite the training-prompt count being orders
+of magnitude smaller than typical instruction-tuning corpora. Concretely
+the entire RL-training distribution fits in a fixed 1209-prompt subset
+of \texttt{DeepScaleR}, yet pass@1 lifts on out-of-distribution
+benchmarks are competitive with much larger PPO recipes
+(Section~\ref{sec:results}). This raises a sharp practical question:
+\emph{how small can the RL prompt set be while still yielding the same
+benchmark transfer?} A 300-prompt RL set, for instance, would cut both
+the PRM training wall-clock and the RL rollout wall-clock by roughly
+$4{\times}$ relative to the 1209-prompt default --- both phases scale
+roughly linearly with prompt count at fixed $K$, $J$, and rollouts
+per RL step --- and the iterated-refresh schedule (\S\ref{sec:refresh})
+would amortize even further if the per-iteration PRM is cheaper.
+Promising next experiments: (i) sweep prompt-set sizes
+$N \in \{100, 300, 600, 1209\}$ at fixed RL budget and report the
+benchmark-transfer Pareto curve; (ii) compare a fixed random subset to
+a curated difficulty-balanced subset (since success-rate distributions
+shift with the prompt mix, per Section~\ref{sec:vphi}); and (iii) test
+whether a small high-quality RL prompt set combined with a high-quality
+\emph{PRM} (trained on a separate larger collection) can match the full
+1209 RL recipe at a fraction of the wall-clock. The structural
+advantage of \caspo{} over methods that require on-policy MC
+continuations (\vineppo{}) is exactly that the PRM is decoupled from
+the RL prompt set, so the two budgets can be chosen independently.
+
 \section{Conclusion}
 \label{sec:conclusion}
 
