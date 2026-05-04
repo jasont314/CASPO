@@ -197,6 +197,11 @@ def main():
                     help="Path to a separate mc_labels-format .pt file to use as the val "
                          "set (replacing the in-data split). Use this for true OOD-prompt "
                          "evaluation against a held-out dsr_sub subset.")
+    ap.add_argument("--held_out_max_rows", type=int, default=0,
+                    help="If >0, truncate held-out val to this many rows. ~12k rows "
+                         "(≈200 unique prompts) gives ρ CI half-width ±0.07 — plenty "
+                         "for an architecture-comparison signal — and cuts eval wall by "
+                         "~4× vs evaluating the full 909-prompt collection.")
     args = ap.parse_args()
 
     from caspo.config import CASPOConfig
@@ -256,6 +261,16 @@ def main():
     if args.held_out_data is not None:
         _rprint(f"[mc-train] loading HELD-OUT val data from {args.held_out_data}")
         val_blob = torch.load(args.held_out_data, map_location="cpu", weights_only=False)
+        # Optional cap to keep eval wall manageable. Held-out files are
+        # typically deterministically ordered by shard concat, so a
+        # head-slice is a representative sample (no need to shuffle).
+        if args.held_out_max_rows > 0 and val_blob["prompt_ids"].shape[0] > args.held_out_max_rows:
+            cap = args.held_out_max_rows
+            for _k in ("prompt_ids", "prompt_mask", "response_ids",
+                       "response_mask", "step_end_idx", "p_hat", "outcomes"):
+                if _k in val_blob and torch.is_tensor(val_blob[_k]):
+                    val_blob[_k] = val_blob[_k][:cap].contiguous()
+            _rprint(f"[mc-train] held-out truncated to {cap} rows (--held_out_max_rows)")
         for _k in ("prompt_ids", "prompt_mask", "response_ids",
                    "response_mask", "step_end_idx", "p_hat"):
             if _k in val_blob and torch.is_tensor(val_blob[_k]) and not val_blob[_k].is_pinned():

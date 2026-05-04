@@ -1076,6 +1076,60 @@ Results at 1.5B and 7B may not transfer to substantially larger scales. The
 7B FSDP+vLLM-IPC stack is novel to this work; whether the same configuration
 extrapolates to 70B is an open systems question.
 
+\section{Future Work: Optimizing the Success-Prediction Architecture}
+\label{sec:future-work}
+Our results adopt \ipvrm{}'s cumulative-log-ratio parameterization for
+$V_\phi$ unchanged, after empirically confirming it dominates a
+single-sigmoid-head alternative under matched hyperparameters
+(Section~\ref{sec:related}). The architectural margin appears to come
+from gradient density --- the log-ratio decomposes loss as a sum of
+per-token contributions, so every response token in the prefix supplies
+a direct gradient signal --- but several design questions remain open
+within this regime.
+
+\paragraph{Heads, depths, and ensembles.}
+We trained $V_\phi$ with a single learnable backbone whose log-ratio is
+read directly. Future work should compare (i) deeper non-linear value
+heads on top of the cumulative log-ratio (e.g.\ a 2--3 layer MLP that
+maps $V_\phi(s_t)$ to a scalar logit), (ii) Q-style critics that score
+each per-token continuation rather than a prefix value, and (iii)
+ensembles of $V_\phi$ trained with different seeds or label collections,
+both as variance-reduction tools and as honest-uncertainty signals for
+the step-TD advantage.
+
+\paragraph{Differential learning-rate schedules.}
+Both architectures we report use a single LR over the entire backbone.
+Standard practice for fresh value heads is a 10--100$\times$ higher LR
+than the pretrained backbone with a brief warmup; this could close some
+of the gap on the sigmoid-head baseline and may also help the log-ratio
+PRM at smaller training-data sizes. We did not sweep this axis.
+
+\paragraph{Training-data form.}
+We use Math-Shepherd-style continuous-target BCE on per-prefix Monte
+Carlo $\widehat{p}$ with $J=8$ continuations and $S=5$ step prefixes
+per response. Promising variants include: increasing $J$ for tighter
+$\widehat{p}$ variance at fixed compute through bucketed batching;
+calibration-aware losses (focal BCE, temperature-scaled targets) when
+the underlying success-rate distribution is bimodal; and contrastive
+losses pairing within-prompt prefixes of different success rates.
+
+\paragraph{Inference-time refinements.}
+At inference, $V_\phi$ is queried in a single forward pass. Test-time
+ensembling (multiple seeds, MC-dropout, temperature scaling on
+$V_\phi/\beta$) and online calibration on a small held-out probe set
+during RL could improve both the calibration and the action of the
+step-TD advantage on \caspo{} performance.
+
+\paragraph{Held-out probe protocol.}
+The empirical comparison reported here uses a prompt-level held-out
+split (\texttt{--split\_by\_prompt} or \texttt{--held\_out\_data}); the
+prefix-level row shuffle that the trainer still supports as a legacy
+default exhibits same-prompt leakage and should not be used for any
+load-bearing claims about $V_\phi$ generalization. Future PRM
+ablations should default to held-out prompts and quantify the gap
+between in-distribution and OOD performance as a single reported
+column.
+
 \section{Conclusion}
 \label{sec:conclusion}
 
