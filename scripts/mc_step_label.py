@@ -140,7 +140,17 @@ def main():
     sp_base = SamplingParams(n=args.K, temperature=args.temperature, top_p=args.top_p,
                               max_tokens=args.max_response_len, skip_special_tokens=True, seed=args.seed)
     t0 = time.time()
-    base_outputs = llm.generate(prompts, sp_base)
+    # prompt_token_ids passthrough: pre-tokenize once + pass IDs to skip vLLM's
+    # internal retokenization. Token IDs are reused below for Phase B prefix
+    # construction (no decode→retokenize roundtrip → cleaner prefix-cache hits).
+    phase_a_prompt_ids = [
+        tok(p, add_special_tokens=True, truncation=True, max_length=args.max_prompt_len).input_ids
+        for p in prompts
+    ]
+    base_outputs = llm.generate(
+        prompts=[{"prompt_token_ids": pids} for pids in phase_a_prompt_ids],
+        sampling_params=sp_base,
+    )
     print(f"[mc] Phase A done in {time.time()-t0:.1f}s", flush=True)
 
     # Verify outcomes for all base rollouts
@@ -231,33 +241,41 @@ def main():
         print("[mc] Phase B: nothing to label, exiting.", flush=True)
         return
 
-    # Build prefix prompts for vLLM. Each prefix = original prompt + base response tokens [0:end_idx+1]
+    # Build prefix token-id lists (no decode→retokenize roundtrip → exact prefix-cache hits).
     print(f"[mc] Phase B: building prefix prompts for {n_jobs} jobs...", flush=True)
-    prefix_prompts = []
+    prefix_token_ids_list = []
     prefix_metadata = []  # (flat_row_idx, end_idx, max_continuation_tokens)
     for r, end_idx in mc_jobs:
         prompt_idx, k_idx, _, _ = flat_rows[r]
         prefix_response_ids = response_ids_pad[r, : end_idx + 1].tolist()
-        prefix_text = prompts[prompt_idx] + tok.decode(prefix_response_ids, skip_special_tokens=False)
-        prefix_prompts.append(prefix_text)
-        # Adaptive: continuation budget = max_response_len - tokens already used
+        # Reuse already-tokenized prompt ids from Phase A so prefix bytes match exactly.
+        full_prefix_ids = list(phase_a_prompt_ids[prompt_idx]) + prefix_response_ids
+        prefix_token_ids_list.append(full_prefix_ids)
         max_continuation = args.max_response_len - (end_idx + 1)
-        max_continuation = max(32, max_continuation)  # at least 32 tokens
+        max_continuation = max(32, max_continuation)
         prefix_metadata.append((r, end_idx, max_continuation))
 
-    # Run MC continuations. Need different max_tokens per prefix → submit separately or
-    # use the maximum and rely on EOS for shorter ones.
-    # For simplicity: use the MAX max_continuation across jobs (some inefficiency for short
-    # prefixes but parallelism wins). Actually we're better off doing rollouts in BUCKETS by
-    # max_continuation length.
-    # Simple and fast: use the GLOBAL max_response_len for all (over-budget but simple).
-    # The adaptive part we're doing: we don't care about completing past max_response_len total.
-    print(f"[mc] Phase B: running J={args.J} MC continuations per prefix...", flush=True)
-    sp_mc = SamplingParams(n=args.J, temperature=args.temperature, top_p=args.top_p,
-                            max_tokens=args.max_response_len, skip_special_tokens=True,
-                            seed=args.seed + 1)
+    # Bucketed adaptive max_tokens: group prefixes by ceil(max_continuation/256) so
+    # each vLLM batch only allocates KV up to its bucket cap. Avoids the prior
+    # behaviour where every prefix paid for max_response_len tokens of KV.
+    print(f"[mc] Phase B: running J={args.J} MC continuations per prefix (bucketed)...", flush=True)
+    BUCKET = 256
+    buckets: dict[int, list[int]] = {}
+    for j_idx, (_, _, mc) in enumerate(prefix_metadata):
+        b = ((mc + BUCKET - 1) // BUCKET) * BUCKET
+        buckets.setdefault(b, []).append(j_idx)
+    print(f"[mc] Phase B: {len(buckets)} buckets: " +
+          ", ".join(f"{b}:{len(idxs)}" for b, idxs in sorted(buckets.items())), flush=True)
+    mc_outputs = [None] * n_jobs
     t0 = time.time()
-    mc_outputs = llm.generate(prefix_prompts, sp_mc)
+    for bcap, idxs in sorted(buckets.items()):
+        sp_mc = SamplingParams(n=args.J, temperature=args.temperature, top_p=args.top_p,
+                                max_tokens=bcap, skip_special_tokens=True,
+                                seed=args.seed + 1)
+        batch_inputs = [{"prompt_token_ids": prefix_token_ids_list[j]} for j in idxs]
+        outs = llm.generate(prompts=batch_inputs, sampling_params=sp_mc)
+        for local_i, j in enumerate(idxs):
+            mc_outputs[j] = outs[local_i]
     print(f"[mc] Phase B: MC done in {time.time()-t0:.1f}s ({n_jobs * args.J} generations)", flush=True)
 
     # Verify each MC continuation. The "full text" for verification is prefix_text + continuation.
