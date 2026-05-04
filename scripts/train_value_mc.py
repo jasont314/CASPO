@@ -189,6 +189,14 @@ def main():
     ap.add_argument("--architecture", choices=["ipvrm", "sigmoid_head"], default="ipvrm",
                     help="ipvrm: V=β·Σlog(π_φ/π_ref) (2 fwds, 2 backbones); "
                          "sigmoid_head: V=σ(W·h_φ) (1 fwd, 1 backbone + linear head)")
+    ap.add_argument("--split_by_prompt", action="store_true",
+                    help="Hold out --val_fraction of unique PROMPTS (all their prefixes "
+                         "go to val) rather than a random prefix-level shuffle. Eliminates "
+                         "same-prompt leakage in the val set within the same collection.")
+    ap.add_argument("--held_out_data", default=None,
+                    help="Path to a separate mc_labels-format .pt file to use as the val "
+                         "set (replacing the in-data split). Use this for true OOD-prompt "
+                         "evaluation against a held-out dsr_sub subset.")
     args = ap.parse_args()
 
     from caspo.config import CASPOConfig
@@ -234,14 +242,60 @@ def main():
     _rprint(f"[mc-train] N={N} labeled prefixes")
     _rprint(f"[mc-train] p_hat: mean={float(blob['p_hat'].mean()):.3f} std={float(blob['p_hat'].std()):.3f}")
 
-    # Train/val split (random by row, since each row is one (prefix, p_hat) pair)
-    rng = random.Random(args.seed)
-    perm = list(range(N))
-    rng.shuffle(perm)
-    n_val = max(1, int(N * args.val_fraction))
-    val_idxs = perm[:n_val]
-    train_idxs = perm[n_val:]
-    _rprint(f"[mc-train] train={len(train_idxs)} val={len(val_idxs)}")
+    # ----------------------------------------------------------
+    # Train/val split. Three modes:
+    # (a) --held_out_data <path>: load a separate mc_labels .pt as val. True
+    #     OOD-prompt eval. Train uses ALL of the primary blob.
+    # (b) --split_by_prompt: hash prompt_ids per row, group by prompt, hold
+    #     out --val_fraction of unique prompts (ALL their prefixes go to val).
+    #     Removes same-prompt prefix leakage within the same collection.
+    # (c) default (legacy): random row-level shuffle. Leaks same-prompt
+    #     prefixes between train and val; val ρ overstates OOD generalization.
+    # ----------------------------------------------------------
+    val_blob = blob  # default: val drawn from the same blob as train
+    if args.held_out_data is not None:
+        _rprint(f"[mc-train] loading HELD-OUT val data from {args.held_out_data}")
+        val_blob = torch.load(args.held_out_data, map_location="cpu", weights_only=False)
+        for _k in ("prompt_ids", "prompt_mask", "response_ids",
+                   "response_mask", "step_end_idx", "p_hat"):
+            if _k in val_blob and torch.is_tensor(val_blob[_k]) and not val_blob[_k].is_pinned():
+                try:
+                    val_blob[_k] = val_blob[_k].pin_memory()
+                except Exception:
+                    pass
+        N_val = int(val_blob["prompt_ids"].shape[0])
+        train_idxs = list(range(N))
+        val_idxs = list(range(N_val))
+        _rprint(f"[mc-train] mode=held_out_file  train={len(train_idxs)} val={len(val_idxs)}")
+    elif args.split_by_prompt:
+        # Hash each row's prompt_ids (× prompt_mask) to identify unique prompts.
+        rng = random.Random(args.seed)
+        pid_t = blob["prompt_ids"]
+        pmask_t = blob["prompt_mask"]
+        # Mask out padding before hashing so identical prompts with different
+        # padding align. Convert to bytes once.
+        prompt_to_rows: dict[bytes, list[int]] = {}
+        for i in range(N):
+            real = (pid_t[i] * pmask_t[i]).numpy().tobytes()
+            prompt_to_rows.setdefault(real, []).append(i)
+        unique_prompts = list(prompt_to_rows.keys())
+        rng.shuffle(unique_prompts)
+        n_val_prompts = max(1, int(len(unique_prompts) * args.val_fraction))
+        val_prompts = set(unique_prompts[:n_val_prompts])
+        val_idxs = [r for p in unique_prompts[:n_val_prompts] for r in prompt_to_rows[p]]
+        train_idxs = [r for p in unique_prompts[n_val_prompts:] for r in prompt_to_rows[p]]
+        _rprint(f"[mc-train] mode=split_by_prompt  unique_prompts={len(unique_prompts)} "
+                f"(val={n_val_prompts}, train={len(unique_prompts)-n_val_prompts})  "
+                f"train_rows={len(train_idxs)} val_rows={len(val_idxs)}")
+    else:
+        rng = random.Random(args.seed)
+        perm = list(range(N))
+        rng.shuffle(perm)
+        n_val = max(1, int(N * args.val_fraction))
+        val_idxs = perm[:n_val]
+        train_idxs = perm[n_val:]
+        _rprint(f"[mc-train] mode=row_shuffle (LEAKY — same prompt may appear in "
+                f"both train and val)  train={len(train_idxs)} val={len(val_idxs)}")
 
     # Per-rank shard of train rows
     if world_size > 1:
@@ -368,19 +422,21 @@ def main():
     total_steps = steps_per_epoch * args.epochs
     _rprint(f"[mc-train] {args.epochs} epochs × {steps_per_epoch} steps = {total_steps} total")
 
-    def get_batch(idxs):
+    def get_batch(idxs, source=None):
         # non_blocking=True overlaps H2D w/ compute of the previous step;
         # only effective because the source tensors were pinned above.
-        prompt_ids = blob["prompt_ids"][idxs].to(device, non_blocking=True)
-        prompt_mask = blob["prompt_mask"][idxs].to(device, non_blocking=True)
-        response_ids = blob["response_ids"][idxs].to(device, non_blocking=True)
-        response_mask = blob["response_mask"][idxs].to(device, non_blocking=True)
-        step_end_idx = blob["step_end_idx"][idxs].to(device, non_blocking=True)
-        p_hat = blob["p_hat"][idxs].to(device, non_blocking=True)
+        # `source` lets eval pull from val_blob when --held_out_data is set.
+        src = source if source is not None else blob
+        prompt_ids = src["prompt_ids"][idxs].to(device, non_blocking=True)
+        prompt_mask = src["prompt_mask"][idxs].to(device, non_blocking=True)
+        response_ids = src["response_ids"][idxs].to(device, non_blocking=True)
+        response_mask = src["response_mask"][idxs].to(device, non_blocking=True)
+        step_end_idx = src["step_end_idx"][idxs].to(device, non_blocking=True)
+        p_hat = src["p_hat"][idxs].to(device, non_blocking=True)
         return prompt_ids, prompt_mask, response_ids, response_mask, step_end_idx, p_hat
 
-    def forward_loss(idxs, return_preds=False, want_diag=True):
-        pids, pmask, rids, rmask, step_end, p_hat = get_batch(idxs)
+    def forward_loss(idxs, return_preds=False, want_diag=True, source=None):
+        pids, pmask, rids, rmask, step_end, p_hat = get_batch(idxs, source=source)
         out = pv(prompt_ids=pids, prompt_mask=pmask,
                  response_ids=rids, response_mask=rmask)
         if args.architecture == "ipvrm":
@@ -438,7 +494,7 @@ def main():
         eval_mb = args.eval_mb if args.eval_mb > 0 else max(args.mb * 4, args.mb)
         for s in range(0, len(local_val), eval_mb):
             batch_idxs = torch.tensor(local_val[s:s + eval_mb], dtype=torch.long)
-            loss, mse, _, preds, p_hat = forward_loss(batch_idxs, return_preds=True)
+            loss, mse, _, preds, p_hat = forward_loss(batch_idxs, return_preds=True, source=val_blob)
             n = float(len(batch_idxs))
             total_loss_t += loss.detach().float() * n
             total_mse_t += mse.detach().float() * n

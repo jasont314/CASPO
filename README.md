@@ -68,6 +68,25 @@ assignment approaches:
   CASPO replaces VinePPO's online MC prefix values with IPVRM-style learned
   prefix values and optional online value updates. Paper:
   `https://arxiv.org/abs/2604.13197`.
+
+  Differences between CASPO's PRM and the original IPVRM paper:
+
+  | aspect | IPVRM (paper) | CASPO PRM (this repo) |
+  |---|---|---|
+  | architecture | V_φ = β · Σ log(π_φ/π_ref) | **same** (cumulative log-ratio) |
+  | training data | trajectory-level outcome labels | **per-prefix Monte Carlo p̂** (J=8 continuations per labeled prefix, K=16 base rollouts, S=5 step boundaries per response, mixed-outcome filter on K) |
+  | loss | BCE-with-margin on prefix-vs-trajectory pairs | **BCE on continuous targets** σ(V_φ/β) vs p̂ ∈ [0,1] (no margin term) |
+  | refresh strategy | inline online updates during RL | **frozen during RL by default**; iterated-refresh variant retrains from scratch on current-policy rollouts |
+  | step-TD plug-in | V_φ as generalized value | σ(V_φ/β) plugged into vanilla step-TD: A_t = σ(V_φ(s_{t+1})/β) − σ(V_φ(s_t)/β) |
+  | β | learned/tuned | fixed β = 10 |
+  | indexing fix | — | V read at `step_end+1` (cumsum-through-token correction; off-by-one repro guard) |
+
+  We empirically confirmed (2026-05-04) that the cumulative-log-ratio
+  parameterization is essential: at matched hparams, an alternative
+  single-sigmoid-head V_φ = σ(W·h_φ) collapsed val Spearman ρ from ~0.78 to
+  ~0.43 because the log-ratio's per-token decomposition gives every response
+  token a direct gradient signal (~80× supervision density vs the head's
+  single end-of-prefix gradient).
 - DeepSeekMath/GRPO: the grouped relative policy optimization baseline. In this
   repo, GRPO uses grouped terminal rewards over `G=8` responses per prompt and
   the same clipped PPO loss implementation as the other methods. Paper:
@@ -383,10 +402,24 @@ COLLECTION (mc_step_label.py — 4-shard parallel):
 
 TRAINING (train_value_mc.py — FSDP=4):
   --lr 5e-6 --mb 4 --grad_accum 2     # eff_batch = 4×4×2 = 32
+  --eval_mb 16                        # eval has no backward → 4× larger fits
   --epochs 2                          # ρ saturates ~step_3500 ≈ 2 epochs
   --val_fraction 0.1                  # matches orig PRM
   --early_stop_patience 999           # no early stop; let val select best
   --beta 10.0 --seed 0
+
+VAL SPLIT MODES (train_value_mc.py):
+  default                              # row-level shuffle. LEAKY — same prompt
+                                       # may have prefixes in both train and val.
+                                       # val ρ overstates OOD generalization.
+  --split_by_prompt                    # hash prompt_ids, hold out val_fraction
+                                       # of UNIQUE PROMPTS (all their prefixes
+                                       # → val). Removes same-prompt leakage
+                                       # within the same N=300 collection.
+  --held_out_data path/to/holdout.pt   # use a separate mc_labels-format .pt
+                                       # as the val set (true OOD-prompt eval).
+                                       # Generate with launch_qwen_mc_prm_holdout.sh
+                                       # on the remaining 909 dsr_sub prompts.
 ```
 
 Key lessons from sweep (2026-05-02 to 2026-05-03):

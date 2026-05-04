@@ -441,6 +441,19 @@ scalar-head alternative (\S\ref{sec:related}). We train for two
 epochs with full-model FSDP updates, $\beta = 10$, effective batch
 size 32, and learning rate $5 \times 10^{-6}$.
 
+\paragraph{Held-out PRM evaluation.}
+For PRM quality reporting we evaluate $V_\phi$ on a \emph{prompt-level}
+held-out split rather than a prefix-level shuffle. The default
+\texttt{train\_value\_mc.py} flow exposes two non-leaky modes:
+\texttt{--split\_by\_prompt}, which holds out
+$\lceil \mathrm{val\_fraction} \cdot |\mathcal{D}_{\mathrm{prompt}}|\rceil$
+unique prompts (and all their prefixes) from the same N=300 collection,
+and \texttt{--held\_out\_data <path>}, which loads a separately-collected
+mc\_labels file generated on disjoint prompts (the remaining 909
+\texttt{dsr\_sub} prompts not in the primary training collection). The
+prefix-level row shuffle is preserved as a legacy default but flagged
+explicitly as leaky in the trainer's startup banner.
+
 \subsection{Phase-2: step-TD policy optimization}
 At each PPO outer step, the trainer samples $G$ responses per prompt
 for $P$ prompts, segments each response, and constructs step values
