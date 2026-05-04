@@ -56,7 +56,7 @@ def main():
                          "0 keeps train/deploy aligned. Set to a smaller value (e.g. 1024) "
                          "only if you specifically want to hedge against rambling-tail noise "
                          "at the cost of leaving late RL prefixes out-of-distribution.")
-    ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.92)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mixed_only", action="store_true", default=True,
                     help="only label rollouts of mixed-outcome prompts")
@@ -79,6 +79,7 @@ def main():
     print(f"[mc] init vLLM (max_model_len={args.max_prompt_len + args.max_response_len})", flush=True)
     llm = LLM(
         model=args.model, dtype="bfloat16",
+        kv_cache_dtype="fp8",
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_prompt_len + args.max_response_len,
         enable_prefix_caching=True, trust_remote_code=True,

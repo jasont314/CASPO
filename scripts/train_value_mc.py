@@ -33,6 +33,18 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision
 
+# Apply Liger Kernel fused triton ops to Qwen2 BEFORE the model loads —
+# RMSNorm, RoPE, SwiGLU get fused triton kernels for ~15-25% throughput.
+# Skipping fused_linear_cross_entropy because we use logits_to_keep slicing.
+try:
+    from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+    apply_liger_kernel_to_qwen2(
+        rope=True, swiglu=True, rms_norm=True,
+        fused_linear_cross_entropy=False,
+    )
+except ImportError:
+    pass  # liger_kernel optional; fall through to vanilla Qwen2
+
 sys.path.insert(0, "/home/jason/experiment/CASPO")
 
 
@@ -170,9 +182,9 @@ def main():
     if use_lora:
         # only LoRA params (peft already froze base)
         trainable = [p for p in pv.phi.parameters() if p.requires_grad]
-        optim = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+        optim = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, fused=True)
     else:
-        optim = torch.optim.AdamW(pv.phi.parameters(), lr=args.lr, weight_decay=0.0)
+        optim = torch.optim.AdamW(pv.phi.parameters(), lr=args.lr, weight_decay=0.0, fused=True)
 
     def save_pv_ckpt(path):
         """Save pv at path, handling LoRA merge for drop-in compatibility."""
