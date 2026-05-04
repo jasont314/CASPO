@@ -132,6 +132,8 @@ for r in 0 1 2 3; do
     --override "lr=$LR" \
     --override "kl_coef=$KL_COEF" \
     --override "kl_estimator=$KL_ESTIMATOR" \
+    --override "clip_eps_low=0.2" \
+    --override "clip_eps_high=0.2" \
     --override "max_steps=$MAX_STEPS" \
     --override "save_every=$SAVE_EVERY" \
     --override "save_optimizer_state=true" \
@@ -140,6 +142,7 @@ for r in 0 1 2 3; do
     --override "rollout_backend=vllm" \
     --override "vllm_weight_sync_backend=ipc" \
     --override "vllm_gpu_memory_utilization=0.45" \
+    --override "vllm_kv_cache_dtype=fp8" \
     --override "vllm_enforce_eager=false" \
     --override "vllm_multi_sample_mode=auto" \
     --override "vllm_max_num_seqs=128" \

@@ -54,7 +54,7 @@ read -r -a GPUS <<< "$GPU_LIST"
 N_GPUS=${#GPUS[@]}
 [[ "$N_GPUS" -eq 4 ]] || { echo "ERROR: need 4 GPUs (FSDP=4); got $N_GPUS: $GPU_LIST"; exit 1; }
 
-DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
+DSR_SUB="${DSR_SUB:-/tmp/rlvr_replication/dsr_sub.jsonl}"
 [[ -f "$DSR_SUB" ]] || { echo "ERROR: dataset not found: $DSR_SUB"; exit 1; }
 
 PRM_PATH="${PRM_PATH:-/mnt/nvme_tmp4/jason_caspo/qwen_mc_prm_15b_dsr_sub/best}"
@@ -120,6 +120,8 @@ for r in 0 1 2 3; do
     --override "lr=1.0e-6" \
     --override "kl_coef=$KL_COEF" \
     --override "kl_estimator=k3" \
+    --override "clip_eps_low=0.2" \
+    --override "clip_eps_high=0.2" \
     --override "max_steps=$MAX_STEPS" \
     --override "save_every=$SAVE_EVERY" \
     --override "save_optimizer_state=$SAVE_OPTIMIZER_STATE" \

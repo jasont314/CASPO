@@ -81,7 +81,7 @@ N_GPUS=${#GPUS[@]}
 [[ "$N_GPUS" -ge 4 ]] || { echo "ERROR: need >= 4 GPUs; got $N_GPUS"; exit 1; }
 
 POLICY="${POLICY:-Qwen/Qwen2.5-Math-1.5B}"
-DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
+DSR_SUB="${DSR_SUB:-/tmp/rlvr_replication/dsr_sub.jsonl}"
 [[ -f "$DSR_SUB" ]] || { echo "ERROR: dataset not found: $DSR_SUB"; exit 1; }
 
 OUT_DIR="${OUT_DIR:?OUT_DIR must be set}"

@@ -76,7 +76,7 @@ read -r -a GPUS <<< "$GPU_LIST"
 N_GPUS=${#GPUS[@]}
 [[ "$N_GPUS" -eq 4 ]] || { echo "ERROR: need 4 GPUs (FSDP=4); got $N_GPUS: $GPU_LIST"; exit 1; }
 
-DSR_SUB="${DSR_SUB:-/path/to/dsr_sub.jsonl}"
+DSR_SUB="${DSR_SUB:-/tmp/rlvr_replication/dsr_sub.jsonl}"
 [[ -f "$DSR_SUB" ]] || { echo "ERROR: dataset not found: $DSR_SUB"; echo "  Set DSR_SUB env var to dsr_sub.jsonl path"; exit 1; }
 
 OUT_DIR="${OUT_DIR:-./grpo_qwen25math15b_dsr_sub}"

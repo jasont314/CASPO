@@ -70,7 +70,10 @@
 set -eo pipefail
 source /opt/conda/etc/profile.d/conda.sh
 conda activate "${CONDA_ENV:-scalable}"
-set -uo pipefail
+# preserve -e from above; only ADD -u (treat unset vars as errors).
+# `set -uo pipefail` (without -e) would silently drop -e and let
+# failing nested launchers continue the alternating loop.
+set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PYBIN="${PYBIN:-$(which python)}"
 

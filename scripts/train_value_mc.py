@@ -48,6 +48,91 @@ except ImportError:
 sys.path.insert(0, "/home/jason/experiment/CASPO")
 
 
+class SigmoidHeadValueModel(torch.nn.Module):
+    """Single-forward sigmoid-head V_φ(s) = σ(W·h_φ(s)).
+
+    Architecture: phi backbone (Qwen2 etc.) + Linear(hidden_size, 1).
+    Trained with BCE(σ(logit), p_hat). No ref model — single forward per step.
+    """
+    def __init__(self, model_name_or_path: str, attn_impl=None):
+        super().__init__()
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        kwargs = dict(torch_dtype=torch.bfloat16)
+        if attn_impl:
+            kwargs["attn_implementation"] = attn_impl
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.phi = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+        hidden = self.phi.config.hidden_size
+        self.value_head = torch.nn.Linear(hidden, 1, bias=True, dtype=torch.bfloat16)
+        # Zero-init: σ(0)=0.5 ≈ p_hat prior; stable starting point.
+        torch.nn.init.zeros_(self.value_head.weight)
+        torch.nn.init.zeros_(self.value_head.bias)
+        # For compat with the IPVRM path that names attribute self.ref:
+        self.ref = None
+        self.cfg_model_name = model_name_or_path
+
+    def forward(self, prompt_ids, prompt_mask, response_ids, response_mask):
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+        # phi.model bypasses the LM head — we only need backbone hidden states.
+        out = self.phi.model(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = out.last_hidden_state  # [B, P+R, H]
+        # Slice response-side hidden states only — caller indexes by step_end_idx
+        # which is already a response-token offset (0..R-1).
+        P = prompt_ids.shape[1]
+        resp_hidden = hidden[:, P:, :]  # [B, R, H]
+        logits = self.value_head(resp_hidden).squeeze(-1).float()  # [B, R] in fp32
+        return {"logits": logits}
+
+    def save_pretrained(self, path: str):
+        # FSDP-aware: gather to rank-0 then write. Mirrors
+        # PrefixValueModel.save_pretrained.
+        phi = self.phi
+        is_fsdp = phi.__class__.__name__ == "FullyShardedDataParallel"
+        try:
+            _dist_init = dist.is_available() and dist.is_initialized()
+            rank = dist.get_rank() if _dist_init else 0
+        except Exception:
+            _dist_init = False
+            rank = 0
+        if is_fsdp:
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                FullyShardedDataParallel as _FSDP,
+                StateDictType,
+            )
+            full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with _FSDP.state_dict_type(phi, StateDictType.FULL_STATE_DICT, full_cfg):
+                state_dict = phi.state_dict()
+            if rank == 0:
+                os.makedirs(path, exist_ok=True)
+                inner = getattr(phi, "module", phi)
+                inner.save_pretrained(path, state_dict=state_dict)
+                try:
+                    self.tokenizer.save_pretrained(path)
+                except Exception:
+                    pass
+                torch.save({
+                    "value_head_state": self.value_head.state_dict(),
+                    "architecture": "sigmoid_head",
+                    "phi_init": self.cfg_model_name,
+                }, os.path.join(path, "value_head.pt"))
+            return
+        if rank != 0:
+            return
+        os.makedirs(path, exist_ok=True)
+        phi.save_pretrained(path)
+        try:
+            self.tokenizer.save_pretrained(path)
+        except Exception:
+            pass
+        torch.save({
+            "value_head_state": self.value_head.state_dict(),
+            "architecture": "sigmoid_head",
+            "phi_init": self.cfg_model_name,
+        }, os.path.join(path, "value_head.pt"))
+
+
 def is_dist_initialized() -> bool:
     try:
         return dist.is_available() and dist.is_initialized()
@@ -71,7 +156,12 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=1, help="gradient accumulation steps; effective batch = mb*FSDP_size*grad_accum")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--save_every", type=int, default=200)
-    ap.add_argument("--eval_every", type=int, default=50)
+    # eval_every: 50 was over-evaluating. eval_val is collective FSDP across
+    # ~1606 val rows / mb=4 ≈ ~400 forward steps per eval. At eval_every=50 +
+    # 2712 train steps that's 54 evals × 400 ≈ 21.6k val forwards, dominating
+    # the 2712 train forwards. eval_every=200 is the new default; launchers
+    # may still pass eval_every=100 to keep early-stop responsiveness.
+    ap.add_argument("--eval_every", type=int, default=200)
     ap.add_argument("--early_stop_patience", type=int, default=8)
     ap.add_argument("--val_fraction", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
@@ -86,6 +176,9 @@ def main():
     ap.add_argument("--lora_alpha", type=int, default=64,
                     help="LoRA alpha (typical 2*r)")
     ap.add_argument("--lora_dropout", type=float, default=0.0)
+    ap.add_argument("--architecture", choices=["ipvrm", "sigmoid_head"], default="ipvrm",
+                    help="ipvrm: V=β·Σlog(π_φ/π_ref) (2 fwds, 2 backbones); "
+                         "sigmoid_head: V=σ(W·h_φ) (1 fwd, 1 backbone + linear head)")
     args = ap.parse_args()
 
     from caspo.config import CASPOConfig
@@ -116,6 +209,17 @@ def main():
 
     _rprint(f"[mc-train] loading data from {args.data}")
     blob = torch.load(args.data, map_location="cpu", weights_only=False)
+    # Pin source tensors so per-batch .to(device, non_blocking=True) copies
+    # can overlap with the previous step's compute. Cheap (just registers
+    # the host buffer with CUDA); pays off every step since each batch
+    # touches 5 tensors with .to(device).
+    for _k in ("prompt_ids", "prompt_mask", "response_ids",
+               "response_mask", "step_end_idx", "p_hat"):
+        if _k in blob and torch.is_tensor(blob[_k]) and not blob[_k].is_pinned():
+            try:
+                blob[_k] = blob[_k].pin_memory()
+            except Exception:
+                pass  # pin_memory can OOM on host RAM-tight boxes
     N = int(blob["prompt_ids"].shape[0])
     _rprint(f"[mc-train] N={N} labeled prefixes")
     _rprint(f"[mc-train] p_hat: mean={float(blob['p_hat'].mean()):.3f} std={float(blob['p_hat'].std()):.3f}")
@@ -134,11 +238,18 @@ def main():
         train_idxs = train_idxs[rank::world_size]
         _rprint(f"[mc-train] rank {rank}: {len(train_idxs)} local train rows")
 
-    # Build model
-    _rprint(f"[mc-train] init phi+ref from cfg.model_name_or_path={cfg.model_name_or_path}")
-    pv = PrefixValueModel(cfg)
-    pv.phi = pv.phi.to(device)
-    pv.ref = pv.ref.to(device)
+    # Build model — branch on architecture
+    _rprint(f"[mc-train] architecture={args.architecture}")
+    if args.architecture == "ipvrm":
+        _rprint(f"[mc-train] init phi+ref from cfg.model_name_or_path={cfg.model_name_or_path}")
+        pv = PrefixValueModel(cfg)
+        pv.phi = pv.phi.to(device)
+        pv.ref = pv.ref.to(device)
+    else:
+        _rprint(f"[mc-train] init sigmoid-head phi from {cfg.model_name_or_path}")
+        pv = SigmoidHeadValueModel(cfg.model_name_or_path)
+        pv.phi = pv.phi.to(device)
+        pv.value_head = pv.value_head.to(device)
 
     use_lora = args.lora_r > 0
     if use_lora:
@@ -195,14 +306,19 @@ def main():
                     transformer_layer_cls=layer_classes,
                 )
             pv.phi = FSDP(pv.phi, **wrap_kwargs)
-    pv.ref.eval()
-    for p in pv.ref.parameters():
-        p.requires_grad = False
+    if args.architecture == "ipvrm":
+        pv.ref.eval()
+        for p in pv.ref.parameters():
+            p.requires_grad = False
 
     if use_lora:
         # only LoRA params (peft already froze base)
         trainable = [p for p in pv.phi.parameters() if p.requires_grad]
         optim = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, fused=True)
+    elif args.architecture == "sigmoid_head":
+        # Train phi backbone + value_head together
+        params = list(pv.phi.parameters()) + list(pv.value_head.parameters())
+        optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, fused=True)
     else:
         optim = torch.optim.AdamW(pv.phi.parameters(), lr=args.lr, weight_decay=0.0, fused=True)
 
@@ -216,9 +332,14 @@ def main():
                 if is_main:
                     base_model = peft_model.base_model.model
                     base_model.save_pretrained(path)
-                    # save tokenizer + meta to match PrefixValueModel.from_pretrained
-                    if hasattr(pv, '_tokenizer') and pv._tokenizer is not None:
-                        pv._tokenizer.save_pretrained(path)
+                    # save tokenizer + meta to match PrefixValueModel.from_pretrained.
+                    # PrefixValueModel exposes the HF tokenizer as ``self.tokenizer``;
+                    # the prior ``pv._tokenizer`` lookup silently no-op'd, leaving
+                    # LoRA-merged checkpoints without a tokenizer dir and breaking
+                    # downstream ``AutoTokenizer.from_pretrained(path)`` calls.
+                    tok = getattr(pv, 'tokenizer', None)
+                    if tok is not None:
+                        tok.save_pretrained(path)
                     with open(os.path.join(path, 'caspo_value_meta.json'), 'w') as f:
                         json.dump({'ref_model_path': cfg.model_name_or_path}, f)
             finally:
@@ -238,30 +359,51 @@ def main():
     _rprint(f"[mc-train] {args.epochs} epochs × {steps_per_epoch} steps = {total_steps} total")
 
     def get_batch(idxs):
-        prompt_ids = blob["prompt_ids"][idxs].to(device)
-        prompt_mask = blob["prompt_mask"][idxs].to(device)
-        response_ids = blob["response_ids"][idxs].to(device)
-        response_mask = blob["response_mask"][idxs].to(device)
-        step_end_idx = blob["step_end_idx"][idxs].to(device)
-        p_hat = blob["p_hat"][idxs].to(device)
+        # non_blocking=True overlaps H2D w/ compute of the previous step;
+        # only effective because the source tensors were pinned above.
+        prompt_ids = blob["prompt_ids"][idxs].to(device, non_blocking=True)
+        prompt_mask = blob["prompt_mask"][idxs].to(device, non_blocking=True)
+        response_ids = blob["response_ids"][idxs].to(device, non_blocking=True)
+        response_mask = blob["response_mask"][idxs].to(device, non_blocking=True)
+        step_end_idx = blob["step_end_idx"][idxs].to(device, non_blocking=True)
+        p_hat = blob["p_hat"][idxs].to(device, non_blocking=True)
         return prompt_ids, prompt_mask, response_ids, response_mask, step_end_idx, p_hat
 
-    def forward_loss(idxs, return_preds=False):
+    def forward_loss(idxs, return_preds=False, want_diag=True):
         pids, pmask, rids, rmask, step_end, p_hat = get_batch(idxs)
         out = pv(prompt_ids=pids, prompt_mask=pmask,
                  response_ids=rids, response_mask=rmask)
-        V = out["V"]  # [B, R]
-        # Read V at step_end_idx for each row
-        last_v = V.gather(1, step_end.unsqueeze(1)).squeeze(1).float()
-        # Loss: BCE(sigmoid(V/β), p_hat), with p_hat in [0, 1]
-        logits = last_v / args.beta
+        if args.architecture == "ipvrm":
+            V = out["V"]  # [B, R+1]; V[:, 0]=0, V[:, t] = sum_{i<t} log_ratio[:, i]
+            # Read V AFTER the last response token of the labeled step.
+            # ``step_end_idx`` is the (0-indexed) response-token idx INCLUDED in
+            # the labeled step; the cumulative log-ratio THROUGH that token lives
+            # at V[:, step_end_idx + 1]. The prior version read V[:, step_end_idx]
+            # which silently excluded the last token of every step (off-by-one).
+            last_col = V.shape[1] - 1
+            gather_idx = (step_end + 1).clamp(max=last_col).unsqueeze(1)
+            last_v = V.gather(1, gather_idx).squeeze(1).float()
+            logits = last_v / args.beta
+        else:
+            # sigmoid_head: out["logits"] is [B, R]; gather at step_end (no off-by-one
+            # since logits are response-aligned with hidden states at each token).
+            logits_full = out["logits"]  # [B, R]
+            last_col = logits_full.shape[1] - 1
+            gather_idx = step_end.clamp(max=last_col).unsqueeze(1)
+            logits = logits_full.gather(1, gather_idx).squeeze(1).float()
         # Equivalent to F.binary_cross_entropy_with_logits but supports continuous targets
         loss = F.binary_cross_entropy_with_logits(logits, p_hat)
-        # Diagnostics
-        with torch.no_grad():
-            preds = torch.sigmoid(logits)
-            pred_mse = ((preds - p_hat) ** 2).mean()
-            mean_pred = preds.mean()
+        # Diagnostics — skipped on non-log steps to avoid an extra sigmoid +
+        # 2 reductions per training step. eval/log paths set want_diag=True.
+        if want_diag or return_preds:
+            with torch.no_grad():
+                preds = torch.sigmoid(logits)
+                pred_mse = ((preds - p_hat) ** 2).mean()
+                mean_pred = preds.mean()
+        else:
+            preds = None
+            pred_mse = loss.detach()  # placeholder; not logged on this step
+            mean_pred = loss.detach()
         if return_preds:
             return loss, pred_mse, mean_pred, preds.detach().cpu(), p_hat.detach().cpu()
         return loss, pred_mse, mean_pred
@@ -349,7 +491,12 @@ def main():
         for s in range(0, len(train_t), args.mb):
             batch_idxs = train_t[s:s + args.mb]
             pv.phi.train()
-            loss, mse, mean_pred = forward_loss(batch_idxs)
+            # Only compute diagnostics on the iteration that will actually
+            # log (at-or-near the next log step). step is the *optimizer*
+            # step; we approximate "near a log step" by checking the next
+            # post-accum step would land on a log boundary.
+            _will_log = ((step + 1) % 10 == 0) or ((step + 1) == total_steps)
+            loss, mse, mean_pred = forward_loss(batch_idxs, want_diag=_will_log)
             scaled_loss = loss / args.grad_accum
             # Skip all_gather on intermediate accum batches via FSDP no_sync
             if accum_count + 1 < args.grad_accum and isinstance(pv.phi, FSDP):
@@ -361,9 +508,18 @@ def main():
             if accum_count == args.grad_accum:
                 step += 1
                 accum_count = 0
-                torch.nn.utils.clip_grad_norm_(pv.phi.parameters(), 1.0)
+                # FSDP exposes its own clip_grad_norm_ that aggregates across
+                # shards; the standalone torch.nn.utils version operates only
+                # on local shards and under-counts the global norm. Use the
+                # FSDP method when wrapped, else fall back.
+                if isinstance(pv.phi, FSDP):
+                    pv.phi.clip_grad_norm_(1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(pv.phi.parameters(), 1.0)
                 optim.step()
-                optim.zero_grad()
+                # set_to_none frees grad memory rather than zeroing in-place,
+                # which is faster and matches HF Trainer / caspo_trainer.
+                optim.zero_grad(set_to_none=True)
             else:
                 continue
             if step % 10 == 0:
