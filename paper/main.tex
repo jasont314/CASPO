@@ -853,8 +853,9 @@ $\text{prompt}+\text{response}$.
 Final evaluation reports pass@1 and pass@$k$ ($k=16$) on MATH-500, full MATH
 test, College Math, and OlympiadBench. Sampling at evaluation uses
 temperature $0.35$ and top-$p$ $0.9$, matching the upstream protocol.
-Generation is performed with vLLM at \texttt{kv\_cache\_dtype="fp8"} and
-\texttt{gpu\_memory\_utilization=0.92} for maximum eval throughput on a
+Generation is performed with vLLM at \texttt{kv\_cache\_dtype="auto"}
+(bf16, matching the policy weight dtype) and
+\texttt{gpu\_memory\_utilization=0.85} for maximum eval throughput on a
 dedicated GPU. Sample evaluation at intermediate checkpoints uses
 \texttt{EVAL\_LIMIT=100}, \texttt{EVAL\_K=8} for low-overhead training-curve
 visibility; the full benchmark suite is run at the final checkpoint.
