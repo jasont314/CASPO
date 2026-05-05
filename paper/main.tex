@@ -188,15 +188,27 @@ step-TD advantage. Our differences are in \emph{training-data form} and
 labels with a continuous-target BCE (rather than trajectory-level
 labels with the margin term), and we replace inline online updates
 with periodic full retraining of $V_\phi$ from scratch on current-policy
-rollouts. We also empirically verified that the cumulative-log-ratio
-parameterization is essential: at matched hyperparameters and training
-data, an alternative single-sigmoid-head parameterization
-$V_\phi(s_t) = \sigma(W h_\phi(s_t))$ converged at val Spearman
-$\rho \approx 0.43$ versus $\rho \approx 0.78$ for the
-log-ratio architecture (matched step 1000), because the log-ratio's
+rollouts. The choice of parameterization is regime-dependent rather
+than uniformly favorable: on a leaky prefix-shuffle validation set,
+the log-ratio form scores val $\rho \approx 0.78$ versus $\rho
+\approx 0.43$ for a single sigmoid head $V_\phi(s_t) = \sigma(W
+h_\phi(s_t))$ at matched hyperparameters, but this gap narrows on
+prompt-level held-out evaluation and inverts on a fully
+out-of-distribution probe (DeepScaleR prompts disjoint from the
+\texttt{dsr\_sub} training set), where the sigmoid head leads
+log-ratio by ${\approx}0.13~\rho$. On the in-distribution
+policy-drifted (metric-B) probe at step\_300 and beyond,
+sigmoid-head PRMs cross from small-positive to small-negative
+$\rho$ ($-0.07$ to $-0.24$ at step\_300+), i.e.\ they
+\emph{anti-correlate} with success at the policy states that drive
+late-RL credit assignment, while the log-ratio form holds
+${\rho>0}$ at all measured stages. The log-ratio's
 $V_\phi(s_t) = \beta \sum_{i<t} \log\!\big(\pi_\phi/\pi_{\mathrm{ref}}\big)(a_i \mid s_{<i})$
-decomposition yields one direct gradient term per response token rather
-than a single end-of-prefix gradient.
+decomposition yields one direct gradient term per response token
+rather than a single end-of-prefix gradient, which favors fitting
+the in-distribution policy-drifted prefixes the PRM is asked to
+score during RL; we discuss this regime-dependence and its
+implications for deployment in Section~\ref{sec:limitations}.
 
 \paragraph{Per-token learned-critic baselines.}
 The classical PPO-with-critic recipe \citep{schulman2017ppo} uses a learned
@@ -383,14 +395,20 @@ the implied probability is exactly $0.5$ for every prefix --- a
 natural calibrated prior. We refer to $V_\phi$ as the \emph{process
 reward model} (PRM), following the convention of \citet{ipvrm2026}
 and the process-supervision literature. The cumulative-log-ratio
-form is critical: because the value at any prefix decomposes as a
-sum of per-token log-ratio terms, every response token contributes a
-direct gradient signal during training rather than only the
-single-token signal an end-of-prefix scalar head would provide. We
-verified empirically that replacing this parameterization with
-$V_\phi(s_t) = \sigma(W h_\phi(s_t))$ at matched hyperparameters
-collapses validation Spearman $\rho$ from $\approx 0.78$ to
-$\approx 0.43$ (\S\ref{sec:phase1}).
+form is critical \emph{at the deployment regime} (in-distribution
+policy-drifted prefixes the PRM is asked to score during RL):
+because the value at any prefix decomposes as a sum of per-token
+log-ratio terms, every response token contributes a direct gradient
+signal during training rather than only the single-token signal an
+end-of-prefix scalar head would provide. We verified empirically
+that on the leaky prefix-shuffle validation set, replacing this
+parameterization with $V_\phi(s_t) = \sigma(W h_\phi(s_t))$ at
+matched hyperparameters collapses validation Spearman $\rho$ from
+$\approx 0.78$ to $\approx 0.43$. On the metric-B held-out
+evaluation (in-distribution policy-drifted prefixes), log-ratio
+leads sigmoid by ${\approx}0.10{-}0.13~\rho$ across all CASPO
+checkpoints we measure; on a fully out-of-distribution probe the
+relationship inverts (\S\ref{sec:limitations}).
 
 \subsection{Phase-1: PRM training via Monte Carlo step labels}
 \label{sec:phase1}
@@ -437,9 +455,14 @@ gathers the value at the step boundary $s_t$. Because all $i \le t$
 log-ratio terms enter the loss additively, every response token in
 the prefix produces a direct gradient signal --- which is the
 empirical reason this parameterization dominates an end-of-prefix
-scalar-head alternative (\S\ref{sec:related}). We train for two
-epochs with full-model FSDP updates, $\beta = 10$, effective batch
-size 32, and learning rate $5 \times 10^{-6}$.
+scalar-head alternative on the leaky validation set and on the
+in-distribution policy-drifted regime that drives RL
+(\S\ref{sec:related}, \S\ref{sec:limitations}). We train for three epochs with full-model
+FSDP updates, $\beta = 10$, effective batch size 32, and learning
+rate $5 \times 10^{-6}$. Best-by-validation checkpoint selection
+operates on a leaky prefix-shuffle val for runtime efficiency; we
+cross-validate the selected checkpoint on a non-leaky prompt-level
+held-out probe at the end of training (\S\ref{sec:phase1}).
 
 \paragraph{Held-out PRM evaluation.}
 For PRM quality reporting we evaluate $V_\phi$ on a \emph{prompt-level}
@@ -447,12 +470,22 @@ held-out split rather than a prefix-level shuffle. The default
 \texttt{train\_value\_mc.py} flow exposes two non-leaky modes:
 \texttt{--split\_by\_prompt}, which holds out
 $\lceil \mathrm{val\_fraction} \cdot |\mathcal{D}_{\mathrm{prompt}}|\rceil$
-unique prompts (and all their prefixes) from the same N=300 collection,
+unique prompts (and all their prefixes) from the training collection,
 and \texttt{--held\_out\_data <path>}, which loads a separately-collected
-mc\_labels file generated on disjoint prompts (the remaining 909
-\texttt{dsr\_sub} prompts not in the primary training collection). The
-prefix-level row shuffle is preserved as a legacy default but flagged
-explicitly as leaky in the trainer's startup banner.
+mc\_labels file generated on disjoint prompts (e.g.\ a fresh DeepScaleR
+slice disjoint from \texttt{dsr\_sub}). The prefix-level row shuffle is
+preserved as a legacy default but flagged explicitly as leaky in the
+trainer's startup banner. The Phase-1 PRM that drives our RL runs (the
+``orig'' recipe) was collected over the full \texttt{dsr\_sub}
+($N{=}1209$ prompts, $K{=}16$, $J{=}16$, sharded across four parallel
+collection processes), of which $1208$ unique prompts were observed
+across shards and $750$ unique prompts produced mixed-outcome MC labels
+(${\approx}62\%$ yield at the SFT base policy). A subsequent
+policy-source refresh collected on rollouts of the step\_150 RL
+checkpoint of \texttt{dsr\_sub} sees the same $1208$ unique prompts
+with $561$ mixed-outcome (${\approx}46\%$ yield), reflecting the
+policy moving away from chance success on a subset of prompts as RL
+proceeds.
 
 \subsection{Phase-2: step-TD policy optimization}
 At each PPO outer step, the trainer samples $G$ responses per prompt
@@ -469,22 +502,34 @@ control distribution drift.
 \subsection{Iterated PRM refresh}
 \label{sec:refresh}
 
-\paragraph{PRM decay.}
-A learned PRM is in-distribution only at the policy state on which its
-MC labels were collected. As RL training updates the policy, the
+\paragraph{PRM decay (and recovery).}
+A learned PRM is in-distribution only at the policy state on which
+its MC labels were collected. As RL training updates the policy, the
 prefixes seen at outer step $t$ drift away from the policy that
 generated the Phase-1 labels, and $V_\phi$'s calibration on those
-prefixes deteriorates. Concretely, on Qwen2.5-Math-1.5B with the
-\texttt{dsr\_sub} dataset we
-measure the per-checkpoint Spearman $\rho$ between $V_\phi(s_t)$ and a
-fresh $J{=}8$ MC estimate of $P(\text{success} \mid s_t)$ at policy
-states $\{$step\_50, step\_100, $\ldots$, step\_400$\}$. A PRM trained
-on rollouts of step\_0 (SFT) yields $\rho \approx 0.63$ when scored on
-its own distribution; on policy state step\_150 this drops to
-$\rho \approx 0.54$, and on step\_400 it falls to $\rho \approx 0.27$.
-The decay is monotone with cumulative policy drift and is the dominant
-mechanism by which a fixed prefix-value model loses its credit-signal
-quality during RL.
+prefixes can deteriorate. We measure this directly on
+Qwen2.5-Math-1.5B with the \texttt{dsr\_sub} dataset by computing the
+per-checkpoint Spearman $\rho$ between $V_\phi(s_t)$ and a fresh
+$K{=}4$, $J{=}8$ MC estimate of $P(\text{success} \mid s_t)$ at
+policy states $\{$step\_50, step\_100, $\ldots$, step\_400$\}$,
+generated at the same response cap as the PRM's training data
+(cap${=}1024$).
+
+The Phase-1 PRM trained on SFT-policy rollouts behaves
+\emph{non-monotonically} across RL stages: $\rho$ rises through early
+RL, peaks at step\_150 ($\rho{=}0.54$), drops sharply at
+step\_200--250 ($\rho{=}0.23,\ 0.20$) as the policy executes a
+structural change in its reasoning patterns, and partially recovers
+thereafter ($\rho{=}0.27, 0.32, 0.38$ at step\_300/350/400). The
+drop at step\_200--250 is the largest single calibration loss and is
+what motivates a refresh trigger before that window. The partial
+recovery from step\_300 onward suggests that the policy's
+distribution re-stabilizes after the structural transition, but
+$V_\phi$ never re-attains its step\_150 peak. PRM staleness is
+therefore better described as ``staircase decay with a critical
+mid-RL drop'' than as smooth monotone drift, and the refresh
+schedule should be tuned to catch the drop window rather than to a
+fixed pace.
 
 \paragraph{Refresh mechanism.}
 We address PRM decay by replacing a single drifting $V_\phi$ with a
@@ -500,16 +545,62 @@ $\Delta\log p$, chosen so that $\rho$ at the refresh trigger remains
 well above the empirical $\tau \approx 0.4$ floor at which the
 credit-signal contribution of $V_\phi$ becomes negligible.
 
+\paragraph{Implicit regularization from policy-source labels.}
+A side benefit of the refresh design is that it makes the (otherwise
+leaky) prefix-shuffle val align with the metric-B (policy-drifted
+prefix) probe used to validate $V_\phi$ for RL. The Phase-1 PRM
+trained on SFT-base rollouts \emph{overfits} the leaky val past
+${\sim}3000$ optimizer steps: leaky val keeps decreasing while
+metric-B $\rho$ on policy-drifted prefixes decays. A refresh PRM
+trained on rollouts of the step\_150 RL checkpoint does \emph{not}
+exhibit this asymmetry --- its metric-B $\rho$ trajectory is roughly
+flat from step ${\sim}500$ to the end of training, mirroring its
+leaky-val trajectory. The mechanistic explanation is direct: leaky
+val measures fit to the training distribution, and for the Phase-1
+PRM the training distribution (SFT-base policy) is not the
+deployment distribution (RL-current policy), so leaky val mis-selects
+checkpoints; for the refresh PRM the training distribution
+${\approx}$ deployment distribution and leaky val ${\approx}$ metric-B.
+This validates the refresh design as having implicit regularization
+beyond the obvious policy-distribution match: the same trainer recipe
+that we previously diagnosed as leaky becomes a usable selector once
+the source policy is moved on-policy.
+
+\paragraph{Per-checkpoint PRM specialization.}
+Comparing the Phase-1 PRM and the policy-source refresh PRM
+checkpoint-by-checkpoint along the RL training trajectory shows
+that the two are not uniformly ranked: the Phase-1 (SFT-source)
+PRM wins early-RL prefixes (step\_0 through step\_150) by
+${\approx}+0.12~\rho$ on metric-B, while the refresh PRM wins
+mid-to-late-RL prefixes (step\_150+) by ${\approx}+0.08~\rho$. Both
+gaps are real per-checkpoint signals (more than three to four
+standard errors on the per-stage estimate) but cancel when averaged
+over the eight CASPO RL checkpoints we log, so the
+trajectory-averaged comparison is essentially a tie. We therefore
+report a softer claim than ``refresh dominates'': the refresh PRM
+is the right choice for RL credit signals after the policy has
+moved appreciably from the SFT base, and the Phase-1 PRM remains
+the right choice in the early-RL window before that drift has
+occurred.
+
 \paragraph{Refresh cost.}
-A single refresh on Qwen2.5-Math-1.5B with \texttt{dsr\_sub} takes
-$\approx 91$ minutes on $4 \times$H100 80GB ($\approx 41$~min for MC
-collection at $K{=}16$, $J{=}8$ on $N{=}300$ prompts, plus
-$\approx 50$~min for FSDP=4 PRM training). At $k = 150$ this amortizes
-to $\approx 36$~s of refresh overhead per RL outer step, raising
-total \caspo{}+refresh wall-clock for a 600-step RL run by roughly
-$5{-}6$~h above the no-refresh \caspo{} baseline. The amortized
-refresh cost is small relative to overall per-step training time and
-is an order of magnitude below \vineppo{}~$K{=}9$.
+With FlashAttention-2 enabled across the trainer and the
+\texttt{--cache\_ref} optimization that precomputes frozen-reference
+log-probabilities once per epoch, a single refresh on
+Qwen2.5-Math-1.5B with \texttt{dsr\_sub} (FSDP=4, $N{=}1209$ prompts,
+three epochs, effective batch 32) takes $\approx 57$ minutes on
+$4{\times}$H100 80GB at the policy-source recipe ($\approx 26$~min for
+MC collection at $K{=}16$, $J{=}8$, $\mathrm{cap}{=}1536$, plus
+$\approx 31$~min for the PRM training pass). The Phase-1 PRM trained
+under the original recipe ($K{=}16$, $J{=}16$, $\mathrm{cap}{=}1024$)
+runs longer at $\approx 88$ minutes ($\approx 48$~min collection plus
+$\approx 40$~min training). At $k{=}150$ the refresh amortizes to
+${\approx}17.7$~s of refresh overhead per RL outer step (three
+mid-RL refreshes over a 600-step run); at $k{=}200$ it amortizes to
+${\approx}11.8$~s/step (two refreshes). The amortized refresh cost
+is small relative to the ${\sim}90$~s/step CASPO RL step time
+(Section~\ref{sec:infra}) and is an order of magnitude below
+\vineppo{}~$K{=}9$.
 
 \paragraph{Ablation.}
 We report \caspo{} both with and without refresh: \caspo{} (the
@@ -823,7 +914,45 @@ neither compete for disk bandwidth nor cross-fill each other's drives.
 The frozen reference policy is shared between the KL term and \caspo{}'s
 value-model ref to avoid a duplicate forward. Rollout, old-logprob rescore,
 ref-logprob precompute, and policy/value forward all use FlashAttention-3 on
-Hopper.
+Hopper at 7B; at 1B/1.5B the trainer uses HuggingFace's
+\texttt{flash\_attention\_2} attention implementation, switched on across
+all five method launchers (rollout, old-logprob rescore, ref-logprob
+precompute, policy update, and value/critic forward) in place of the
+default scaled-dot-product attention. The switch is measured to give a
+${\sim}30\text{--}40\%$ step-time speedup on the 1.5B configuration with
+no numerical change.
+
+\paragraph{Microbatch and memory budget on 4-GPU 1.5B FSDP.}
+On the 1.5B FSDP=4 configuration we use a per-rank policy microbatch
+of $8$ with gradient accumulation $4$ (preserving the global PPO
+minibatch of $128$), an additional $4\text{--}9\%$ step-time gain over
+the previous $\mathrm{mb}{=}2$/$\mathrm{accum}{=}8$ split with no OOM
+under any of \caspo{}, \grpo{}, or \ppocritic{}. Peak reserved memory
+remains ${\sim}17$~GiB at \ppocritic{} (the highest of the three) and
+${\sim}13\text{--}15$~GiB for the other methods, well within the
+H100 80~GB budget after the ${\sim}24$~GiB vLLM KV reservation. With
+these settings the measured \caspo{}-$\Delta p$ outer-step time
+on Qwen2.5-Math-1.5B (FSDP=4, $G{=}8$, $128$ prompts/step,
+$\mathrm{mb}{=}8$, $\mathrm{accum}{=}4$, FA2, vLLM
+\texttt{gpu\_memory\_utilization}${=}0.30$ and
+\texttt{kv\_cache\_dtype} bf16) is ${\approx}89.8$~s/step
+including rollout, old-logprob rescore, value forward,
+ref-logprob precompute, policy update, and IPC sync.
+
+\paragraph{Cached frozen-reference logprobs for PRM training.}
+PRM training on $N{=}1209$ \texttt{dsr\_sub} prompts under FSDP=4 with
+the cumulative-log-ratio parameterization recomputes both the trainable
+$\pi_\phi$ and the frozen $\pi_{\mathrm{ref}}$ log-probabilities for
+every prefix every epoch by default. We add a \texttt{--cache\_ref}
+path that precomputes the frozen-reference log-probabilities once per
+prefix at the start of each epoch and replays them from a tensor cache
+during the gradient pass; combined with FlashAttention-2 this is
+measured to give a $35\text{--}50\%$ Phase-B (training-pass)
+speedup at $\mathrm{cap}{=}1024\text{--}1536$ with no impact on the
+optimizer trajectory (the cached log-probabilities are exact bf16
+copies of what the forward would have computed). The numbers
+reported under \emph{Refresh cost} (\S\ref{sec:refresh}) are with
+\texttt{--cache\_ref} and FA2 enabled.
 
 \paragraph{Paper-faithful alignment with upstream \vineppo{}.}
 A targeted audit against the upstream \vineppo{} reference repository
@@ -840,29 +969,55 @@ and uniform grad-accumulation per outer step. With these in place,
 the \vineppo{} baseline in our stack matches the upstream
 configuration field-for-field at the respective scale.
 
-\paragraph{Stabilization deviations from upstream
-(\ppocritic{}/\caspo{} only).}
-Two deliberate departures from upstream-faithful numerics were required
-to keep the online-value methods (\ppocritic{}, \caspo{}, \caspo{}-Δp)
-stable at 1B. Empirically, with upstream's $\mathrm{kl\_coef}=10^{-4}$
-and no advantage clip, both \ppocritic{} and \caspo{} drift to KL$\to
-\infty$ within $\sim 20$ outer steps in our reimplementation; \grpo{}
-remains stable. The fix was a stronger ref-anchor and an outlier safety
-net:
+\paragraph{Stabilization deviations from upstream.}
+Two deliberate departures from upstream-faithful numerics were
+required to keep our 1B runs stable. Table~\ref{tab:hp} reports our
+1B KL coefficients: $10^{-3}$ for \grpo{}, \vineppo{}, and \caspo{};
+$10^{-2}$ for \ppocritic{}. The $10^{-3}$ value is itself an order
+of magnitude above upstream \vineppo{}'s $10^{-4}$, but is the
+smallest value at which our 1B runs hold KL bounded across 600
+outer steps; with upstream's $10^{-4}$ and no advantage clip, all
+four 1B methods drift to KL$\to\infty$ within $\sim 20$ outer steps
+in our reimplementation. The further $10\times$ bump to $10^{-2}$
+for \ppocritic{} specifically is required because \ppocritic{}'s
+critic-baseline advantages are small in early training (the critic
+predicts near the mean reward, advantages ${\approx}0$), so a
+tighter ref anchor is needed to prevent premature drift while the
+critic warms up.
 \begin{itemize}
-\item $\mathrm{kl\_coef} = 10^{-2}$ (100$\times$ upstream's $10^{-4}$,
-  midway between InstructGPT's $0.02$ and DeepSeek-Math GRPO's $0.04$).
-  This is roughly the standard RLHF range; upstream \vineppo{}'s unusually
-  small value is paired with $K{=}9$ Monte Carlo step values that absorb
-  V-noise we do not have.
-\item Standardized advantage clip $\pm 3\sigma$ retained as an outlier
-  safety net (the upstream-faithful no-clip choice survives at \vineppo{}
-  but causes \caspo{} to occasionally take large policy steps that
-  destabilize online $V_\phi$).
+\item $\mathrm{kl\_coef} = 10^{-3}$ for \grpo{}/\vineppo{}/\caspo{}
+  ($10\times$ upstream's $10^{-4}$); $\mathrm{kl\_coef} = 10^{-2}$
+  for \ppocritic{} ($100\times$ upstream's $10^{-4}$). Both values
+  remain inside the standard RLHF range, between InstructGPT's
+  $0.02$ and DeepSeek-Math GRPO's $0.04$. Upstream \vineppo{}'s
+  unusually small value is paired with $K{=}9$ Monte Carlo step
+  values that absorb V-noise we do not have.
+\item Standardized advantage clip $\pm 3\sigma$ retained as an
+  outlier safety net (the upstream-faithful no-clip choice survives
+  at \vineppo{} but causes \caspo{} to occasionally take large
+  policy steps that destabilize online $V_\phi$).
 \end{itemize}
-\grpo{} and \vineppo{} are unaffected by these knobs at runtime since
-they have no learned baseline to drift; we hold the same values across
-methods for stack consistency.
+We note the $10\times$ KL-coefficient asymmetry between
+\ppocritic{} and the other methods as a comparability concern and
+report all four methods at their stable-converged KL coefficient
+rather than at a single shared value. At 7B, all four methods hold
+at the upstream $\mathrm{kl\_coef}=10^{-4}$ without modification.
+
+\paragraph{Production PRM provenance (orig recipe).}
+The Phase-1 PRM checkpoint that drives the reported \caspo{}
+math500/gsm8k gains (the ``orig'' recipe in our internal log) was
+trained for an intended three-epoch budget of $5046$ optimizer steps
+and the run terminated at step $4500$ (${\approx}89\%$ of the
+intended budget) when a periodic save filled the output volume mid-write.
+The auto-save's \texttt{/best} symlink (selected on the leaky
+prefix-shuffle val with \texttt{best\_val\_loss} ${=}0.4060$) and the
+\texttt{/step\_4500} subdir both point to the same step; we use the
+\texttt{/best} payload (a complete $3.55$~GB
+\texttt{model.safetensors}), since the partial \texttt{/step\_4500}
+write is truncated to $1.16$~GB. The interrupted-budget caveat
+matters only for the orig PRM; subsequent refreshes complete their
+full-epoch budgets uneventfully under FSDP=4 with the cached
+reference-logprob path.
 
 \paragraph{$V_\phi$ retrain after verifier and tokenization changes.}
 $V_\phi$'s offline training data was collected before two upstream-aligned
@@ -1027,18 +1182,20 @@ accuracy/wall-clock trade-off.
 \paragraph{Reward-model drift.}
 A $V_\phi$ trained on the SFT distribution decays in calibration as
 the policy optimizes; the prefixes encountered later in training are
-no longer drawn from the SFT marginal, and Spearman $\rho$ vs. fresh
-MC labels falls monotonically (Section~\ref{sec:refresh}).
-\caspo{}+refresh addresses this by periodically retraining $V_\phi$
-from scratch on Monte-Carlo-labeled rollouts of the current policy
-(every $k{=}150$ outer steps for $\Delta p$, $k{=}200$ for
-$\Delta\log p$). Per-refresh wall-clock is approximately one-tenth
-of one \vineppo{} outer-step budget at $K{=}9$, so the method
-remains dominated by RL rollout cost rather than refresh overhead.
-Neither the no-refresh default nor refresh is a complete defense
-against pathological feedback loops (e.g.\ a value head that learns
-to predict policy surface form rather than correctness); we report
-both to quantify the contribution of the refresh path.
+no longer drawn from the SFT marginal, and Spearman $\rho$ vs.\ fresh
+MC labels declines non-monotonically with a sharp mid-RL drop
+(Section~\ref{sec:refresh}). \caspo{}+refresh addresses this by
+periodically retraining $V_\phi$ from scratch on Monte-Carlo-labeled
+rollouts of the current policy (every $k{=}150$ outer steps for
+$\Delta p$, $k{=}200$ for $\Delta\log p$). The amortized refresh
+overhead is on the order of $10\text{--}20$~s per RL outer step
+(Section~\ref{sec:refresh}), well below one \vineppo{}~$K{=}9$
+step's ${\sim}33$~min, so the method remains dominated by RL rollout
+cost rather than refresh overhead. Neither the no-refresh default nor refresh is a
+complete defense against pathological feedback loops (e.g.\ a value
+head that learns to predict policy surface form rather than
+correctness); we report both to quantify the contribution of the
+refresh path.
 
 \paragraph{Cross-distribution probe-set evaluation of $V_\phi$.}
 Selecting the best refresh recipe by ranking candidate $V_\phi$ checkpoints
@@ -1076,6 +1233,20 @@ Results at 1.5B and 7B may not transfer to substantially larger scales. The
 7B FSDP+vLLM-IPC stack is novel to this work; whether the same configuration
 extrapolates to 70B is an open systems question.
 
+\paragraph{Single-seed PRM ranking.}
+Our PRM A/B comparisons (Phase-1 SFT-source vs. policy-source refresh,
+including the per-stage specialization in Section~\ref{sec:refresh})
+are based on one trained PRM per recipe. A paired-$t$ test across the
+eight CASPO RL checkpoints we log shows that none of the recipe-level
+metric-B $\rho$ differences are significant at $p<0.05$; the $95\%$
+confidence intervals all straddle zero, even though per-checkpoint
+deltas are large in magnitude (${\approx}0.10\text{--}0.20~\rho$).
+Per-stage specialization is real but cancels in the trajectory
+average. Multi-seed PRM training over $\geq 3$ independent label
+collections is the only honest path to a definitive recipe ranking;
+the comparisons reported here are suggestive, not proven, and any
+``wins by $X~\rho$'' phrasing should be read with that caveat.
+
 \section{Future Work: Optimizing the Success-Prediction Architecture}
 \label{sec:future-work}
 Our results adopt \ipvrm{}'s cumulative-log-ratio parameterization for
@@ -1112,6 +1283,23 @@ $\widehat{p}$ variance at fixed compute through bucketed batching;
 calibration-aware losses (focal BCE, temperature-scaled targets) when
 the underlying success-rate distribution is bimodal; and contrastive
 losses pairing within-prompt prefixes of different success rates.
+
+\paragraph{Continuation count $J$ at fixed checkpoint-selection.}
+The orig recipe uses $J{=}16$ continuations per prefix; refreshes
+use $J{=}8$ to halve label-collection cost. A direct A/B at fixed
+recipe (orig at $J{=}8$ vs.\ orig at $J{=}16$) shows that on the
+\emph{leaky-val-selected} \texttt{/best} checkpoint $J{=}16$ leads
+$J{=}8$ by ${\approx}0.027~\rho$ on average metric-B; but at the
+\emph{metric-B-selected} peak (which falls at ${\approx}60\%$ of the
+optimizer budget, well before the leaky-val-selected
+\texttt{/best}), $J{=}8$ ties $J{=}16$ on metric-B (paired-$t$
+$p{=}0.93$). The apparent $J{=}16$ advantage is therefore an artifact
+of leaky-val mis-selection rather than a structural property of the
+larger continuation count: when the selector is non-leaky (or when
+training stops at the metric-B peak), $J{=}8$ is sufficient. This
+is a useful corollary of the earlier statistical-significance caveat
+and a concrete recipe simplification (halve $J$ at no measurable
+metric-B cost).
 
 \paragraph{Inference-time refinements.}
 At inference, $V_\phi$ is queried in a single forward pass. Test-time
