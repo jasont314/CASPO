@@ -232,6 +232,7 @@ while (( current_step < TOTAL_STEPS )); do
     SAVE_OPTIMIZER_STATE=true \
     ADV_TRANSFORM="$ADV_TRANSFORM" \
     LOG_DIR="$OUT_ROOT/logs/cycle_${cycle}_rl" \
+    RUN_EVAL=false \
       bash scripts/launch_qwen_caspo.sh
   fi
 
@@ -267,6 +268,67 @@ while (( current_step < TOTAL_STEPS )); do
 done
 
 echo ""
-echo "[alt] $(date +%H:%M:%S) === ALL DONE: $cycle cycles, $current_step total RL steps ==="
+echo "[alt] $(date +%H:%M:%S) === RL+REFRESH DONE: $cycle cycles, $current_step total RL steps ==="
 echo "[alt] final policy: $current_ckpt"
 echo "[alt] final PRM:    $current_prm"
+
+# ---- Post-run greedy eval on every saved RL ckpt ----
+# Mirrors launch_qwen_caspo.sh's built-in eval block but scoped across
+# every cycle_*_rl/step_* dir (typically save_every=50 → 12 ckpts at
+# 600 total steps), so we get the full pass@1 trajectory across cycles.
+# Suppressed by RUN_EVAL=false. Parallel across GPU_LIST.
+RUN_EVAL="${RUN_EVAL:-true}"
+if [[ "$RUN_EVAL" == "true" ]]; then
+  read -r -a GPUS <<< "$GPU_LIST"
+  EVAL_DIR="$OUT_ROOT/eval"
+  mkdir -p "$EVAL_DIR"
+  echo ""
+  echo "[alt] $(date +%H:%M:%S) === POST-RUN EVAL ==="
+
+  # Collect all step_* ckpts across cycles, numerically sorted by step.
+  mapfile -t CKPTS < <(
+    for cy_dir in "$OUT_ROOT"/cycle_*_rl; do
+      [[ -d "$cy_dir" ]] || continue
+      for ck_dir in "$cy_dir"/step_*; do
+        [[ -d "$ck_dir" ]] && echo "$ck_dir"
+      done
+    done | awk -F'/step_' '{print $2 "\t" $0}' | sort -n | cut -f2-
+  )
+  echo "[alt] eval ckpts (${#CKPTS[@]}):"
+  printf '[alt]   %s\n' "${CKPTS[@]}"
+
+  eval_one() {
+    local gpu="$1" ckpt="$2"
+    local tag="$(basename "$(dirname "$ckpt")")_$(basename "$ckpt")"
+    local out="$EVAL_DIR/${tag}.json"
+    local elog="$EVAL_DIR/${tag}.log"
+    [[ -f "$out" ]] && { echo "[$tag] skip — exists"; return; }
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYBIN" -u scripts/eval.py \
+      --config configs/caspo_rho1b_math.yaml \
+      --override "model_name_or_path=$ckpt" \
+      --override "prompt_template={query}\nLet's think step by step and output the final answer within \\boxed{}." \
+      --override "max_response_len=2048" \
+      --benchmarks "math500,gsm8k,olympiadbench" \
+      --k 1 --temperature 0.0 --top-p 1.0 \
+      --max-new-tokens 3072 \
+      --backend vllm --gpu-memory-utilization 0.85 \
+      --output "$out" \
+      > "$elog" 2>&1 \
+    && echo "[$tag] $(date +%H:%M:%S) done" || echo "[$tag] FAIL"
+  }
+
+  i=0
+  while (( i < ${#CKPTS[@]} )); do
+    EPIDS=()
+    for ((j=0; j<${#GPUS[@]} && i+j<${#CKPTS[@]}; j++)); do
+      ( eval_one "${GPUS[$j]}" "${CKPTS[$((i+j))]}" ) &
+      EPIDS+=("$!")
+    done
+    for pid in "${EPIDS[@]}"; do wait "$pid"; done
+    i=$((i + ${#EPIDS[@]}))
+  done
+  echo "[alt] $(date +%H:%M:%S) === EVAL DONE: $EVAL_DIR ==="
+fi
+
+echo ""
+echo "[alt] $(date +%H:%M:%S) === ALL DONE ==="
