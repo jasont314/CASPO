@@ -96,7 +96,7 @@ for r in 0 1 2 3; do
     --override "tokenizer_name_or_path=Qwen/Qwen2.5-Math-1.5B" \
     --override "trust_remote_code=true" \
     --override "torch_dtype=bfloat16" \
-    --override "attn_implementation=sdpa" \
+    --override "attn_implementation=flash_attention_2" \
     --override "dataset_name=$DSR_SUB" \
     --override "dataset_split=train" \
     --override "filter_eval_leakage=false" \
@@ -109,8 +109,8 @@ for r in 0 1 2 3; do
     --override "rollout_top_p=1.0" \
     --override "group_size=8" \
     --override "prompts_per_step=128" \
-    --override "micro_batch_size=4" \
-    --override "grad_accum_steps=8" \
+    --override "micro_batch_size=8" \
+    --override "grad_accum_steps=4" \
     --override "use_gradient_checkpointing=true" \
     --override "lr=1.0e-6" \
     --override "kl_coef=$KL_COEF" \

@@ -73,8 +73,8 @@ LR="${LR:-1.0e-6}"
 KL_COEF="${KL_COEF:-0.001}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-128}"
-MB="${MB:-4}"
-ACCUM="${ACCUM:-8}"
+MB="${MB:-8}"
+ACCUM="${ACCUM:-4}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-2}"
 KL_ESTIMATOR="${KL_ESTIMATOR:-k3}"
 
@@ -113,7 +113,7 @@ for r in 0 1 2 3; do
     --override "ref_model_path=$REF_MODEL" \
     --override "trust_remote_code=true" \
     --override "torch_dtype=bfloat16" \
-    --override "attn_implementation=sdpa" \
+    --override "attn_implementation=flash_attention_2" \
     --override "dataset_name=$DSR_SUB" \
     --override "dataset_split=train" \
     --override "filter_eval_leakage=false" \
