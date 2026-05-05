@@ -27,7 +27,7 @@
 #   J=16                        # MC continuations per labeled prefix
 #   STEPS_PER_RESPONSE=5
 #   NUM_PROMPTS=                # empty = use all (1209 for dsr_sub)
-#   MAX_RESPONSE_LEN=2048       # matches RL deployment cap
+#   MAX_RESPONSE_LEN=1024       # orig recipe (base SFT chains compact); use 1536 for refresh PRM
 #   MAX_TRAIN_PREFIX_LEN=0      # 0 = match collection cap (no decoupling)
 #
 #   # Phase B (training):
@@ -38,7 +38,7 @@
 #   LR=5e-6
 #   TRAIN_MB=4
 #   GRAD_ACCUM=2                # eff_batch = N_GPUS × TRAIN_MB × GRAD_ACCUM = 32
-#   EPOCHS=2
+#   EPOCHS=3                    # every metric-B-best PRM in the sweep was 3-epoch
 #   VAL_FRACTION=0.1
 #   EARLY_STOP_PATIENCE=999     # 999 = effectively no early stop
 #   BETA=10.0

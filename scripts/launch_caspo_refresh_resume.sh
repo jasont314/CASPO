@@ -142,7 +142,6 @@ for r in 0 1 2 3; do
     --override "rollout_backend=vllm" \
     --override "vllm_weight_sync_backend=ipc" \
     --override "vllm_gpu_memory_utilization=0.45" \
-    --override "vllm_kv_cache_dtype=fp8" \
     --override "vllm_enforce_eager=false" \
     --override "vllm_multi_sample_mode=auto" \
     --override "vllm_max_num_seqs=128" \

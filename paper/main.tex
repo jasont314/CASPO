@@ -539,7 +539,11 @@ the current policy snapshot under the same Phase-1 recipe
 (\eqref{eq:phat}, \eqref{eq:prmloss}), retrains $V_\phi$ \emph{from
 scratch} on those labels (initialized from the SFT backbone, not from
 the previous $V_\phi$, to avoid bias compounding across refreshes),
-and resumes RL using the new $V_\phi$ as the prefix value source. We
+and resumes RL using the new $V_\phi$ as the prefix value source. The
+policy resumes with its AdamW first- and second-moment buffers and
+its learning-rate scheduler state preserved across the refresh
+boundary, so optimizer warm-up and lr decay continue along the
+original 600-step horizon rather than restarting at each refresh. We
 use $k = 150$ for the $\Delta p$ formulation and $k = 200$ for
 $\Delta\log p$, chosen so that $\rho$ at the refresh trigger remains
 well above the empirical $\tau \approx 0.4$ floor at which the
@@ -584,21 +588,19 @@ the right choice in the early-RL window before that drift has
 occurred.
 
 \paragraph{Refresh cost.}
-With FlashAttention-2 enabled across the trainer and the
-\texttt{--cache\_ref} optimization that precomputes frozen-reference
-log-probabilities once per epoch, a single refresh on
-Qwen2.5-Math-1.5B with \texttt{dsr\_sub} (FSDP=4, $N{=}1209$ prompts,
-three epochs, effective batch 32) takes $\approx 57$ minutes on
-$4{\times}$H100 80GB at the policy-source recipe ($\approx 26$~min for
-MC collection at $K{=}16$, $J{=}8$, $\mathrm{cap}{=}1536$, plus
-$\approx 31$~min for the PRM training pass). The Phase-1 PRM trained
-under the original recipe ($K{=}16$, $J{=}16$, $\mathrm{cap}{=}1024$)
-runs longer at $\approx 88$ minutes ($\approx 48$~min collection plus
+A single refresh on Qwen2.5-Math-1.5B with \texttt{dsr\_sub} (FSDP=4,
+$N{=}1209$ prompts, three epochs, effective batch 32) takes
+$\approx 57$ minutes on $4{\times}$H100 80GB at the policy-source
+recipe ($\approx 26$~min for MC collection at $K{=}16$, $J{=}8$,
+$\mathrm{cap}{=}1536$, plus $\approx 31$~min for the PRM training
+pass). The Phase-1 PRM trained under the original recipe
+($K{=}16$, $J{=}16$, $\mathrm{cap}{=}1024$) runs longer at
+$\approx 88$ minutes ($\approx 48$~min collection plus
 $\approx 40$~min training). At $k{=}150$ the refresh amortizes to
 ${\approx}17.7$~s of refresh overhead per RL outer step (three
 mid-RL refreshes over a 600-step run); at $k{=}200$ it amortizes to
 ${\approx}11.8$~s/step (two refreshes). The amortized refresh cost
-is small relative to the ${\sim}90$~s/step CASPO RL step time
+is small relative to the ${\sim}78$~s/step CASPO RL step time
 (Section~\ref{sec:infra}) and is an order of magnitude below
 \vineppo{}~$K{=}9$.
 
@@ -912,47 +914,34 @@ neither compete for disk bandwidth nor cross-fill each other's drives.
 
 \paragraph{Reference-policy sharing.}
 The frozen reference policy is shared between the KL term and \caspo{}'s
-value-model ref to avoid a duplicate forward. Rollout, old-logprob rescore,
-ref-logprob precompute, and policy/value forward all use FlashAttention-3 on
-Hopper at 7B; at 1B/1.5B the trainer uses HuggingFace's
-\texttt{flash\_attention\_2} attention implementation, switched on across
-all five method launchers (rollout, old-logprob rescore, ref-logprob
-precompute, policy update, and value/critic forward) in place of the
-default scaled-dot-product attention. The switch is measured to give a
-${\sim}30\text{--}40\%$ step-time speedup on the 1.5B configuration with
-no numerical change.
+value-model ref to avoid a duplicate forward. All forward passes
+(rollout, old-logprob rescore, ref-logprob precompute, policy update,
+value/critic forward) use FlashAttention-3 at 7B on Hopper and
+FlashAttention-2 at 1B/1.5B.
 
 \paragraph{Microbatch and memory budget on 4-GPU 1.5B FSDP.}
 On the 1.5B FSDP=4 configuration we use a per-rank policy microbatch
 of $8$ with gradient accumulation $4$ (preserving the global PPO
-minibatch of $128$), an additional $4\text{--}9\%$ step-time gain over
-the previous $\mathrm{mb}{=}2$/$\mathrm{accum}{=}8$ split with no OOM
-under any of \caspo{}, \grpo{}, or \ppocritic{}. Peak reserved memory
-remains ${\sim}17$~GiB at \ppocritic{} (the highest of the three) and
-${\sim}13\text{--}15$~GiB for the other methods, well within the
-H100 80~GB budget after the ${\sim}24$~GiB vLLM KV reservation. With
-these settings the measured \caspo{}-$\Delta p$ outer-step time
-on Qwen2.5-Math-1.5B (FSDP=4, $G{=}8$, $128$ prompts/step,
-$\mathrm{mb}{=}8$, $\mathrm{accum}{=}4$, FA2, vLLM
-\texttt{gpu\_memory\_utilization}${=}0.30$ and
-\texttt{kv\_cache\_dtype} bf16) is ${\approx}89.8$~s/step
-including rollout, old-logprob rescore, value forward,
-ref-logprob precompute, policy update, and IPC sync.
+minibatch of $128$). Peak reserved memory is ${\sim}17$~GiB at
+\ppocritic{} and ${\sim}13\text{--}15$~GiB for the other methods,
+within the H100 80~GB budget alongside the per-method vLLM KV
+reservation (\texttt{gpu\_memory\_utilization} $0.45$ for
+\caspo{}/\grpo{}, $0.35$ for \ppocritic{}, $0.50$ for \vineppo{};
+\texttt{kv\_cache\_dtype} bf16). With these settings the measured
+\caspo{}-$\Delta p$ outer-step time on Qwen2.5-Math-1.5B (FSDP=4,
+$G{=}8$, $128$ prompts/step, $\mathrm{mb}{=}8$, $\mathrm{accum}{=}4$,
+FA2) is ${\approx}78$~s/step including rollout, old-logprob
+rescore, value forward, ref-logprob precompute, policy update, and
+IPC sync.
 
 \paragraph{Cached frozen-reference logprobs for PRM training.}
-PRM training on $N{=}1209$ \texttt{dsr\_sub} prompts under FSDP=4 with
-the cumulative-log-ratio parameterization recomputes both the trainable
-$\pi_\phi$ and the frozen $\pi_{\mathrm{ref}}$ log-probabilities for
-every prefix every epoch by default. We add a \texttt{--cache\_ref}
-path that precomputes the frozen-reference log-probabilities once per
-prefix at the start of each epoch and replays them from a tensor cache
-during the gradient pass; combined with FlashAttention-2 this is
-measured to give a $35\text{--}50\%$ Phase-B (training-pass)
-speedup at $\mathrm{cap}{=}1024\text{--}1536$ with no impact on the
-optimizer trajectory (the cached log-probabilities are exact bf16
-copies of what the forward would have computed). The numbers
-reported under \emph{Refresh cost} (\S\ref{sec:refresh}) are with
-\texttt{--cache\_ref} and FA2 enabled.
+PRM training under FSDP=4 with the cumulative-log-ratio
+parameterization caches the frozen-reference log-probabilities once
+per prefix at the start of each epoch and replays them from a tensor
+cache during the gradient pass, avoiding a redundant
+$\pi_{\mathrm{ref}}$ forward at every microbatch. The cached values
+are exact bf16 copies of the original forward output, so the cache
+has no effect on the optimizer trajectory.
 
 \paragraph{Paper-faithful alignment with upstream \vineppo{}.}
 A targeted audit against the upstream \vineppo{} reference repository
@@ -1357,7 +1346,7 @@ policy generalizes via the base LM features.
 \emph{Promising next experiments.} (i) Sweep prompt-set sizes
 $N \in \{100, 300, 600, 1209\}$ at fixed RL budget and report
 the benchmark-transfer Pareto curve, distinguishing PRM held-out
-ρ (which is allowed to be low) from policy benchmark pass@1 (which
+$\rho$ (which is allowed to be low) from policy benchmark pass@1 (which
 must remain high). (ii) Compare a fixed random subset to a curated
 difficulty-balanced subset at the same $N$ (since success-rate
 distributions shift with the prompt mix, per Section~\ref{sec:vphi}).
