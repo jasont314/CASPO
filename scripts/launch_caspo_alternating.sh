@@ -197,6 +197,9 @@ while (( current_step < TOTAL_STEPS )); do
   (( next_target > TOTAL_STEPS )) && next_target="$TOTAL_STEPS"
 
   # ---- RL phase: from current_ckpt + current_prm until step=next_target ----
+  # Cycle 1 from base SFT (no optimizer.pt) → launch_qwen_caspo.sh (from-scratch).
+  # Cycles 2+ from RL ckpt (has optimizer.pt) → launch_caspo_refresh_resume.sh
+  # (preserves AdamW + lr scheduler state across the refresh boundary).
   RL_OUT="$OUT_ROOT/cycle_${cycle}_rl"
   echo ""
   echo "[alt] $(date +%H:%M:%S) === CYCLE $cycle: RL [$current_step → $next_target] ==="
@@ -204,18 +207,33 @@ while (( current_step < TOTAL_STEPS )); do
   echo "[alt] PRM:    $current_prm"
   echo "[alt] out:    $RL_OUT"
 
-  POLICY_CKPT="$current_ckpt" \
-  NEW_PRM="$current_prm" \
-  OUT_DIR="$RL_OUT" \
-  REF_MODEL="$REF_MODEL" \
-  GPU_LIST="$GPU_LIST" \
-  DSR_SUB="$DSR_SUB" \
-  MAX_STEPS="$next_target" \
-  SAVE_EVERY=50 \
-  METHOD="$METHOD" \
-  ADV_TRANSFORM="$ADV_TRANSFORM" \
-  LOG_DIR="$OUT_ROOT/logs/cycle_${cycle}_rl" \
-    bash scripts/launch_caspo_refresh_resume.sh
+  if [[ -f "$current_ckpt/optimizer.pt" ]]; then
+    echo "[alt] resume mode: warm (optimizer.pt + lr_scheduler preserved)"
+    POLICY_CKPT="$current_ckpt" \
+    NEW_PRM="$current_prm" \
+    OUT_DIR="$RL_OUT" \
+    REF_MODEL="$REF_MODEL" \
+    GPU_LIST="$GPU_LIST" \
+    DSR_SUB="$DSR_SUB" \
+    MAX_STEPS="$next_target" \
+    SAVE_EVERY=50 \
+    METHOD="$METHOD" \
+    ADV_TRANSFORM="$ADV_TRANSFORM" \
+    LOG_DIR="$OUT_ROOT/logs/cycle_${cycle}_rl" \
+      bash scripts/launch_caspo_refresh_resume.sh
+  else
+    echo "[alt] resume mode: from-scratch (no optimizer.pt at $current_ckpt; cycle 1 path)"
+    PRM_PATH="$current_prm" \
+    OUT_DIR="$RL_OUT" \
+    GPU_LIST="$GPU_LIST" \
+    DSR_SUB="$DSR_SUB" \
+    MAX_STEPS="$next_target" \
+    SAVE_EVERY=50 \
+    SAVE_OPTIMIZER_STATE=true \
+    ADV_TRANSFORM="$ADV_TRANSFORM" \
+    LOG_DIR="$OUT_ROOT/logs/cycle_${cycle}_rl" \
+      bash scripts/launch_qwen_caspo.sh
+  fi
 
   # Locate the saved ckpt for the next phase
   if [[ -d "$RL_OUT/step_${next_target}" ]]; then
