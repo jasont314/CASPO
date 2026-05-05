@@ -44,11 +44,15 @@
 #   BETA=10.0
 #   SEED=0
 #
-# ---- ETA ----
-#   Initial PRM (base SFT, full dsr_sub N=1209):
-#     ~41 min collection + ~50 min training on 4 GPUs ≈ 91 min total
-#   Refresh PRM (CASPO ckpt, N=300):
-#     ~30 min collection + ~50 min training ≈ 80 min total
+# ---- ETA (4 GPUs FSDP=4, with cache_ref + FA2 patches) ----
+#   Initial PRM (base SFT, full dsr_sub N=1209, K=16 J=16 cap=1024 3ep):
+#     ~48 min Phase A + ~40 min Phase B ≈ 88 min total
+#   Refresh PRM (CASPO step_X policy, full N=1209, K=16 J=8 cap=1536 3ep):
+#     ~26 min Phase A + ~31 min Phase B ≈ 57 min total
+#
+#   Mixed-prompt yield (per K=16 base rollouts):
+#     base SFT policy:    ~62% (750/1208 unique mixed)
+#     step_150 RL policy: ~46% (561/1208 unique mixed — improved policy → fewer mixed)
 #
 set -o pipefail
 
@@ -102,11 +106,18 @@ LR="${LR:-5e-6}"
 # feedback_grpo_mb_pareto.md: "mb=4 best (65s/step), mb=8 slower (72s)").
 TRAIN_MB="${TRAIN_MB:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
+SAVE_EVERY="${SAVE_EVERY:-500}"
+EVAL_EVERY="${EVAL_EVERY:-200}"
 EPOCHS="${EPOCHS:-2}"
 VAL_FRACTION="${VAL_FRACTION:-0.1}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-999}"
 BETA="${BETA:-10.0}"
 SEED="${SEED:-0}"
+# Phase B speedups (validated 2026-05-05): cache_ref + flash_attention_2 cuts
+# per-step time ~35% on FSDP=4 cap=1024 (0.732s → 0.476s) and ~50% on cap=1536
+# (~0.85s → 0.432s). Both opt-in by default.
+CACHE_REF="${CACHE_REF:-1}"                    # IPVRM only; harmless on sigmoid (gated in trainer)
+PHASE_B_ATTN_IMPL="${PHASE_B_ATTN_IMPL:-flash_attention_2}"
 
 mkdir -p "$OUT_DIR/shards" "$LOG_DIR"
 
@@ -117,6 +128,7 @@ echo "[mc-prm] dataset:                    $DSR_SUB"
 echo "[mc-prm] N=${NUM_PROMPTS:-all} K=$K J=$J steps=$STEPS_PER_RESPONSE"
 echo "[mc-prm] max_response_len=$MAX_RESPONSE_LEN  max_train_prefix_len=$MAX_TRAIN_PREFIX_LEN"
 echo "[mc-prm] training: lr=$LR mb=$TRAIN_MB×$GRAD_ACCUM eff_batch=$((N_GPUS * TRAIN_MB * GRAD_ACCUM)) ep=$EPOCHS"
+echo "[mc-prm] phase-B speedups: CACHE_REF=$CACHE_REF  PHASE_B_ATTN_IMPL=$PHASE_B_ATTN_IMPL"
 echo "[mc-prm] output: $OUT_DIR  logs: $LOG_DIR"
 
 # ----------------------------------------------------------
@@ -176,6 +188,8 @@ TRAIN_PORT=$((30000 + RANDOM % 5000))
 TRAIN_PIDS=()
 ref_arg=()
 [[ -n "$REF_PATH" ]] && ref_arg=(--ref_path "$REF_PATH")
+cache_arg=()
+[[ "$CACHE_REF" == "1" ]] && cache_arg=(--cache_ref)
 for r in 0 1 2 3; do
   gpu="${GPUS[$r]}"
   log="$LOG_DIR/train_rank${r}.log"
@@ -183,17 +197,19 @@ for r in 0 1 2 3; do
   WORLD_SIZE=4 RANK="$r" LOCAL_RANK=0 \
   MASTER_ADDR=127.0.0.1 MASTER_PORT="$TRAIN_PORT" \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
+  PHASE_B_ATTN_IMPL="$PHASE_B_ATTN_IMPL" \
     nohup "$PYBIN" -u scripts/train_value_mc.py \
     --config configs/caspo_rho1b_math.yaml \
     --data "$OUT_DIR/mc_labels.pt" \
     --output_dir "$OUT_DIR" \
     --phi_init_path "$PHI_INIT" \
     "${ref_arg[@]}" \
+    "${cache_arg[@]}" \
     --lr "$LR" --mb "$TRAIN_MB" --grad_accum "$GRAD_ACCUM" \
     --epochs "$EPOCHS" --val_fraction "$VAL_FRACTION" \
     --early_stop_patience "$EARLY_STOP_PATIENCE" \
     --beta "$BETA" --seed "$SEED" \
-    --save_every 500 --eval_every 200 \
+    --save_every "$SAVE_EVERY" --eval_every "$EVAL_EVERY" \
     --eval_mb 16 \
     > "$log" 2>&1 &
   TRAIN_PIDS+=("$!")

@@ -93,15 +93,20 @@ def main():
         # default (256 / 8192) keeps the GPU saturated through the long Phase B
         # tail. enable_chunked_prefill overlaps the per-bucket prefill burst
         # with ongoing decode from the previous bucket.
+        # 2026-05-04: tested 1024 / 32768 — at K=16 J=8 cap=1024 it was a small
+        # regression (vLLM v1 cudagraph_capture_sizes top out at 512 → batches
+        # >512 fall to non-graph path). Reverted to 512 / 16384.
         max_num_seqs=512,
         max_num_batched_tokens=16384,
         enable_chunked_prefill=True,
         seed=args.seed,
     )
-    # num_workers=8 parallelizes the per-shard ~33k continuation MathRewardFn
+    # num_workers=16 parallelizes the per-shard ~33k continuation MathRewardFn
     # verifications across a ProcessPoolExecutor. Verification was the single-
-    # threaded tail (~1-2 min per shard); 8 workers cuts it to ~10-20s.
-    reward_fn = MathRewardFn(num_workers=8)
+    # threaded tail (~1-2 min per shard); 16 workers cuts it to ~10-20s.
+    # 2026-05-04: was 8; bumped to 16 alongside batched verify — the per-call
+    # parallel-threshold gate (n > 16*2=32) is now always met.
+    reward_fn = MathRewardFn(num_workers=16)
 
     # ============================================================
     # Load prompts
@@ -164,13 +169,25 @@ def main():
     )
     print(f"[mc] Phase A done in {time.time()-t0:.1f}s", flush=True)
 
-    # Verify outcomes for all base rollouts
+    # Verify outcomes for all base rollouts.
+    # 2026-05-04 PATCH: batch all (n_prompts*K) verifications into ONE reward_fn
+    # call so the worker pool actually parallelizes. Previously each per-prompt
+    # call had only K=16 entries, often below the parallel-fan-out threshold,
+    # leaving us serial across thousands of single-prompt calls.
     base_responses = [[c.text for c in out.outputs] for out in base_outputs]
-    print(f"[mc] Phase A: verifying {n_prompts * args.K} rollouts...", flush=True)
+    print(f"[mc] Phase A: verifying {n_prompts * args.K} rollouts (batched)...", flush=True)
+    t_v = time.time()
+    flat_preds: List[str] = []
+    flat_gts: List[str] = []
+    for i in range(n_prompts):
+        flat_preds.extend(base_responses[i])
+        flat_gts.extend([gts[i]] * args.K)
+    flat_rewards = reward_fn(predictions=flat_preds, ground_truths=flat_gts)
     base_outcomes = []  # [n_prompts][K]
     for i in range(n_prompts):
-        rewards = reward_fn(predictions=base_responses[i], ground_truths=[gts[i]] * args.K)
-        base_outcomes.append([1 if r >= 0.5 else 0 for r in rewards])
+        chunk = flat_rewards[i * args.K : (i + 1) * args.K]
+        base_outcomes.append([1 if r >= 0.5 else 0 for r in chunk])
+    print(f"[mc] Phase A: verify done in {time.time()-t_v:.1f}s", flush=True)
     n_mixed = sum(1 for outs in base_outcomes if 0 < sum(outs) < args.K)
     print(f"[mc] Phase A: mixed-outcome prompts: {n_mixed}/{n_prompts}", flush=True)
 
@@ -292,23 +309,60 @@ def main():
     # Verify each MC continuation. The "full text" for verification is prefix_text + continuation.
     # We need to give the verifier (problem, full_response, gt). The "response" the verifier sees
     # is the prefix's response part + the MC continuation.
-    print(f"[mc] Phase B: verifying {n_jobs * args.J} continuations...", flush=True)
-    p_hats = []
+    # 2026-05-04 PATCH: batch all n_jobs*J continuations into ONE reward_fn
+    # call. Previously the per-job call (J=8 entries) was below the parallel
+    # threshold, so verification ran fully serial across n_jobs calls.
+    # Production: 264k entries → ~16x speedup of the verify tail.
+    # Also: pre-decode unique prefix-response texts ONCE via batch_decode to
+    # avoid n_jobs separate single-sequence decode calls (each starts a fresh
+    # tokenizer fast-path; batch is 5-10x cheaper).
+    print(f"[mc] Phase B: verifying {n_jobs * args.J} continuations (batched)...", flush=True)
+    t_v = time.time()
+    # Decode prefix-response texts once per (r, end_idx) pair. Many jobs share
+    # the same r (multiple step boundaries on the same rollout) — but end_idx
+    # differs, so cache is keyed (r, end_idx).
+    prefix_text_cache: dict[tuple[int, int], str] = {}
+    decode_keys: list[tuple[int, int]] = []
+    decode_id_lists: list[list[int]] = []
+    for j_idx in range(n_jobs):
+        r, end_idx, _ = prefix_metadata[j_idx]
+        key = (r, end_idx)
+        if key not in prefix_text_cache:
+            prefix_text_cache[key] = ""  # placeholder, fill via batch_decode
+            decode_keys.append(key)
+            decode_id_lists.append(response_ids_pad[r, : end_idx + 1].tolist())
+    if decode_id_lists:
+        decoded = tok.batch_decode(decode_id_lists, skip_special_tokens=True)
+        for k, txt in zip(decode_keys, decoded):
+            prefix_text_cache[k] = txt
+    # Build flat predictions / gts for one big reward_fn call.
+    flat_preds: List[str] = []
+    flat_gts: List[str] = []
+    job_n_outputs: list[int] = []
     for j_idx, out in enumerate(mc_outputs):
         r, end_idx, _ = prefix_metadata[j_idx]
-        prompt_idx, k_idx, _, _ = flat_rows[r]
-        # Build full responses for verification: prefix response part + each MC continuation
-        prefix_response_text = tok.decode(
-            response_ids_pad[r, : end_idx + 1].tolist(), skip_special_tokens=True
-        )
-        full_responses = [prefix_response_text + c.text for c in out.outputs]
-        rewards = reward_fn(predictions=full_responses, ground_truths=[gts[prompt_idx]] * len(full_responses))
-        n_correct = sum(1 for r_ in rewards if r_ >= 0.5)
-        p_hat = n_correct / max(len(rewards), 1)
+        prompt_idx, _, _, _ = flat_rows[r]
+        prefix_response_text = prefix_text_cache[(r, end_idx)]
+        n_out = len(out.outputs)
+        for c in out.outputs:
+            flat_preds.append(prefix_response_text + c.text)
+        flat_gts.extend([gts[prompt_idx]] * n_out)
+        job_n_outputs.append(n_out)
+    flat_rewards = reward_fn(predictions=flat_preds, ground_truths=flat_gts)
+    p_hats = []
+    cur = 0
+    for j_idx, n_out in enumerate(job_n_outputs):
+        chunk = flat_rewards[cur : cur + n_out]
+        cur += n_out
+        n_correct = sum(1 for r_ in chunk if r_ >= 0.5)
+        p_hat = n_correct / max(len(chunk), 1)
         p_hats.append(p_hat)
         if j_idx < 5:
+            r, end_idx, _ = prefix_metadata[j_idx]
+            prompt_idx, k_idx, _, _ = flat_rows[r]
             print(f"  [mc] sample {j_idx}: prompt={prompt_idx} k={k_idx} step_end={end_idx} "
-                  f"p_hat={p_hat:.3f} (correct/J = {n_correct}/{len(rewards)})", flush=True)
+                  f"p_hat={p_hat:.3f} (correct/J = {n_correct}/{len(chunk)})", flush=True)
+    print(f"[mc] Phase B: verify done in {time.time()-t_v:.1f}s", flush=True)
 
     # ============================================================
     # Save

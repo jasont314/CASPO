@@ -202,6 +202,28 @@ def main():
                          "(≈200 unique prompts) gives ρ CI half-width ±0.07 — plenty "
                          "for an architecture-comparison signal — and cuts eval wall by "
                          "~4× vs evaluating the full 909-prompt collection.")
+    # ------------------------------------------------------------------
+    # Phase B speed knobs
+    # ------------------------------------------------------------------
+    ap.add_argument("--max_steps", type=int, default=0,
+                    help="Hard cap on optimizer steps. 0 = no cap (use --epochs). "
+                         "Used by the Phase B profiler / smoke runs.")
+    ap.add_argument("--dynamic_pad", action="store_true",
+                    help="Per-microbatch truncate prompt + response to actual max "
+                         "lengths in the batch (right-padded data). Saves ~3× wall on "
+                         "data with mean prompt=83, mean response=549 vs cap=1024+1024 "
+                         "by eliminating padding compute. Math is unchanged: response "
+                         "tokens beyond max_resp_len are all-zero rows that contribute "
+                         "exactly 0 to log_ratio and to BCE. ``step_end_idx`` is < "
+                         "max_resp_len for every labeled row by construction (it points "
+                         "to a real response token).")
+    ap.add_argument("--cache_ref", action="store_true",
+                    help="Precompute ref_logprobs[B, R] once per dataset row at the "
+                         "start of training and feed via PrefixValueModel(ref_logprobs=...) "
+                         "every step. Eliminates the per-step ref forward (~50% wall on "
+                         "IPVRM training where phi and ref are both full backbones). "
+                         "Costs 1 epoch of ref-only forwards upfront + ~N×R fp16 host "
+                         "RAM (42k × 1024 × 2B ≈ 88 MB). IPVRM only.")
     args = ap.parse_args()
 
     from caspo.config import CASPOConfig
@@ -227,8 +249,11 @@ def main():
     # Disable gradient checkpointing — combination of FSDP + grad-ckpt + Qwen2
     # produces "setStorage out of bounds for storage of size 0" in backward.
     cfg.use_gradient_checkpointing = False
-    # FA3 sometimes incompatible with Qwen2; use SDPA for safety
-    cfg.attn_implementation = None
+    # FA3 sometimes incompatible with Qwen2; use SDPA for safety.
+    # Override via PHASE_B_ATTN_IMPL env (e.g. "flash_attention_2") for the
+    # Phase B speedup probe — leave SDPA as the production default.
+    _attn_env = os.environ.get("PHASE_B_ATTN_IMPL", "").strip()
+    cfg.attn_implementation = _attn_env if _attn_env else None
 
     _rprint(f"[mc-train] loading data from {args.data}")
     blob = torch.load(args.data, map_location="cpu", weights_only=False)
@@ -401,6 +426,104 @@ def main():
     else:
         optim = torch.optim.AdamW(pv.phi.parameters(), lr=args.lr, weight_decay=0.0, fused=True)
 
+    # ------------------------------------------------------------------
+    # Optional: precompute and cache ref logprobs once (IPVRM only).
+    # ref is frozen so log π_ref(y_t | s_t) is identical at every epoch.
+    # Caching it eliminates one of the two backbone forwards per step.
+    # ------------------------------------------------------------------
+    ref_cache = None
+    if args.cache_ref and args.architecture == "ipvrm":
+        N_total = int(blob["prompt_ids"].shape[0])
+        R_full = int(blob["response_ids"].shape[1])
+        # Use float16 to keep host/device traffic small; IPVRM ratio is
+        # bf16-equivalent precision so fp16 cache is effectively lossless.
+        cache_local = torch.zeros((N_total, R_full), dtype=torch.float16)
+        # Cache build is forward-only (no backward, no FSDP all-gather since
+        # ref isn't FSDP-wrapped) — can use a much larger chunk than train mb
+        # without OOM. 4× train mb is conservative.
+        chunk = max(args.mb * 4, 16)
+        _rprint(f"[mc-train][cache_ref] precomputing ref_logprobs for "
+                f"N={N_total}, R={R_full}, chunk={chunk}")
+        ref_t0 = time.time()
+        # Shard rows across ranks so each rank computes 1/world_size of
+        # the cache; we all-reduce(sum) at the end since untouched rows
+        # are zero on every rank but the owning rank.
+        if world_size > 1:
+            local_rows = list(range(rank, N_total, world_size))
+        else:
+            local_rows = list(range(N_total))
+        with torch.no_grad():
+            for s in range(0, len(local_rows), chunk):
+                idxs_t = torch.tensor(local_rows[s:s + chunk], dtype=torch.long)
+                pids = blob["prompt_ids"][idxs_t].to(device, non_blocking=True)
+                pmask = blob["prompt_mask"][idxs_t].to(device, non_blocking=True)
+                rids = blob["response_ids"][idxs_t].to(device, non_blocking=True)
+                rmask = blob["response_mask"][idxs_t].to(device, non_blocking=True)
+                # Trim response only (prompt trim breaks RoPE — see
+                # get_batch comment). Response-only trim is bit-identical
+                # to full forward in real positions.
+                max_r = max(1, int(rmask.sum(dim=1).max().item()))
+                rids = rids[:, :max_r].contiguous()
+                rmask = rmask[:, :max_r].contiguous()
+                # Compute log π_ref on the response.
+                ref_logp = PrefixValueModel._gather_response_logprobs(
+                    pv.ref, pids, pmask, rids, rmask
+                )  # [B, max_r]
+                # Pad back out to R_full so cache layout matches dataset.
+                if max_r < R_full:
+                    pad = torch.zeros((ref_logp.shape[0], R_full - max_r),
+                                      dtype=ref_logp.dtype, device=ref_logp.device)
+                    ref_logp = torch.cat([ref_logp, pad], dim=1)
+                cache_local[idxs_t] = ref_logp.to(torch.float16).cpu()
+                if (s // chunk) % 50 == 0:
+                    _rprint(f"[mc-train][cache_ref] rank {rank} "
+                            f"row {s}/{len(local_rows)} "
+                            f"elapsed={time.time()-ref_t0:.1f}s")
+        # All-reduce so every rank sees the full cache (rows owned by other
+        # ranks are zero locally; sum recovers the populated values).
+        if world_size > 1:
+            # Move to GPU for nccl all-reduce; chunk to avoid OOM on a
+            # 42k×1024×fp16 buffer (≈86 MB — fits easily).
+            cache_local_gpu = cache_local.to(device)
+            dist.all_reduce(cache_local_gpu, op=dist.ReduceOp.SUM)
+            cache_local = cache_local_gpu.cpu()
+            del cache_local_gpu
+        # Pin cache so per-batch .to(device, non_blocking=True) is async.
+        try:
+            cache_local = cache_local.pin_memory()
+        except Exception:
+            pass
+        ref_cache = cache_local
+        _rprint(f"[mc-train][cache_ref] DONE in {time.time()-ref_t0:.1f}s; "
+                f"cache size={ref_cache.numel() * 2 / 1e6:.1f} MB fp16")
+        # Free the in-process ref backbone to reclaim ~3GB / GPU.
+        try:
+            del pv.ref
+            pv.ref = None
+            torch.cuda.empty_cache()
+            _rprint("[mc-train][cache_ref] freed pv.ref backbone")
+        except Exception as _e:
+            _rprint(f"[mc-train][cache_ref] free pv.ref failed: {_e}")
+
+    # ------------------------------------------------------------------
+    # Phase B: optional torch.compile on phi backbone.
+    # Set via PHASE_B_COMPILE_MODE env, one of:
+    #   "" (default) → no compile
+    #   "reduce-overhead" → safer, captures cudagraphs (some FSDP gotchas)
+    #   "max-autotune" → aggressive autotune, may be unstable with FSDP
+    #   "default" → conservative
+    # Applied AFTER cache_ref (which only forwards `pv.ref`, not pv.phi),
+    # AFTER FSDP wrap (FSDP-wrapped module compile is the supported path on
+    # PT 2.10 — torch.compile delegates `_lazy_init` etc. to the wrapper).
+    # ------------------------------------------------------------------
+    _compile_mode = os.environ.get("PHASE_B_COMPILE_MODE", "").strip()
+    if _compile_mode:
+        try:
+            _rprint(f"[mc-train] torch.compile(pv.phi, mode={_compile_mode!r})")
+            pv.phi = torch.compile(pv.phi, mode=_compile_mode, dynamic=True)
+        except Exception as _e:
+            _rprint(f"[mc-train] torch.compile failed: {_e}; falling back")
+
     def save_pv_ckpt(path):
         """Save pv at path, handling LoRA merge for drop-in compatibility."""
         if use_lora:
@@ -473,12 +596,46 @@ def main():
         response_mask = src["response_mask"][idxs].to(device, non_blocking=True)
         step_end_idx = src["step_end_idx"][idxs].to(device, non_blocking=True)
         p_hat = src["p_hat"][idxs].to(device, non_blocking=True)
+        # ----------------------------------------------------------
+        # Dynamic per-batch padding. Data is right-padded; with mean
+        # response=549 vs cap=1024, the static path spends ~50% of
+        # forward FLOPs on guaranteed-zero response positions.
+        #
+        # IMPORTANT: only the RESPONSE is trimmed. Prompt cannot be
+        # trimmed because RoPE makes the response logprobs depend on
+        # the absolute position of each response token (=
+        # prompt_len_pad + t). Trimming the prompt shifts the
+        # response leftward in absolute position → different RoPE
+        # angles → different logits. (Verified empirically: trimming
+        # only the response yields bit-identical logprobs, trimming
+        # the prompt shifts logprobs by up to 10 nats per token.)
+        #
+        # Response-only trimming math: tokens past max_resp_len are
+        # mask=0 → log_ratio=0 → cumsum identical at every kept
+        # position; step_end_idx ≤ resp_len-1 < max_resp_len.
+        # ----------------------------------------------------------
+        if args.dynamic_pad:
+            max_r = int(response_mask.sum(dim=1).max().item())
+            max_r = max(1, max_r)
+            response_ids = response_ids[:, :max_r].contiguous()
+            response_mask = response_mask[:, :max_r].contiguous()
         return prompt_ids, prompt_mask, response_ids, response_mask, step_end_idx, p_hat
 
     def forward_loss(idxs, return_preds=False, want_diag=True, source=None):
         pids, pmask, rids, rmask, step_end, p_hat = get_batch(idxs, source=source)
+        # Optional cached ref logprobs (IPVRM only) — supplies the frozen
+        # ref forward without re-running the backbone every step.
+        kwargs = {}
+        if (args.cache_ref and args.architecture == "ipvrm"
+                and source is None and ref_cache is not None):
+            # Slice cached ref logprobs to the trimmed response window so
+            # they line up with the (possibly dynamic-padded) response_ids.
+            cached = ref_cache[idxs].to(device, non_blocking=True)
+            R_cur = rids.shape[1]
+            cached = cached[:, :R_cur].contiguous()
+            kwargs["ref_logprobs"] = cached
         out = pv(prompt_ids=pids, prompt_mask=pmask,
-                 response_ids=rids, response_mask=rmask)
+                 response_ids=rids, response_mask=rmask, **kwargs)
         if args.architecture == "ipvrm":
             V = out["V"]  # [B, R+1]; V[:, 0]=0, V[:, t] = sum_{i<t} log_ratio[:, i]
             # Read V AFTER the last response token of the labeled step.
@@ -638,6 +795,11 @@ def main():
                     f"mse={float(mse):.4f} mean_pred={float(mean_pred):.3f} "
                     f"t={time.time()-t0:.1f}s"
                 )
+            # Hard cap for profiling / smoke (skips eval and save).
+            if args.max_steps > 0 and step >= args.max_steps:
+                _rprint(f"[mc-train] hit --max_steps={args.max_steps}; exiting train loop")
+                early_stopped = True
+                break
             if step % args.eval_every == 0 or step == total_steps:
                 stats = eval_val()  # collective — all ranks
                 if stats is not None:
@@ -657,6 +819,12 @@ def main():
                             dist.barrier()
                         # save_pretrained on FSDP-wrapped phi is collective
                         save_pv_ckpt(best_path)
+                        if is_main:
+                            with open(os.path.join(best_path, "best_info.json"), "w") as f:
+                                json.dump({"step": step, "val_loss": best_val_loss,
+                                           "val_mse": stats["val_mse"],
+                                           "val_spearman": stats["val_spearman"],
+                                           "val_within_auc": stats["val_within_auc"]}, f, indent=2)
                     else:
                         no_improve += 1
                         if no_improve >= args.early_stop_patience and step > 200:
