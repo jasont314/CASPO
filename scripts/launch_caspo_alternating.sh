@@ -28,11 +28,15 @@
 #   REFRESH_EVERY  : default 150 (RL steps between refreshes)
 #   METHOD         : default "caspo"
 #   ADV_TRANSFORM  : default "prob"  (or "logprob" for Δlogp)
-#   PRM_TRAIN_K, PRM_TRAIN_J, PRM_TRAIN_S        : default 16, 16, 5
-#   PRM_TRAIN_NUM_PROMPTS                        : default empty (= use all)
-#   PRM_TRAIN_MAX_RESP                           : default 2048 (= RL cap)
+#   PRM_TRAIN_K                                  : default 16
+#   PRM_TRAIN_J (initial)                        : default 16  (orig recipe)
+#   PRM_TRAIN_J_REFRESH                          : default 8   (v3 refresh recipe)
+#   PRM_TRAIN_S                                  : default 5
+#   PRM_TRAIN_NUM_PROMPTS                        : default empty (= use all dsr_sub)
+#   PRM_TRAIN_MAX_RESP (initial)                 : default 1024 (orig recipe — base SFT rollouts compact)
+#   PRM_TRAIN_MAX_RESP_REFRESH                   : default 1536 (v3 refresh recipe — captures p99 step_150 correct chains)
 #   PRM_TRAIN_PREFIX_CAP                         : default 0 (= match collection)
-#   PRM_TRAIN_EPOCHS                             : default 2
+#   PRM_TRAIN_EPOCHS                             : default 3 (every metric-B-best PRM was 3-epoch)
 #   ALL Phase-1 hparams (LR, KL_COEF, etc.) inherit defaults from
 #     scripts/launch_caspo_refresh_resume.sh
 #
