@@ -89,14 +89,22 @@ REFRESH_EVERY="${REFRESH_EVERY:-150}"
 METHOD="${METHOD:-caspo}"
 ADV_TRANSFORM="${ADV_TRANSFORM:-prob}"
 PRM_TRAIN_K="${PRM_TRAIN_K:-16}"
+# Initial PRM uses J=16 (orig recipe, deployed production). Refresh PRMs use J=8
+# (faster, refresh v3 recipe — won metric-B comparison).
 PRM_TRAIN_J="${PRM_TRAIN_J:-16}"
+PRM_TRAIN_J_REFRESH="${PRM_TRAIN_J_REFRESH:-8}"
 PRM_TRAIN_S="${PRM_TRAIN_S:-5}"
 PRM_TRAIN_NUM_PROMPTS="${PRM_TRAIN_NUM_PROMPTS:-}"
-PRM_TRAIN_MAX_RESP="${PRM_TRAIN_MAX_RESP:-2048}"
-# refresh: matches RL max_response_len; captures ~98% of correct chains (p98 ≈ 1613)
+# Per-phase response cap — initial trains on base SFT (compact rollouts, cap=1024
+# matches deployed orig). Refresh trains on policy-current rollouts (longer; cap=1536
+# captures ~99% of step_150-policy correct chains — validated by v3 refresh ρ=0.364).
+PRM_TRAIN_MAX_RESP="${PRM_TRAIN_MAX_RESP:-1024}"
+PRM_TRAIN_MAX_RESP_REFRESH="${PRM_TRAIN_MAX_RESP_REFRESH:-1536}"
 PRM_TRAIN_PREFIX_CAP="${PRM_TRAIN_PREFIX_CAP:-0}"
-# 0 = match collection cap; no decoupling. Validated by 1536-prefix v3 refresh (ρ=0.630).
-PRM_TRAIN_EPOCHS="${PRM_TRAIN_EPOCHS:-2}"
+# 0 = match collection cap; no decoupling. Validated by 1536-prefix v3 refresh (ρ=0.364).
+# 3 epochs: every metric-B-best PRM today (orig, v3 refresh, refresh_3ep) trained 3 ep.
+# 2-epoch was undertrained per intermediate-checkpoint sweep (best-step at 95%+ of 2ep).
+PRM_TRAIN_EPOCHS="${PRM_TRAIN_EPOCHS:-3}"
 
 mkdir -p "$OUT_ROOT/logs"
 
@@ -107,14 +115,26 @@ mkdir -p "$OUT_ROOT/logs"
 #   $2: output dir for the PRM
 #   $3: log dir for this PRM training
 #   $4: seed (so refresh PRMs use varying seeds across cycles)
+#   $5: phase ("initial" or "refresh") — selects J / cap defaults
 # ----------------------------------------------------------
 train_prm() {
   local policy="$1"
   local prm_out="$2"
   local prm_log="$3"
   local seed="$4"
+  local phase="${5:-refresh}"   # default refresh for backward-compat
   local np_arg=()
   [[ -n "$PRM_TRAIN_NUM_PROMPTS" ]] && np_arg=(NUM_PROMPTS="$PRM_TRAIN_NUM_PROMPTS")
+  # Per-phase J / cap selection
+  local j_phase max_resp_phase
+  if [[ "$phase" == "initial" ]]; then
+    j_phase="$PRM_TRAIN_J"
+    max_resp_phase="$PRM_TRAIN_MAX_RESP"
+  else
+    j_phase="$PRM_TRAIN_J_REFRESH"
+    max_resp_phase="$PRM_TRAIN_MAX_RESP_REFRESH"
+  fi
+  echo "[alt] train_prm phase=$phase  J=$j_phase  max_resp=$max_resp_phase  ep=$PRM_TRAIN_EPOCHS"
   POLICY="$policy" \
   PHI_INIT="$REF_MODEL" \
   REF_PATH="$REF_MODEL" \
@@ -123,9 +143,9 @@ train_prm() {
   GPU_LIST="$GPU_LIST" \
   DSR_SUB="$DSR_SUB" \
   K="$PRM_TRAIN_K" \
-  J="$PRM_TRAIN_J" \
+  J="$j_phase" \
   STEPS_PER_RESPONSE="$PRM_TRAIN_S" \
-  MAX_RESPONSE_LEN="$PRM_TRAIN_MAX_RESP" \
+  MAX_RESPONSE_LEN="$max_resp_phase" \
   MAX_TRAIN_PREFIX_LEN="$PRM_TRAIN_PREFIX_CAP" \
   EPOCHS="$PRM_TRAIN_EPOCHS" \
   SEED="$seed" \
@@ -158,7 +178,7 @@ if [[ -z "$current_prm" ]]; then
   echo "[alt] rollout source: $current_ckpt (= INITIAL_CKPT)"
   echo "[alt] PRM init:       $REF_MODEL (= REF_MODEL, from-scratch)"
   echo "[alt] out:            $PHASE0_OUT"
-  train_prm "$current_ckpt" "$PHASE0_OUT" "$PHASE0_LOG" 0
+  train_prm "$current_ckpt" "$PHASE0_OUT" "$PHASE0_LOG" 0 initial
   current_prm="$PHASE0_OUT/best"
   [[ -d "$current_prm" ]] || { echo "[alt] ERROR: $current_prm not found after Phase 0"; exit 1; }
   echo "[alt] $(date +%H:%M:%S) Phase 0 done. initial PRM=$current_prm"
@@ -218,7 +238,7 @@ while (( current_step < TOTAL_STEPS )); do
   echo "[alt] $(date +%H:%M:%S) === CYCLE $cycle: REFRESH PRM at $current_ckpt ==="
   echo "[alt] rollout source: $current_ckpt"
   echo "[alt] out:            $PRM_OUT"
-  train_prm "$current_ckpt" "$PRM_OUT" "$PRM_LOG" "$cycle"
+  train_prm "$current_ckpt" "$PRM_OUT" "$PRM_LOG" "$cycle" refresh
   current_prm="$PRM_OUT/best"
   [[ -d "$current_prm" ]] || { echo "[alt] ERROR: $current_prm not found after train"; exit 1; }
   echo "[alt] $(date +%H:%M:%S) refresh complete. new PRM=$current_prm"
